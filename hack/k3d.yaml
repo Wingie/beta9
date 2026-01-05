@@ -6,6 +6,14 @@ metadata:
 image: docker.io/rancher/k3s:v1.31.5-k3s1
 servers: 1
 
+# Podman compatibility: explicit kubeAPI binding to 127.0.0.1
+# Without this, kubeconfig defaults to 0.0.0.0 which doesn't work with Podman
+# Reference: https://github.com/k3d-io/k3d/issues/1008
+kubeAPI:
+  host: "127.0.0.1"
+  hostIP: "127.0.0.1"
+  hostPort: "6443"
+
 ports:
 - port: 1993:1993
   nodeFilters:
@@ -34,7 +42,7 @@ volumes:
 registries:
   create:
     name: registry.localhost
-    host: "0.0.0.0"
+    host: "127.0.0.1"  # Changed from 0.0.0.0 for Podman compatibility
     hostPort: "5001"
     volumes:
     - $HOME/.beta9-k3d/registry:/var/lib/registry
