@@ -53,11 +53,24 @@ spec:
         prometheus.io/port: "9090"
         app: gateway
     spec:
+      initContainers:
+      - name: wait-for-deps
+        image: busybox:1.37.0
+        command: ['sh', '-c',
+          'echo "Waiting for dependencies...";
+           until nc -z postgresql 5432; do echo "Waiting for postgresql..."; sleep 2; done;
+           until nc -z redis-master 6379; do echo "Waiting for redis-master..."; sleep 2; done;
+           until nc -z juicefs-redis-master 6379; do echo "Waiting for juicefs-redis..."; sleep 2; done;
+           until nc -z localstack 4566; do echo "Waiting for localstack..."; sleep 2; done;
+           echo "All dependencies ready!"']
       containers:
       - name: gateway
         image: registry.localhost:5000/beta9-gateway:latest
         command:
         - /usr/local/bin/gateway
+        env:
+        - name: CONFIG_PATH
+          value: /etc/beta9/config.yaml
         ports:
         - name: grpc
           containerPort: 1993
@@ -70,6 +83,8 @@ spec:
         volumeMounts:
         - name: images
           mountPath: /images
+        - name: config
+          mountPath: /etc/beta9
         resources:
           requests:
             cpu: 100m
@@ -92,6 +107,9 @@ spec:
       - name: images
         persistentVolumeClaim:
           claimName: beta9-images
+      - name: config
+        configMap:
+          name: beta9-config
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -230,3 +248,105 @@ spec:
     persistence:
       enabled: true
       size: 1Gi
+---
+# JuiceFS Redis - separate Redis for filesystem metadata
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: juicefs-redis
+  namespace: beta9
+spec:
+  repo: https://charts.bitnami.com/bitnami
+  chart: redis
+  createNamespace: false
+  version: 19.6.4
+  valuesContent: |-
+    nameOverride: juicefs-redis
+    fullnameOverride: juicefs-redis
+    architecture: standalone
+    auth:
+      enabled: false
+    image:
+      tag: latest
+      pullPolicy: Always
+    master:
+      persistence:
+        size: 1Gi
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+---
+# LocalStack - S3-compatible storage for JuiceFS and images
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: localstack
+  namespace: beta9
+spec:
+  repo: https://localstack.github.io/helm-charts
+  chart: localstack
+  createNamespace: false
+  version: 0.6.5
+  valuesContent: |-
+    extraEnvVars:
+    - name: SERVICES
+      value: s3
+    enableStartupScripts: true
+    startupScriptContent: |
+      #!/bin/bash
+      awslocal s3 mb s3://juicefs || true
+      awslocal s3 mb s3://logs || true
+      awslocal s3 mb s3://beta9-images || true
+    persistence:
+      enabled: true
+      storageClass: local-path
+      size: 20Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+---
+# ConfigMap for Gateway configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: beta9-config
+  namespace: beta9
+data:
+  config.yaml: |
+    database:
+      postgres:
+        host: postgresql
+        port: 5432
+        username: root
+        password: password
+        name: main
+        timezone: UTC
+      redis:
+        mode: single
+        addrs:
+          - redis-master:6379
+    storage:
+      mode: juicefs
+      fsName: beta9-fs
+      fsPath: /data
+      objectPath: /data/objects
+      juicefs:
+        redisURI: redis://juicefs-redis-master:6379/0
+        awsS3Bucket: http://localstack:4566/juicefs
+        awsAccessKey: test
+        awsSecretKey: test
+        blockSize: 4096
+        cacheSize: 0
+      workspaceStorage:
+        defaultEndpointUrl: http://localstack:4566
+        defaultAccessKey: test
+        defaultSecretKey: test
+    imageService:
+      registries:
+        s3:
+          bucketName: beta9-images
+          endpoint: http://localstack:4566
+          accessKey: test
+          secretKey: test
