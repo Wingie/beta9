@@ -161,20 +161,7 @@ spec:
     targetPort: 9090
     protocol: TCP
 ---
-apiVersion: traefik.containo.us/v1alpha1
-kind: IngressRouteTCP
-metadata:
-  name: gateway
-  namespace: beta9
-spec:
-  entryPoints:
-  - web
-  routes:
-  - match: HostSNI(`*`)
-    kind: Rule
-    services:
-    - name: gateway
-      port: 1993
+# NOTE: IngressRouteTCP removed - using NodePort instead (no Traefik dependency)
 ---
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
