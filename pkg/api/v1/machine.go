@@ -27,6 +27,14 @@ type RegisterMachineRequest struct {
 	PrivateIP    string `json:"private_ip"`
 }
 
+type MachineKeepaliveRequest struct {
+	MachineID    string                      `json:"machine_id"`
+	ProviderName string                      `json:"provider_name"`
+	PoolName     string                      `json:"pool_name"`
+	AgentVersion string                      `json:"agent_version"`
+	Metrics      *types.ProviderMachineMetrics `json:"metrics"`
+}
+
 type MachineGroup struct {
 	providerRepo repository.ProviderRepository
 	tailscale    *network.Tailscale
@@ -45,6 +53,7 @@ func NewMachineGroup(g *echo.Group, providerRepo repository.ProviderRepository, 
 
 	g.GET("/:workspaceId/gpus", auth.WithWorkspaceAuth(group.GPUCounts))
 	g.POST("/register", group.RegisterMachine)
+	g.POST("/keepalive", group.MachineKeepalive)
 	g.GET("/config", group.GetConfig)
 	g.GET("/list", group.ListPoolMachines)
 	return group
@@ -150,6 +159,43 @@ func (g *MachineGroup) RegisterMachine(ctx echo.Context) error {
 
 	return ctx.JSON(http.StatusOK, map[string]interface{}{
 		"config": remoteConfig,
+	})
+}
+
+func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
+	cc, _ := ctx.(*auth.HttpAuthContext)
+	if (cc.AuthInfo.Token.TokenType != types.TokenTypeMachine) && (cc.AuthInfo.Token.TokenType != types.TokenTypeWorker) {
+		return HTTPForbidden("Invalid token")
+	}
+
+	var request MachineKeepaliveRequest
+	if err := ctx.Bind(&request); err != nil {
+		return HTTPBadRequest("Invalid payload")
+	}
+
+	if request.MachineID == "" || request.PoolName == "" {
+		return HTTPBadRequest("machine_id and pool_name are required")
+	}
+
+	// Default provider name if not specified
+	providerName := request.ProviderName
+	if providerName == "" {
+		providerName = "generic"
+	}
+
+	err := g.providerRepo.SetMachineKeepAlive(
+		providerName,
+		request.PoolName,
+		request.MachineID,
+		request.AgentVersion,
+		request.Metrics,
+	)
+	if err != nil {
+		return HTTPInternalServerError(fmt.Sprintf("Failed to update keepalive: %v", err))
+	}
+
+	return ctx.JSON(http.StatusOK, map[string]interface{}{
+		"status": "ok",
 	})
 }
 
