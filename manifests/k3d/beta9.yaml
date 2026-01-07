@@ -185,7 +185,7 @@ spec:
   repo: https://charts.bitnami.com/bitnami
   chart: redis
   createNamespace: false
-  version: 18.6.1
+  version: 19.6.4
   valuesContent: |-
     nameOverride: redis
     fullnameOverride: redis
@@ -208,7 +208,7 @@ spec:
   repo: https://charts.bitnami.com/bitnami
   chart: postgresql
   createNamespace: false
-  version: 13.2.25
+  version: 15.5.38
   valuesContent: |-
     nameOverride: postgresql
     fullnameOverride: postgresql
