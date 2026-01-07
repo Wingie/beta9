@@ -350,3 +350,23 @@ data:
           endpoint: http://localstack:4566
           accessKey: test
           secretKey: test
+    # External worker pools for machines connecting via tunnel
+    worker:
+      pools:
+        external:
+          mode: external
+          provider: generic
+          poolSizing:
+            defaultWorkerCpu: 4000m
+            defaultWorkerMemory: 8Gi
+            minFreeCpu: 1000m
+            minFreeMemory: 1Gi
+        gpu:
+          mode: external
+          provider: generic
+          gpuType: any
+          poolSizing:
+            defaultWorkerCpu: 8000m
+            defaultWorkerMemory: 16Gi
+            minFreeCpu: 2000m
+            minFreeMemory: 4Gi
