@@ -112,9 +112,12 @@ func (g *MachineGroup) RegisterMachine(ctx echo.Context) error {
 		return HTTPBadRequest("Invalid payload")
 	}
 
+	// Get remote config for Tailscale-connected workers
+	// For external pools using SSH tunnel, this may fail - that's OK
 	remoteConfig, err := providers.GetRemoteConfig(g.config, g.tailscale)
 	if err != nil {
-		return HTTPInternalServerError("Unable to create remote config")
+		// Return nil config - external workers via SSH tunnel don't need it
+		remoteConfig = nil
 	}
 
 	cpu, err := scheduler.ParseCPU(request.Cpu)
