@@ -3,7 +3,15 @@ FROM golang:1.22.10-bullseye AS base
 RUN apt-get update && \
     apt-get install -y --no-install-recommends fuse3
 
-RUN curl -L https://beam-runner-python-deps.s3.amazonaws.com/juicefs -o /usr/local/bin/juicefs && chmod +x /usr/local/bin/juicefs
+# JuiceFS - architecture-aware download
+RUN JUICEFS_VERSION="1.2.1" && \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        JUICEFS_ARCH="linux-amd64"; \
+    elif [ "$(uname -m)" = "aarch64" ]; then \
+        JUICEFS_ARCH="linux-arm64"; \
+    fi && \
+    curl -L "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-${JUICEFS_ARCH}.tar.gz" | tar -xz -C /usr/local/bin juicefs && \
+    chmod +x /usr/local/bin/juicefs
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
 RUN apt-get install -y libfuse2 libfuse-dev bash-completion && \
@@ -15,11 +23,12 @@ RUN apt-get install -y libfuse2 libfuse-dev bash-completion && \
     dpkg -i mountpoint.deb && \
     rm -vf mountpoint.deb
 
+# GeeseFS - architecture-aware download
 RUN if [ "$(uname -m)" = "x86_64" ]; then \
     curl -L https://github.com/yandex-cloud/geesefs/releases/download/v0.42.4/geesefs-linux-amd64 -o /usr/local/bin/geesefs && \
     chmod +x /usr/local/bin/geesefs; \
     elif [ "$(uname -m)" = "aarch64" ]; then \
-    curl -L https://github.com/yandex-cloud/geesefs/releases/download/v0.42.4/geesefs-linux-amd64 -o /usr/local/bin/geesefs && \
+    curl -L https://github.com/yandex-cloud/geesefs/releases/download/v0.42.4/geesefs-linux-arm64 -o /usr/local/bin/geesefs && \
     chmod +x /usr/local/bin/geesefs; \
     fi
 
