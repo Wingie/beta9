@@ -3,15 +3,12 @@ FROM golang:1.22.10-bullseye AS base
 RUN apt-get update && \
     apt-get install -y --no-install-recommends fuse3
 
-# JuiceFS - architecture-aware download
-RUN JUICEFS_VERSION="1.2.1" && \
-    if [ "$(uname -m)" = "x86_64" ]; then \
-        JUICEFS_ARCH="linux-amd64"; \
-    elif [ "$(uname -m)" = "aarch64" ]; then \
-        JUICEFS_ARCH="linux-arm64"; \
-    fi && \
-    curl -L "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-${JUICEFS_ARCH}.tar.gz" | tar -xz -C /usr/local/bin juicefs && \
-    chmod +x /usr/local/bin/juicefs
+# JuiceFS - build from source for glibc 2.31 compatibility (Debian Bullseye)
+RUN git clone --depth 1 --branch v1.2.1 https://github.com/juicedata/juicefs.git /tmp/juicefs && \
+    cd /tmp/juicefs && \
+    CGO_ENABLED=0 go build -ldflags="-s -w" -o /usr/local/bin/juicefs . && \
+    chmod +x /usr/local/bin/juicefs && \
+    rm -rf /tmp/juicefs
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
 RUN apt-get install -y libfuse2 libfuse-dev bash-completion && \
