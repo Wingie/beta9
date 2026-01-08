@@ -43,6 +43,8 @@ metadata:
   namespace: beta9
 spec:
   replicas: 1
+  strategy:
+    type: Recreate  # Required for hostNetwork - prevents port conflicts during updates
   selector:
     matchLabels:
       app: gateway
