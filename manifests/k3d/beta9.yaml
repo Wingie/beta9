@@ -53,6 +53,7 @@ spec:
         prometheus.io/port: "9090"
         app: gateway
     spec:
+      hostNetwork: true  # Allow gateway to access host's Tailscale network
       initContainers:
       - name: wait-for-deps
         image: busybox:1.37.0
