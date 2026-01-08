@@ -47,6 +47,7 @@ type RedisConfig struct {
 	ClientName         string        `key:"clientName" json:"client_name"`
 	EnableTLS          bool          `key:"enableTLS" json:"enable_tls"`
 	InsecureSkipVerify bool          `key:"insecureSkipVerify" json:"insecure_skip_verify"`
+	ExternalPort       int           `key:"externalPort" json:"external_port"` // Port for external workers via Tailscale (default: 6379)
 	MinIdleConns       int           `key:"minIdleConns" json:"min_idle_conns"`
 	MaxIdleConns       int           `key:"maxIdleConns" json:"max_idle_conns"`
 	ConnMaxIdleTime    time.Duration `key:"connMaxIdleTime" json:"conn_max_idle_time"`
@@ -270,14 +271,15 @@ type WorkspaceStorageConfig struct {
 }
 
 type JuiceFSConfig struct {
-	RedisURI     string `key:"redisURI" json:"redis_uri"`
-	AWSS3Bucket  string `key:"awsS3Bucket" json:"aws_s3_bucket"`
-	AWSAccessKey string `key:"awsAccessKey" json:"aws_access_key"`
-	AWSSecretKey string `key:"awsSecretKey" json:"aws_secret_key"`
-	CacheSize    int64  `key:"cacheSize" json:"cache_size"`
-	BlockSize    int64  `key:"blockSize" json:"block_size"`
-	Prefetch     int64  `key:"prefetch" json:"prefetch"`
-	BufferSize   int64  `key:"bufferSize" json:"buffer_size"`
+	RedisURI          string `key:"redisURI" json:"redis_uri"`
+	AWSS3Bucket       string `key:"awsS3Bucket" json:"aws_s3_bucket"`
+	AWSAccessKey      string `key:"awsAccessKey" json:"aws_access_key"`
+	AWSSecretKey      string `key:"awsSecretKey" json:"aws_secret_key"`
+	CacheSize         int64  `key:"cacheSize" json:"cache_size"`
+	BlockSize         int64  `key:"blockSize" json:"block_size"`
+	Prefetch          int64  `key:"prefetch" json:"prefetch"`
+	BufferSize        int64  `key:"bufferSize" json:"buffer_size"`
+	ExternalRedisPort int    `key:"externalRedisPort" json:"external_redis_port"` // Port for external workers via Tailscale (default: 6379)
 }
 
 type GeeseConfig struct {

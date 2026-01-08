@@ -329,6 +329,7 @@ data:
         mode: single
         addrs:
           - redis-master:6379
+        externalPort: 6380  # Port exposed via Tailscale for external workers
     storage:
       mode: juicefs
       fsName: beta9-fs
@@ -341,6 +342,7 @@ data:
         awsSecretKey: test
         blockSize: 4096
         cacheSize: 0
+        externalRedisPort: 6381  # Port exposed via Tailscale for external workers
       workspaceStorage:
         defaultEndpointUrl: http://localstack:4566
         defaultAccessKey: test

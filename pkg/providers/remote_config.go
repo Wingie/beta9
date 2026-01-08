@@ -30,7 +30,13 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 	if err != nil {
 		return nil, err
 	}
-	remoteConfig.Database.Redis.Addrs[0] = fmt.Sprintf("%s:%d", redisHostname, 6379)
+
+	// Use configured external port or default to 6379
+	redisExternalPort := baseConfig.Database.Redis.ExternalPort
+	if redisExternalPort == 0 {
+		redisExternalPort = 6379
+	}
+	remoteConfig.Database.Redis.Addrs[0] = fmt.Sprintf("%s:%d", redisHostname, redisExternalPort)
 	remoteConfig.Database.Redis.InsecureSkipVerify = true
 
 	if baseConfig.Storage.Mode == storage.StorageModeJuiceFS {
@@ -39,7 +45,12 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 			return nil, err
 		}
 
-		juiceFsRedisHostname = fmt.Sprintf("%s:%d", juiceFsRedisHostname, 6379)
+		// Use configured external port or default to 6379
+		juicefsExternalPort := baseConfig.Storage.JuiceFS.ExternalRedisPort
+		if juicefsExternalPort == 0 {
+			juicefsExternalPort = 6379
+		}
+		juiceFsRedisHostname = fmt.Sprintf("%s:%d", juiceFsRedisHostname, juicefsExternalPort)
 
 		parsedUrl, err := url.Parse(remoteConfig.Storage.JuiceFS.RedisURI)
 		if err != nil {
