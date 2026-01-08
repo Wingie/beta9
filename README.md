@@ -125,6 +125,127 @@ if __name__ == "__main__":
 >
 > Beta9 is the open-source engine powering [Beam](https://beam.cloud), our fully-managed cloud platform. You can self-host Beta9 for free or choose managed cloud hosting through Beam.
 
+---
+
+## FlowState Fork - Modifications from Upstream
+
+This is a fork of [beam-cloud/beta9](https://github.com/beam-cloud/beta9) with modifications to support external GPU workers via SSH tunnel (without requiring the closed-source agent binary or Tailscale VPN).
+
+### Changes Made
+
+#### 1. Added Machine Keepalive Endpoint
+
+**File**: `pkg/api/v1/machine.go`
+
+**Why**: The upstream gateway has a `SetMachineKeepAlive()` function but NO HTTP endpoint to call it. Without this, machines can register but never transition to "ready" status.
+
+**Change**: Added `POST /api/v1/machine/keepalive` endpoint:
+
+```go
+g.POST("/keepalive", group.MachineKeepalive)
+```
+
+**Behavior**:
+- Accepts machine_id, pool_name, agent_version, metrics
+- Calls `providerRepo.SetMachineKeepAlive()` to:
+  - Set machine status to "ready"
+  - Refresh 5-minute TTL
+  - Store metrics
+
+#### 2. Fixed Tailscale Dependency in Registration
+
+**File**: `pkg/api/v1/machine.go`
+
+**Why**: `RegisterMachine()` called `GetRemoteConfig()` which requires Tailscale to resolve Redis hostnames. For external workers using SSH tunnel (no Tailscale), this caused registration to fail with "Unable to create remote config".
+
+**Change**: Return null config instead of failing:
+
+```go
+remoteConfig, err := providers.GetRemoteConfig(g.config, g.tailscale)
+if err != nil {
+    // Return nil config - external workers via SSH tunnel don't need it
+    remoteConfig = nil
+}
+```
+
+### Why These Changes?
+
+Beta9's original architecture requires:
+1. **Closed-source agent binary** (~70MB) - distributed at release.beam.cloud, not in this repo
+2. **Tailscale VPN** - for network connectivity between agent and gateway
+
+Our use case:
+- Connect external GPU workers (Lambda Labs, local machines) to self-hosted Beta9
+- Use **SSH tunnels** instead of VPN for simpler network setup
+- Write our own **Python agent** instead of using closed-source binary
+
+### Machine Lifecycle with These Changes
+
+```
+┌─────────┐    ┌────────────┐    ┌─────────────────┐
+│ pending │───>│ registered │───>│     ready       │
+└─────────┘    └────────────┘    └─────────────────┘
+     │               │                    │
+beta9 machine    POST              POST /keepalive
+create          /register          (every 60 sec)
+```
+
+**Important**: Machine state has 5-minute TTL. If keepalive not sent within 5 minutes, the machine is automatically removed from the pool (Redis key expires).
+
+### API Reference
+
+#### POST /api/v1/machine/register
+```json
+{
+  "machine_id": "abc123",
+  "hostname": "my-worker",
+  "provider_name": "generic",
+  "pool_name": "gpu",
+  "cpu": "8000m",
+  "memory": "16Gi",
+  "gpu_count": "1",
+  "private_ip": "192.168.1.100"
+}
+```
+
+#### POST /api/v1/machine/keepalive
+```json
+{
+  "machine_id": "abc123",
+  "provider_name": "generic",
+  "pool_name": "gpu",
+  "agent_version": "0.1.0",
+  "metrics": {
+    "cpu_utilization_pct": 15.5,
+    "memory_utilization_pct": 42.3
+  }
+}
+```
+
+### Testing
+
+```bash
+# SSH tunnel to gateway
+ssh -L 1994:localhost:31994 your-server
+
+# Create machine token
+beta9 machine create --pool gpu
+
+# Register
+curl -X POST http://localhost:1994/api/v1/machine/register \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"machine_id":"abc","pool_name":"gpu",...}'
+
+# Keepalive (must be within 5 minutes!)
+curl -X POST http://localhost:1994/api/v1/machine/keepalive \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"machine_id":"abc","pool_name":"gpu","agent_version":"0.1.0"}'
+```
+
+---
+
 ## 👋 Contributing
 
 We welcome contributions big or small. These are the most helpful things for us:

@@ -160,8 +160,14 @@ func (g *MachineGroup) RegisterMachine(ctx echo.Context) error {
 		return HTTPInternalServerError("Failed to register machine")
 	}
 
-	return ctx.JSON(http.StatusOK, map[string]interface{}{
-		"config": remoteConfig,
+	return ctx.JSON(http.StatusOK, RegisterMachineResponse{
+		Config: remoteConfig,
+		MachineState: &MachineStateResponse{
+			MachineID:  request.MachineID,
+			Status:     types.MachineStatusRegistered,
+			PoolName:   request.PoolName,
+			TTLSeconds: types.MachineKeepaliveExpirationS,
+		},
 	})
 }
 
@@ -197,9 +203,25 @@ func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
 		return HTTPInternalServerError(fmt.Sprintf("Failed to update keepalive: %v", err))
 	}
 
-	return ctx.JSON(http.StatusOK, map[string]interface{}{
-		"status": "ok",
-	})
+	// Fetch updated machine state to include in response
+	response := KeepaliveResponse{
+		Status: "ok",
+	}
+
+	machineState, err := g.providerRepo.GetMachine(providerName, request.PoolName, request.MachineID)
+	if err == nil && machineState != nil && machineState.State != nil {
+		response.MachineState = &MachineStateResponse{
+			MachineID:      request.MachineID,
+			Status:         machineState.State.Status,
+			PoolName:       request.PoolName,
+			LastKeepalive:  machineState.State.LastKeepalive,
+			LastWorkerSeen: machineState.State.LastWorkerSeen,
+			TTLSeconds:     types.MachineKeepaliveExpirationS,
+			AgentVersion:   machineState.State.AgentVersion,
+		}
+	}
+
+	return ctx.JSON(http.StatusOK, response)
 }
 
 func (g *MachineGroup) GPUCounts(ctx echo.Context) error {
