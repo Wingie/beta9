@@ -356,6 +356,11 @@ data:
           endpoint: http://localstack:4566
           accessKey: test
           secretKey: test
+    tailscale:
+      enabled: true
+      controlUrl: "https://controlplane.tailscale.com"
+      authKey: ""  # Set via: kubectl edit configmap beta9-config -n beta9
+      hostName: "beta9-gateway"
     # External worker pools for machines connecting via tunnel
     worker:
       pools:
