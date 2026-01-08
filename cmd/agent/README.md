@@ -1,4 +1,4 @@
-# Beta9 Python Agent
+# Beta9 Python Agent (TESTING/DEBUGGING)
 
 Open-source agent for connecting external GPU workers to Beta9.
 
