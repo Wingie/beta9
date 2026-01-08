@@ -34,8 +34,12 @@ class AgentConfig:
     # Provider info
     provider_name: str = "generic"
 
-    # k3s configuration (for Linux)
-    k3s_token: Optional[str] = None
+    # Machine hostname (for gateway to reach k3s API)
+    # Should be Tailscale IP or DNS name that gateway can reach
+    hostname: Optional[str] = None
+
+    # k3s configuration
+    k3s_token: Optional[str] = None  # Bearer token for k3s API (required for external workers)
     k3s_version: str = "v1.28.5+k3s1"
 
     # Timing
@@ -72,7 +76,8 @@ class AgentConfig:
         - BETA9_GATEWAY_HOST: Gateway host
         - BETA9_GATEWAY_PORT: Gateway port
         - BETA9_PROVIDER_NAME: Provider name
-        - BETA9_K3S_TOKEN: Pre-existing k3s token
+        - BETA9_HOSTNAME: Machine hostname (Tailscale IP)
+        - BETA9_K3S_TOKEN: k3s bearer token for API auth
         - BETA9_DEBUG: Enable debug logging
         """
         return cls(
@@ -82,6 +87,7 @@ class AgentConfig:
             gateway_host=os.environ.get("BETA9_GATEWAY_HOST", "localhost"),
             gateway_port=int(os.environ.get("BETA9_GATEWAY_PORT", "1994")),
             provider_name=os.environ.get("BETA9_PROVIDER_NAME", "generic"),
+            hostname=os.environ.get("BETA9_HOSTNAME"),
             k3s_token=os.environ.get("BETA9_K3S_TOKEN"),
             debug=os.environ.get("BETA9_DEBUG", "").lower() in ("1", "true", "yes"),
         )

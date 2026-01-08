@@ -44,7 +44,8 @@ def signal_handler(signum, frame):
 @click.option("--provider-name", envvar="BETA9_PROVIDER_NAME", default="generic", help="Provider name")
 @click.option("--gateway-host", envvar="BETA9_GATEWAY_HOST", default="localhost", help="Gateway HTTP host")
 @click.option("--gateway-port", envvar="BETA9_GATEWAY_PORT", default=1994, type=int, help="Gateway HTTP port")
-@click.option("--k3s-token", envvar="BETA9_K3S_TOKEN", default=None, help="Pre-existing k3s token (skip k3s setup)")
+@click.option("--hostname", envvar="BETA9_HOSTNAME", default=None, help="Hostname/IP for gateway to reach this machine's k3s API (e.g., Tailscale IP)")
+@click.option("--k3s-token", envvar="BETA9_K3S_TOKEN", default=None, help="k3s bearer token for API authentication")
 @click.option("--keepalive-interval", default=60, type=int, help="Keepalive interval in seconds")
 @click.option("--debug", is_flag=True, help="Enable debug logging")
 @click.option("--dry-run", is_flag=True, help="Don't actually register, just log")
@@ -57,6 +58,7 @@ def main(
     provider_name: str,
     gateway_host: str,
     gateway_port: int,
+    hostname: Optional[str],
     k3s_token: Optional[str],
     keepalive_interval: int,
     debug: bool,
@@ -90,6 +92,7 @@ def main(
         provider_name=provider_name,
         gateway_host=gateway_host,
         gateway_port=gateway_port,
+        hostname=hostname,
         k3s_token=k3s_token,
         keepalive_interval=keepalive_interval,
         debug=debug,

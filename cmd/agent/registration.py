@@ -35,12 +35,19 @@ def register_machine(config: AgentConfig) -> RegistrationResult:
     Returns:
         RegistrationResult with success status and gateway config
     """
-    hostname = f"machine-{config.machine_id}"
+    # Use provided hostname (Tailscale IP) or fall back to machine-{id}
+    hostname = config.hostname or f"machine-{config.machine_id}"
+
+    # k3s_token is the bearer token for k3s API authentication
+    # Gateway uses this to deploy worker pods to this machine's k3s cluster
+    k3s_token = config.k3s_token or ""
+    if not k3s_token:
+        logger.warning("No --k3s-token provided. Gateway won't be able to deploy worker pods.")
 
     payload = {
-        "token": config.k3s_token or "mock-k3s-token",  # k3s token, not registration token
+        "token": k3s_token,  # k3s bearer token for gateway to authenticate with this k3s
         "machine_id": config.machine_id,
-        "hostname": hostname,
+        "hostname": hostname,  # Tailscale IP or DNS name gateway can reach
         "provider_name": config.provider_name,
         "pool_name": config.pool_name,
         "cpu": get_cpu_string(),

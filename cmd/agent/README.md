@@ -96,17 +96,20 @@ python -m cmd.agent \
 
 | Argument | Env Variable | Default | Required | Description |
 |----------|--------------|---------|----------|-------------|
-| `--token` | `BETA9_TOKEN` | - | Yes | Machine registration token |
+| `--token` | `BETA9_TOKEN` | - | Yes | Machine registration token from `beta9 machine create` |
 | `--machine-id` | `BETA9_MACHINE_ID` | Auto-generated | No | 8 character hex ID |
 | `--pool-name` | `BETA9_POOL_NAME` | `external` | No | Worker pool name |
 | `--provider-name` | `BETA9_PROVIDER_NAME` | `generic` | No | Provider identifier |
 | `--gateway-host` | `BETA9_GATEWAY_HOST` | `localhost` | No | Gateway HTTP host |
 | `--gateway-port` | `BETA9_GATEWAY_PORT` | `1994` | No | Gateway HTTP port |
-| `--hostname` | `HOSTNAME` | System hostname | No | Machine hostname |
+| `--hostname` | `BETA9_HOSTNAME` | `machine-{id}` | **Yes*** | IP/hostname for gateway to reach k3s API (e.g., Tailscale IP) |
+| `--k3s-token` | `BETA9_K3S_TOKEN` | - | **Yes*** | k3s bearer token for gateway to authenticate |
 | `--keepalive-interval` | - | `60` | No | Seconds between keepalives |
 | `--debug` | `BETA9_DEBUG` | `false` | No | Enable verbose logging |
 | `--once` | - | `false` | No | Single registration, then exit |
 | `--dry-run` | - | `false` | No | Print config without registering |
+
+*Required for external worker mode - gateway needs these to deploy worker pods to your k3s cluster.
 
 ## Environment Variables
 
@@ -117,9 +120,49 @@ export BETA9_TOKEN="your-token-here"
 export BETA9_POOL_NAME="gpu"
 export BETA9_GATEWAY_HOST="localhost"
 export BETA9_GATEWAY_PORT="1994"
+export BETA9_HOSTNAME="100.100.74.117"  # Your Tailscale IP
+export BETA9_K3S_TOKEN="your-k3s-bearer-token"
 export BETA9_DEBUG="true"
 
 python -m cmd.agent
+```
+
+## External Worker Setup (Tailscale + Rancher Desktop)
+
+For connecting a Mac/Linux machine as an external worker via Tailscale:
+
+### 1. Create k3s Service Account
+
+```bash
+# On your worker machine with Rancher Desktop/k3s
+kubectl create serviceaccount beta9-gateway -n default
+kubectl create clusterrolebinding beta9-gateway \
+  --clusterrole=cluster-admin \
+  --serviceaccount=default:beta9-gateway
+
+# Generate long-lived token (1 year)
+K3S_TOKEN=$(kubectl create token beta9-gateway --duration=8760h)
+echo "K3S_TOKEN=$K3S_TOKEN"
+```
+
+### 2. Get Your Tailscale IP
+
+```bash
+tailscale ip -4
+# e.g., 100.100.74.117
+```
+
+### 3. Run Agent
+
+```bash
+python -m cmd.agent \
+  --token "<machine_token_from_beta9_machine_create>" \
+  --machine-id "abc12345" \
+  --pool-name external \
+  --gateway-host 100.72.101.23 \
+  --gateway-port 1994 \
+  --hostname "100.100.74.117" \
+  --k3s-token "$K3S_TOKEN"
 ```
 
 ## Configuration File
