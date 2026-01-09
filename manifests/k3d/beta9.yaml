@@ -364,6 +364,9 @@ data:
       directRedisHost: "100.72.101.23"  # OCI Tailscale IP - bypass tsnet service discovery for external workers
     # External worker pools for machines connecting via tunnel
     worker:
+      imageRegistry: "100.72.101.23:30500"  # OCI registry exposed via Tailscale
+      imageName: "beta9-worker"
+      imageTag: "latest"
       pools:
         external:
           mode: external
