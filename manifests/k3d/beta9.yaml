@@ -362,10 +362,10 @@ data:
       controlUrl: "https://controlplane.tailscale.com"
       authKey: ""  # Set via: kubectl edit configmap beta9-config -n beta9
       hostName: "beta9-gateway"
-      directRedisHost: "100.72.101.23"  # OCI Tailscale IP - bypass tsnet service discovery for external workers
+      directRedisHost: "${TAILSCALE_CONTROLPLANE_IP}"  # OCI Tailscale IP - bypass tsnet service discovery for external workers
     # External worker pools for machines connecting via tunnel
     worker:
-      imageRegistry: "100.72.101.23:30500"  # OCI registry exposed via Tailscale
+      imageRegistry: "${TAILSCALE_CONTROLPLANE_IP}:30500"  # OCI registry exposed via Tailscale
       imageName: "beta9-worker"
       imageTag: "latest"
       pools:
