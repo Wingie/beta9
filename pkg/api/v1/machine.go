@@ -135,11 +135,18 @@ func (g *MachineGroup) RegisterMachine(ctx echo.Context) error {
 		return HTTPInternalServerError("Invalid gpu count")
 	}
 
-	hostName := fmt.Sprintf("%s.%s", request.HostName, g.config.Tailscale.HostName)
-
-	// If user is != "", add it into hostname (for self-managed control servers like headscale)
-	if g.config.Tailscale.User != "" {
-		hostName = fmt.Sprintf("%s.%s.%s", request.HostName, g.config.Tailscale.User, g.config.Tailscale.HostName)
+	// Determine hostname format based on connectivity mode
+	var hostName string
+	if g.config.Tailscale.DirectRedisHost != "" {
+		// Direct mode: use hostname as-is (IP address for direct k8s access)
+		hostName = request.HostName
+	} else {
+		// Tailscale MagicDNS mode: append Tailscale hostname suffix
+		hostName = fmt.Sprintf("%s.%s", request.HostName, g.config.Tailscale.HostName)
+		// If user is != "", add it into hostname (for self-managed control servers like headscale)
+		if g.config.Tailscale.User != "" {
+			hostName = fmt.Sprintf("%s.%s.%s", request.HostName, g.config.Tailscale.User, g.config.Tailscale.HostName)
+		}
 	}
 
 	poolConfig, ok := g.config.Worker.Pools[request.PoolName]
