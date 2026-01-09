@@ -133,6 +133,8 @@ FROM golang AS worker
 WORKDIR /workspace
 
 COPY go.mod go.sum ./
+# Allow Go toolchain to auto-download newer versions if needed
+ENV GOTOOLCHAIN=auto
 RUN go mod download
 COPY --exclude=sdk . .
 
