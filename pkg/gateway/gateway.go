@@ -129,9 +129,17 @@ func NewGateway() (*Gateway, error) {
 	tailscale := network.GetOrCreateTailscale(network.TailscaleConfig{
 		ControlURL: config.Tailscale.ControlURL,
 		AuthKey:    config.Tailscale.AuthKey,
+		Hostname:   config.Tailscale.HostName,
 		Debug:      config.Tailscale.Debug,
 		Ephemeral:  true,
 	}, tailscaleRepo)
+
+	// Start the Tailscale connection if configured
+	if config.Tailscale.Enabled && config.Tailscale.AuthKey != "" {
+		if err := tailscale.Start(ctx); err != nil {
+			log.Warn().Err(err).Msg("failed to start tailscale, external worker features may not work")
+		}
+	}
 
 	workspaceRepo := repository.NewWorkspaceRedisRepository(redisClient)
 

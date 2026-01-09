@@ -82,6 +82,39 @@ func newTailscale(cfg TailscaleConfig, tailscaleRepo repository.TailscaleReposit
 	return ts
 }
 
+// Start connects to the tailnet without serving any local service.
+// This is needed for the gateway to resolve services on the tailnet.
+func (t *Tailscale) Start(ctx context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.initialized {
+		return nil
+	}
+
+	log.Info().
+		Str("url", t.server.ControlURL).
+		Str("hostname", t.server.Hostname).
+		Msg("starting tailscale connection")
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	status, err := t.server.Up(timeoutCtx)
+	if err != nil {
+		return fmt.Errorf("failed to start tailscale: %w", err)
+	}
+
+	t.initialized = true
+	log.Info().
+		Str("hostname", t.server.Hostname).
+		Str("tailscale_ip", status.TailscaleIPs[0].String()).
+		Int("peer_count", len(status.Peer)).
+		Msg("tailscale connected successfully")
+
+	return nil
+}
+
 // Serve connects to a tailnet and serves a local service
 func (t *Tailscale) Serve(ctx context.Context, service types.InternalService) (net.Listener, error) {
 	log.Info().Str("url", t.server.ControlURL).Msg("connecting to tailnet")
