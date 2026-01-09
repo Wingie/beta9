@@ -80,6 +80,25 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 		if useDirectHost {
 			remoteConfig.Storage.JuiceFS.RedisURI = fmt.Sprintf("redis://:%s@%s:%d/0",
 				juicefsRedisPassword, juiceFsRedisHostname, juicefsExternalPort)
+
+			// Update S3 bucket endpoint for external workers
+			s3ExternalPort := baseConfig.Storage.JuiceFS.ExternalS3Port
+			if s3ExternalPort == 0 {
+				s3ExternalPort = 31566 // Default LocalStack NodePort
+			}
+
+			// Parse existing bucket URL to get bucket path (e.g., /juicefs)
+			bucketPath := "/juicefs" // Default bucket path
+			if parsedBucket, err := url.Parse(remoteConfig.Storage.JuiceFS.AWSS3Bucket); err == nil {
+				bucketPath = parsedBucket.Path
+			}
+
+			remoteConfig.Storage.JuiceFS.AWSS3Bucket = fmt.Sprintf(
+				"http://%s:%d%s",
+				baseConfig.Tailscale.DirectRedisHost, // Reuse same Tailscale IP
+				s3ExternalPort,
+				bucketPath,
+			)
 		} else {
 			remoteConfig.Storage.JuiceFS.RedisURI = fmt.Sprintf("rediss://:%s@%s:%d/0",
 				juicefsRedisPassword, juiceFsRedisHostname, juicefsExternalPort)

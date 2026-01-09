@@ -280,6 +280,7 @@ type JuiceFSConfig struct {
 	Prefetch          int64  `key:"prefetch" json:"prefetch"`
 	BufferSize        int64  `key:"bufferSize" json:"buffer_size"`
 	ExternalRedisPort int    `key:"externalRedisPort" json:"external_redis_port"` // Port for external workers via Tailscale (default: 6379)
+	ExternalS3Port    int    `key:"externalS3Port" json:"external_s3_port"`       // S3 port for external workers via Tailscale (default: 31566)
 }
 
 type GeeseConfig struct {

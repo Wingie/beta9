@@ -345,6 +345,7 @@ data:
         blockSize: 4096
         cacheSize: 0
         externalRedisPort: 30381  # NodePort exposed via Tailscale for external workers
+        externalS3Port: 31566     # LocalStack NodePort for external workers
       workspaceStorage:
         defaultEndpointUrl: http://localstack:4566
         defaultAccessKey: test
