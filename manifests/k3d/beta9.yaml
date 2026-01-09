@@ -357,6 +357,16 @@ data:
           endpoint: http://localstack:4566
           accessKey: test
           secretKey: test
+    gateway:
+      host: gateway  # k8s service name for local workers
+      grpc:
+        externalHost: "${TAILSCALE_CONTROLPLANE_IP}"  # Tailscale IP for external workers
+        externalPort: 1993
+        port: 1993
+      http:
+        externalHost: "${TAILSCALE_CONTROLPLANE_IP}"  # Tailscale IP for external workers
+        externalPort: 1994
+        port: 1994
     tailscale:
       enabled: true
       controlUrl: "https://controlplane.tailscale.com"
