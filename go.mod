@@ -1,6 +1,6 @@
 module github.com/beam-cloud/beta9
 
-go 1.25.5
+go 1.22
 
 require (
 	buf.build/gen/go/cedana/cedana/protocolbuffers/go v1.36.3-20250123222419-64bf8384f939.1
