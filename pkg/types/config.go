@@ -593,12 +593,13 @@ type OpenMeterConfig struct {
 }
 
 type TailscaleConfig struct {
-	ControlURL string `key:"controlUrl" json:"control_url"`
-	User       string `key:"user" json:"user"`
-	AuthKey    string `key:"authKey" json:"auth_key"`
-	HostName   string `key:"hostName" json:"host_name"`
-	Enabled    bool   `key:"enabled" json:"enabled"`
-	Debug      bool   `key:"debug" json:"debug"`
+	ControlURL      string `key:"controlUrl" json:"control_url"`
+	User            string `key:"user" json:"user"`
+	AuthKey         string `key:"authKey" json:"auth_key"`
+	HostName        string `key:"hostName" json:"host_name"`
+	Enabled         bool   `key:"enabled" json:"enabled"`
+	Debug           bool   `key:"debug" json:"debug"`
+	DirectRedisHost string `key:"directRedisHost" json:"direct_redis_host"` // Skip Tailscale resolution, use this IP directly for Redis connections
 }
 
 type ProxyConfig struct {

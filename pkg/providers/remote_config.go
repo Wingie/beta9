@@ -26,9 +26,19 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 		return nil, err
 	}
 
-	redisHostname, err := tailscale.ResolveService("control-plane-redis", connectTimeout)
-	if err != nil {
-		return nil, err
+	// Determine Redis hostname - use direct IP if configured, otherwise Tailscale resolution
+	var redisHostname string
+	useDirectHost := baseConfig.Tailscale.DirectRedisHost != ""
+
+	if useDirectHost {
+		// Direct mode: use configured IP (bypasses Tailscale service discovery)
+		redisHostname = baseConfig.Tailscale.DirectRedisHost
+	} else {
+		// Standard mode: resolve via Tailscale
+		redisHostname, err = tailscale.ResolveService("control-plane-redis", connectTimeout)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Use configured external port or default to 6379
@@ -40,9 +50,17 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 	remoteConfig.Database.Redis.InsecureSkipVerify = true
 
 	if baseConfig.Storage.Mode == storage.StorageModeJuiceFS {
-		juiceFsRedisHostname, err := tailscale.ResolveService("juicefs-redis", connectTimeout)
-		if err != nil {
-			return nil, err
+		var juiceFsRedisHostname string
+
+		if useDirectHost {
+			// Direct mode: use same host for JuiceFS Redis
+			juiceFsRedisHostname = baseConfig.Tailscale.DirectRedisHost
+		} else {
+			// Standard mode: resolve via Tailscale
+			juiceFsRedisHostname, err = tailscale.ResolveService("juicefs-redis", connectTimeout)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		// Use configured external port or default to 6379
@@ -50,15 +68,22 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 		if juicefsExternalPort == 0 {
 			juicefsExternalPort = 6379
 		}
-		juiceFsRedisHostname = fmt.Sprintf("%s:%d", juiceFsRedisHostname, juicefsExternalPort)
 
 		parsedUrl, err := url.Parse(remoteConfig.Storage.JuiceFS.RedisURI)
 		if err != nil {
 			return nil, err
 		}
-
 		juicefsRedisPassword, _ := parsedUrl.User.Password()
-		remoteConfig.Storage.JuiceFS.RedisURI = fmt.Sprintf("rediss://:%s@%s/0", juicefsRedisPassword, juiceFsRedisHostname)
+
+		// Use redis:// (non-TLS) when using direct host - Tailscale already encrypts traffic
+		// Use rediss:// (TLS) when using Tailscale DNS resolution
+		if useDirectHost {
+			remoteConfig.Storage.JuiceFS.RedisURI = fmt.Sprintf("redis://:%s@%s:%d/0",
+				juicefsRedisPassword, juiceFsRedisHostname, juicefsExternalPort)
+		} else {
+			remoteConfig.Storage.JuiceFS.RedisURI = fmt.Sprintf("rediss://:%s@%s:%d/0",
+				juicefsRedisPassword, juiceFsRedisHostname, juicefsExternalPort)
+		}
 	}
 
 	return &remoteConfig, nil
