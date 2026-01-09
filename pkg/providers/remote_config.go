@@ -106,12 +106,19 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 	}
 
 	// Update worker image registry for external workers
-	if useDirectHost && baseConfig.Worker.ExternalRegistryPort > 0 {
-		remoteConfig.Worker.ImageRegistry = fmt.Sprintf(
-			"%s:%d",
-			baseConfig.Tailscale.DirectRedisHost, // Reuse same Tailscale IP
-			baseConfig.Worker.ExternalRegistryPort,
-		)
+	// Priority: ExternalImageRegistry (HTTPS hostname) > ExternalRegistryPort (IP:port)
+	if useDirectHost {
+		if baseConfig.Worker.ExternalImageRegistry != "" {
+			// Use HTTPS registry hostname (e.g., registry.agentosaurus.com)
+			remoteConfig.Worker.ImageRegistry = baseConfig.Worker.ExternalImageRegistry
+		} else if baseConfig.Worker.ExternalRegistryPort > 0 {
+			// Fallback to IP:port for HTTP registry via Tailscale
+			remoteConfig.Worker.ImageRegistry = fmt.Sprintf(
+				"%s:%d",
+				baseConfig.Tailscale.DirectRedisHost,
+				baseConfig.Worker.ExternalRegistryPort,
+			)
+		}
 	}
 
 	return &remoteConfig, nil

@@ -376,7 +376,8 @@ data:
     # External worker pools for machines connecting via tunnel
     worker:
       imageRegistry: "localhost:5000"  # Local registry for workers on same cluster
-      externalRegistryPort: 30500       # NodePort for external workers (via Tailscale)
+      externalRegistryPort: 30500       # NodePort fallback for HTTP registry (via Tailscale)
+      externalImageRegistry: "registry.agentosaurus.com"  # HTTPS registry for external workers
       imageName: "beta9-worker"
       imageTag: "latest"
       pools:

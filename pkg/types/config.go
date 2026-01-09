@@ -370,6 +370,7 @@ type WorkerConfig struct {
 	ImageName                    string                        `key:"imageName" json:"image_name"`
 	ImageRegistry                string                        `key:"imageRegistry" json:"image_registry"`
 	ExternalRegistryPort         int                           `key:"externalRegistryPort" json:"external_registry_port"`
+	ExternalImageRegistry        string                        `key:"externalImageRegistry" json:"external_image_registry"` // HTTPS registry URL for external workers (e.g., registry.agentosaurus.com)
 	ImagePullSecrets             []string                      `key:"imagePullSecrets" json:"image_pull_secrets"`
 	Namespace                    string                        `key:"namespace" json:"namespace"`
 	ServiceAccountName           string                        `key:"serviceAccountName" json:"service_account_name"`
