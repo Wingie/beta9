@@ -105,5 +105,14 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 		}
 	}
 
+	// Update worker image registry for external workers
+	if useDirectHost && baseConfig.Worker.ExternalRegistryPort > 0 {
+		remoteConfig.Worker.ImageRegistry = fmt.Sprintf(
+			"%s:%d",
+			baseConfig.Tailscale.DirectRedisHost, // Reuse same Tailscale IP
+			baseConfig.Worker.ExternalRegistryPort,
+		)
+	}
+
 	return &remoteConfig, nil
 }

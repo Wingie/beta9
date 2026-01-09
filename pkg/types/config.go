@@ -369,6 +369,7 @@ type WorkerConfig struct {
 	ImageTag                     string                        `key:"imageTag" json:"image_tag"`
 	ImageName                    string                        `key:"imageName" json:"image_name"`
 	ImageRegistry                string                        `key:"imageRegistry" json:"image_registry"`
+	ExternalRegistryPort         int                           `key:"externalRegistryPort" json:"external_registry_port"`
 	ImagePullSecrets             []string                      `key:"imagePullSecrets" json:"image_pull_secrets"`
 	Namespace                    string                        `key:"namespace" json:"namespace"`
 	ServiceAccountName           string                        `key:"serviceAccountName" json:"service_account_name"`
