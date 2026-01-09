@@ -1,9 +1,9 @@
-FROM golang:1.25-bullseye AS base
+FROM golang:1.25-bookworm AS base
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends fuse3
 
-# JuiceFS - build from source for glibc 2.31 compatibility (Debian Bullseye)
+# JuiceFS - build from source (Debian Bookworm)
 RUN apt-get install -y --no-install-recommends libsqlite3-dev && \
     git clone --depth 1 --branch v1.2.1 https://github.com/juicedata/juicefs.git /tmp/juicefs && \
     cd /tmp/juicefs && \
