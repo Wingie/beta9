@@ -3,13 +3,13 @@ FROM golang:1.25-bookworm AS base
 RUN apt-get update && \
     apt-get install -y --no-install-recommends fuse3
 
-# JuiceFS - build from source (Debian Bookworm)
-RUN apt-get install -y --no-install-recommends libsqlite3-dev && \
-    git clone --depth 1 --branch v1.2.1 https://github.com/juicedata/juicefs.git /tmp/juicefs && \
-    cd /tmp/juicefs && \
-    go build -ldflags="-s -w" -o /usr/local/bin/juicefs . && \
-    chmod +x /usr/local/bin/juicefs && \
-    rm -rf /tmp/juicefs
+# JuiceFS - download pre-built binary (avoids Go 1.25 pyroscope-go compatibility issues)
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
+    if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi && \
+    curl -L "https://github.com/juicedata/juicefs/releases/download/v1.2.1/juicefs-1.2.1-linux-${ARCH}.tar.gz" | \
+    tar -xz -C /usr/local/bin juicefs && \
+    chmod +x /usr/local/bin/juicefs
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
 RUN apt-get install -y libfuse2 libfuse-dev bash-completion && \
