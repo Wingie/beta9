@@ -380,7 +380,7 @@ data:
     tailscale:
       enabled: true
       controlUrl: "https://controlplane.tailscale.com"
-      authKey: ""  # Set via: kubectl edit configmap beta9-config -n beta9
+      authKey: "${TAILSCALE_AUTHKEY}"  # Set from .env via envsubst
       hostName: "beta9-gateway"
       directRedisHost: "${TAILSCALE_CONTROLPLANE_IP}"  # OCI Tailscale IP - bypass tsnet service discovery for external workers
     # External worker pools for machines connecting via tunnel
