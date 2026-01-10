@@ -73,12 +73,17 @@ const (
 	GPU_RTX4090 GpuType = "RTX4090"
 	GPU_L40S    GpuType = "L40S"
 
+	// Apple Silicon / Metal Performance Shaders
+	// NOTE: Requires native macOS execution (containers cannot access Metal GPUs)
+	// See docs/macos-gpu-limitations.md for details
+	GPU_MPS GpuType = "MPS"
+
 	NO_GPU  GpuType = "NO_GPU"
 	GPU_ANY GpuType = "any"
 )
 
 func AllGPUTypes() []GpuType {
-	return []GpuType{GPU_A10G, GPU_A100_40, GPU_A100_80, GPU_L4, GPU_T4, GPU_H100, GPU_A6000, GPU_RTX4090, GPU_L40S, GPU_ANY}
+	return []GpuType{GPU_A10G, GPU_A100_40, GPU_A100_80, GPU_L4, GPU_T4, GPU_H100, GPU_A6000, GPU_RTX4090, GPU_L40S, GPU_MPS, GPU_ANY}
 }
 
 func GpuTypesToSlice(gpuTypes []GpuType) []string {
