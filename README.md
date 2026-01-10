@@ -127,59 +127,121 @@ if __name__ == "__main__":
 
 ---
 
-## FlowState Fork - Modifications from Upstream
+## Fork: External Worker Support
 
-This is a fork of [beam-cloud/beta9](https://github.com/beam-cloud/beta9) with modifications to support external GPU workers via SSH tunnel (without requiring the closed-source agent binary or Tailscale VPN).
+This fork of [beam-cloud/beta9](https://github.com/beam-cloud/beta9) adds support for **external GPU workers** - connecting machines outside your k3s cluster to participate in job execution.
 
-### Changes Made
+### The Journey
+
+**Problem**: Beta9's original architecture required:
+1. A closed-source agent binary (~70MB) not included in the repo
+2. Tailscale VPN for network connectivity
+
+**Solution**: We built an open-source Go agent (`b9agent`) that:
+- Registers external machines with the gateway via HTTP
+- Maintains keepalive heartbeats to stay in the worker pool
+- Uses Tailscale mesh VPN for secure machine-to-machine connectivity
+- Provides a real-time TUI dashboard showing worker status and jobs
+
+### Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              TAILSCALE MESH VPN                              │
+│  (Encrypted overlay network - all machines share private 100.x.x.x IPs)      │
+└──────────────────────────────────────────────────────────────────────────────┘
+         │                           │                           │
+         ▼                           ▼                           ▼
+┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+│   GATEWAY       │         │   WORKER 1      │         │   WORKER 2      │
+│   (k3s master)  │         │   (external)    │         │   (external)    │
+│                 │         │                 │         │                 │
+│  ┌───────────┐  │         │  ┌───────────┐  │         │  ┌───────────┐  │
+│  │ beta9-gw  │◄─┼─────────┼──│ b9agent   │  │         │  │ b9agent   │  │
+│  │ :1994     │  │   HTTP  │  │ (Go TUI)  │  │         │  │ (Go TUI)  │  │
+│  └───────────┘  │         │  └───────────┘  │         │  └───────────┘  │
+│        │        │         │        │        │         │        │        │
+│        ▼        │         │        ▼        │         │        ▼        │
+│  ┌───────────┐  │         │  ┌───────────┐  │         │  ┌───────────┐  │
+│  │ k3s API   │◄─┼─────────┼──│ kubelet   │  │         │  │ kubelet   │  │
+│  │ :6443     │  │  JOIN   │  │ (k3s)     │  │         │  │ (k3s)     │  │
+│  └───────────┘  │         │  └───────────┘  │         │  └───────────┘  │
+│        │        │         │        │        │         │        │        │
+│        ▼        │         │        ▼        │         │        ▼        │
+│  ┌───────────┐  │         │  ┌───────────┐  │         │  ┌───────────┐  │
+│  │ scheduler │──┼─────────┼──│ PODS      │  │         │  │ PODS      │  │
+│  └───────────┘  │         │  │ (jobs)    │  │         │  │ (jobs)    │  │
+│                 │         │  └───────────┘  │         │  └───────────┘  │
+└─────────────────┘         └─────────────────┘         └─────────────────┘
+     Oracle Cloud              Mac (M-series)           Lambda Labs (GPU)
+```
+
+### Component Roles
+
+| Component | Role | Location |
+|-----------|------|----------|
+| **Gateway** | Central API server, receives jobs, manages machine registry | k3s master (cloud) |
+| **Agent** (`b9agent`) | Registers machine, sends heartbeats, monitors jobs | Each worker machine |
+| **Worker** | k3s node that executes pods (containers) scheduled by gateway | Each worker machine |
+| **Tailscale** | Mesh VPN providing encrypted 100.x.x.x network | All machines |
+
+### Multi-Machine Connection Guide
+
+**Prerequisites:**
+1. All machines must be on the same Tailscale network
+2. Gateway k3s cluster running with `beta9-gateway` service exposed
+3. k3s join token from gateway (for worker k3s to join cluster)
+
+**Connect a new machine:**
+
+```bash
+# 1. Install Tailscale and join your network
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up --authkey=<YOUR_TAILSCALE_KEY>
+
+# 2. Note your Tailscale IP (100.x.x.x)
+tailscale ip -4
+
+# 3. Create machine token on gateway
+beta9 machine create --pool external
+
+# 4. Initialize agent config on worker
+b9agent init \
+  --gateway <GATEWAY_TAILSCALE_IP>:1994 \
+  --token <MACHINE_TOKEN> \
+  --pool external
+
+# 5. Join k3s cluster (as worker node)
+curl -sfL https://get.k3s.io | K3S_URL=https://<GATEWAY_TAILSCALE_IP>:6443 \
+  K3S_TOKEN=<K3S_JOIN_TOKEN> sh -
+
+# 6. Start the agent (TUI dashboard)
+b9agent
+```
+
+**Verify connection:**
+```bash
+# On gateway - check machine is registered and ready
+beta9 machine list
+
+# On worker - TUI shows status, jobs appear when scheduled
+```
+
+### Gateway API Modifications
 
 #### 1. Added Machine Keepalive Endpoint
 
 **File**: `pkg/api/v1/machine.go`
 
-**Why**: The upstream gateway has a `SetMachineKeepAlive()` function but NO HTTP endpoint to call it. Without this, machines can register but never transition to "ready" status.
-
-**Change**: Added `POST /api/v1/machine/keepalive` endpoint:
-
-```go
-g.POST("/keepalive", group.MachineKeepalive)
-```
-
-**Behavior**:
-- Accepts machine_id, pool_name, agent_version, metrics
-- Calls `providerRepo.SetMachineKeepAlive()` to:
-  - Set machine status to "ready"
-  - Refresh 5-minute TTL
-  - Store metrics
+Added `POST /api/v1/machine/keepalive` - required because upstream gateway had the internal function but no HTTP endpoint.
 
 #### 2. Fixed Tailscale Dependency in Registration
 
 **File**: `pkg/api/v1/machine.go`
 
-**Why**: `RegisterMachine()` called `GetRemoteConfig()` which requires Tailscale to resolve Redis hostnames. For external workers using SSH tunnel (no Tailscale), this caused registration to fail with "Unable to create remote config".
+Made `GetRemoteConfig()` errors non-fatal for external workers.
 
-**Change**: Return null config instead of failing:
-
-```go
-remoteConfig, err := providers.GetRemoteConfig(g.config, g.tailscale)
-if err != nil {
-    // Return nil config - external workers via SSH tunnel don't need it
-    remoteConfig = nil
-}
-```
-
-### Why These Changes?
-
-Beta9's original architecture requires:
-1. **Closed-source agent binary** (~70MB) - distributed at release.beam.cloud, not in this repo
-2. **Tailscale VPN** - for network connectivity between agent and gateway
-
-Our use case:
-- Connect external GPU workers (Lambda Labs, local machines) to self-hosted Beta9
-- Use **SSH tunnels** instead of VPN for simpler network setup
-- Write our own **Python agent** instead of using closed-source binary
-
-### Machine Lifecycle with These Changes
+### Machine State Lifecycle
 
 ```
 ┌─────────┐    ┌────────────┐    ┌─────────────────┐
@@ -190,59 +252,62 @@ beta9 machine    POST              POST /keepalive
 create          /register          (every 60 sec)
 ```
 
-**Important**: Machine state has 5-minute TTL. If keepalive not sent within 5 minutes, the machine is automatically removed from the pool (Redis key expires).
+**TTL**: Machine state expires after 5 minutes without keepalive.
 
-### API Reference
+### Agent TUI Dashboard
 
-#### POST /api/v1/machine/register
-```json
-{
-  "machine_id": "abc123",
-  "hostname": "my-worker",
-  "provider_name": "generic",
-  "pool_name": "gpu",
-  "cpu": "8000m",
-  "memory": "16Gi",
-  "gpu_count": "1",
-  "private_ip": "192.168.1.100"
-}
+The Go agent provides a real-time dashboard:
+
+```
+╔══ Beta9 Agent: 159ecc90 ══════════════════════════════════════════════════════╗
+║ Status: READY │ Gateway: 100.72.101.23 │ Pool: external │ Uptime: 2h 34m      ║
+║ CPU: 18.2% │ Memory: 56.1% │ GPUs: 0 │ Last Heartbeat: 3s ago                 ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║ WORKER PODS                                                                   ║
+╟───────────────────────────────────────────────────────────────────────────────╢
+║ worker-abc123   RUNNING     hello_beta9:hello     12s                         ║
+║ worker-def456   COMPLETED   hello_beta9:hello    847ms  (2 min ago)           ║
+║ worker-ghi789   FAILED      test_job:process     1.2s   (5 min ago)           ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+Press Ctrl+C to quit
 ```
 
-#### POST /api/v1/machine/keepalive
-```json
-{
-  "machine_id": "abc123",
-  "provider_name": "generic",
-  "pool_name": "gpu",
-  "agent_version": "0.1.0",
-  "metrics": {
-    "cpu_utilization_pct": 15.5,
-    "memory_utilization_pct": 42.3
-  }
-}
+**Agent Config** (`~/.b9agent/config.yaml`):
+```yaml
+gateway:
+  host: "100.72.101.23"
+  port: 1994
+machine:
+  id: "159ecc90"
+  token: "<machine-token>"
+  hostname: "100.100.74.117"
+pool: "external"
+k3s:
+  token: "<k3s-bearer-token>"
 ```
 
-### Testing
+---
 
-```bash
-# SSH tunnel to gateway
-ssh -L 1994:localhost:31994 your-server
+## TODOs
 
-# Create machine token
-beta9 machine create --pool gpu
+### MPS (Metal Performance Shaders) Inference Engine
+- [ ] Add MPS device detection for Apple Silicon (M1/M2/M3) GPUs
+- [ ] Expose MPS capability in machine registration metrics
+- [ ] Enable PyTorch MPS backend for ML inference on Mac workers
+- [ ] Connect MPS workers to Tailscale mesh for job scheduling
 
-# Register
-curl -X POST http://localhost:1994/api/v1/machine/register \
-  -H "Authorization: Bearer <TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"machine_id":"abc","pool_name":"gpu",...}'
+### Custom Device Support
+- [ ] Abstract device detection beyond NVIDIA GPUs
+- [ ] Support AMD ROCm devices
+- [ ] Support Intel Arc/oneAPI devices
+- [ ] Support cloud-specific accelerators (TPU, Trainium, Inferentia)
+- [ ] Device capability reporting in keepalive metrics
 
-# Keepalive (must be within 5 minutes!)
-curl -X POST http://localhost:1994/api/v1/machine/keepalive \
-  -H "Authorization: Bearer <TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"machine_id":"abc","pool_name":"gpu","agent_version":"0.1.0"}'
-```
+### Agent Improvements
+- [ ] Interactive TUI with log viewing (press Enter on job)
+- [ ] `b9agent config show/set` subcommands
+- [ ] Auto-reconnect on gateway disconnect
+- [ ] Prometheus metrics endpoint
 
 ---
 
