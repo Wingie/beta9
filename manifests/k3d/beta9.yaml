@@ -359,7 +359,7 @@ data:
           secretKey: test
       runner:
         baseImageName: beta9-runner
-        baseImageRegistry: localhost:5000  # Local registry for OCI workers
+        baseImageRegistry: ${K3S_HOST_IP}:5000  # Host IP accessible from k3s pods (set via .env)
         externalBaseImageRegistry: registry.agentosaurus.com  # HTTPS registry for external workers
         tags:
           python3.8: py38-latest
