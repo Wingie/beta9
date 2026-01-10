@@ -119,6 +119,12 @@ func GetRemoteConfig(baseConfig types.AppConfig, tailscale *network.Tailscale) (
 				baseConfig.Worker.ExternalRegistryPort,
 			)
 		}
+
+		// Update runner base image registry for external workers
+		// External workers need HTTPS registry since they can't access localhost:5000
+		if baseConfig.ImageService.Runner.ExternalBaseImageRegistry != "" {
+			remoteConfig.ImageService.Runner.BaseImageRegistry = baseConfig.ImageService.Runner.ExternalBaseImageRegistry
+		}
 	}
 
 	return &remoteConfig, nil

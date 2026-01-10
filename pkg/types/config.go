@@ -233,10 +233,11 @@ type S3ImageRegistryConfig struct {
 }
 
 type RunnerConfig struct {
-	BaseImageName     string                 `key:"baseImageName" json:"base_image_name"`
-	BaseImageRegistry string                 `key:"baseImageRegistry" json:"base_image_registry"`
-	Tags              map[string]string      `key:"tags" json:"tags"`
-	PythonStandalone  PythonStandaloneConfig `key:"pythonStandalone" json:"python_standalone"`
+	BaseImageName             string                 `key:"baseImageName" json:"base_image_name"`
+	BaseImageRegistry         string                 `key:"baseImageRegistry" json:"base_image_registry"`
+	ExternalBaseImageRegistry string                 `key:"externalBaseImageRegistry" json:"external_base_image_registry"` // HTTPS registry for external workers
+	Tags                      map[string]string      `key:"tags" json:"tags"`
+	PythonStandalone          PythonStandaloneConfig `key:"pythonStandalone" json:"python_standalone"`
 }
 
 type PythonStandaloneConfig struct {
