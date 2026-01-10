@@ -66,8 +66,9 @@ func (a *Agent) Run() error {
 
 // runWithTUI runs the agent with TUI dashboard
 func (a *Agent) runWithTUI() error {
-	// Clear screen and show initial state
+	// Clear screen, hide cursor, and show initial state
 	a.tui.Clear()
+	a.tui.HideCursor()
 
 	// Validate config
 	if err := a.config.Validate(); err != nil {
@@ -205,9 +206,12 @@ func (a *Agent) renderTUI() {
 		)
 	}
 
-	a.tui.Clear()
+	// Move cursor to home position (don't clear - just overwrite)
+	a.tui.MoveCursorHome()
 	output := a.tui.Render(a.state)
 	os.Stdout.WriteString(output)
+	// Clear any leftover lines from previous render
+	a.tui.ClearToEnd()
 }
 
 func (a *Agent) setupSignalHandlers() {
@@ -262,6 +266,10 @@ func (a *Agent) Shutdown() {
 		a.keepaliveLoop.Stop()
 	}
 	a.cancel()
+
+	if a.useTUI && a.tui != nil {
+		a.tui.ShowCursor()
+	}
 
 	if !a.useTUI {
 		log.Info().Msg("Agent shutdown complete")

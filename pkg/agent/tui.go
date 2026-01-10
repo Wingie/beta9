@@ -35,7 +35,8 @@ const (
 
 // TUI handles terminal rendering
 type TUI struct {
-	width int
+	width     int
+	lastLines int // Track lines rendered for proper clearing
 }
 
 // NewTUI creates a new TUI renderer
@@ -45,9 +46,29 @@ func NewTUI() *TUI {
 	}
 }
 
-// Clear clears the terminal screen
+// Clear clears the terminal screen (used once at startup)
 func (t *TUI) Clear() {
-	fmt.Print("\033[H\033[2J")
+	fmt.Print("\033[H\033[2J") // Move to home and clear screen
+}
+
+// MoveCursorHome moves cursor to top-left without clearing
+func (t *TUI) MoveCursorHome() {
+	fmt.Print("\033[H") // Move cursor to home position
+}
+
+// ClearToEnd clears from cursor to end of screen
+func (t *TUI) ClearToEnd() {
+	fmt.Print("\033[J") // Clear from cursor to end of screen
+}
+
+// HideCursor hides the terminal cursor
+func (t *TUI) HideCursor() {
+	fmt.Print("\033[?25l")
+}
+
+// ShowCursor shows the terminal cursor
+func (t *TUI) ShowCursor() {
+	fmt.Print("\033[?25h")
 }
 
 // Render renders the current state to terminal
