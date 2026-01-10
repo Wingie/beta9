@@ -357,6 +357,15 @@ data:
           endpoint: http://localstack:4566
           accessKey: test
           secretKey: test
+      runner:
+        baseImageName: beta9-runner
+        baseImageRegistry: registry.agentosaurus.com  # HTTPS registry for external workers
+        tags:
+          python3.8: py38-latest
+          python3.9: py39-latest
+          python3.10: py310-latest
+          python3.11: py311-latest
+          python3.12: py312-latest
     gateway:
       host: gateway  # k8s service name for local workers
       grpc:
