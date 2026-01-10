@@ -1,0 +1,23 @@
+# CoreDNS Custom Configuration for External DNS Resolution
+#
+# Problem: k3s CoreDNS pods cannot reach Tailscale's MagicDNS (100.100.100.100)
+# because pods use the flannel CNI network which can't route to Tailscale's
+# internal IP. This causes external domain resolution to fail.
+#
+# Solution: Override CoreDNS forwarding to use public DNS servers directly.
+# k3s imports *.override files from this ConfigMap into the main Corefile.
+#
+# See: https://docs.k3s.io/networking#coredns
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  custom.override: |
+    # Forward external DNS queries to public resolvers
+    # This bypasses Tailscale MagicDNS which is unreachable from pods
+    forward . 8.8.8.8 1.1.1.1 {
+      policy sequential
+    }
