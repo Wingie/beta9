@@ -339,8 +339,14 @@ func (wpc *ExternalWorkerPoolController) createWorkerJob(workerId, machineId str
 	workerGpuType := wpc.workerPoolConfig.GPUType
 	workerGpuCount := gpuCount
 
+	// Use ExternalImageRegistry for external workers if configured
+	imageRegistry := wpc.config.Worker.ImageRegistry
+	if wpc.config.Worker.ExternalImageRegistry != "" {
+		imageRegistry = wpc.config.Worker.ExternalImageRegistry
+	}
+
 	workerImage := fmt.Sprintf("%s/%s:%s",
-		wpc.config.Worker.ImageRegistry,
+		imageRegistry,
 		wpc.config.Worker.ImageName,
 		wpc.config.Worker.ImageTag,
 	)
