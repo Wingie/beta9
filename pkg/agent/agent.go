@@ -66,9 +66,8 @@ func (a *Agent) Run() error {
 
 // runWithTUI runs the agent with TUI dashboard
 func (a *Agent) runWithTUI() error {
-	// Clear screen, hide cursor, and show initial state
-	a.tui.Clear()
-	a.tui.HideCursor()
+	// Enter full-screen mode (alternate screen buffer)
+	a.tui.EnterFullScreen()
 
 	// Validate config
 	if err := a.config.Validate(); err != nil {
@@ -220,11 +219,7 @@ func (a *Agent) setupSignalHandlers() {
 
 	go func() {
 		sig := <-sigCh
-		if a.useTUI {
-			// Clear TUI and show shutdown message
-			a.tui.Clear()
-			os.Stdout.WriteString("Shutting down...\n")
-		} else {
+		if !a.useTUI {
 			log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
 		}
 		a.Shutdown()
@@ -268,7 +263,7 @@ func (a *Agent) Shutdown() {
 	a.cancel()
 
 	if a.useTUI && a.tui != nil {
-		a.tui.ShowCursor()
+		a.tui.ExitFullScreen()
 	}
 
 	if !a.useTUI {

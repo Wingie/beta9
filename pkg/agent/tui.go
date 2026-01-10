@@ -19,6 +19,17 @@ const (
 	colorDim    = "\033[2m"
 )
 
+// ANSI screen control codes
+const (
+	enterAltScreen = "\033[?1049h" // Switch to alternate screen buffer
+	exitAltScreen  = "\033[?1049l" // Restore original screen buffer
+	clearScreen    = "\033[2J"     // Clear entire screen
+	moveCursorHome = "\033[H"      // Move cursor to home (0,0)
+	hideCursor     = "\033[?25l"   // Hide cursor
+	showCursor     = "\033[?25h"   // Show cursor
+	clearToEnd     = "\033[J"      // Clear from cursor to end of screen
+)
+
 // Box drawing characters
 const (
 	boxTopLeft     = "╔"
@@ -46,29 +57,43 @@ func NewTUI() *TUI {
 	}
 }
 
+// EnterFullScreen switches to alternate screen buffer for clean TUI
+func (t *TUI) EnterFullScreen() {
+	fmt.Print(enterAltScreen) // Switch to alternate buffer
+	fmt.Print(hideCursor)     // Hide cursor
+	fmt.Print(clearScreen)    // Clear screen
+	fmt.Print(moveCursorHome) // Move to top-left
+}
+
+// ExitFullScreen restores original screen buffer
+func (t *TUI) ExitFullScreen() {
+	fmt.Print(showCursor)    // Show cursor
+	fmt.Print(exitAltScreen) // Restore original buffer
+}
+
 // Clear clears the terminal screen (used once at startup)
 func (t *TUI) Clear() {
-	fmt.Print("\033[H\033[2J") // Move to home and clear screen
+	fmt.Print(moveCursorHome + clearScreen)
 }
 
 // MoveCursorHome moves cursor to top-left without clearing
 func (t *TUI) MoveCursorHome() {
-	fmt.Print("\033[H") // Move cursor to home position
+	fmt.Print(moveCursorHome)
 }
 
 // ClearToEnd clears from cursor to end of screen
 func (t *TUI) ClearToEnd() {
-	fmt.Print("\033[J") // Clear from cursor to end of screen
+	fmt.Print(clearToEnd)
 }
 
 // HideCursor hides the terminal cursor
 func (t *TUI) HideCursor() {
-	fmt.Print("\033[?25l")
+	fmt.Print(hideCursor)
 }
 
 // ShowCursor shows the terminal cursor
 func (t *TUI) ShowCursor() {
-	fmt.Print("\033[?25h")
+	fmt.Print(showCursor)
 }
 
 // Render renders the current state to terminal
