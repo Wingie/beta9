@@ -23,6 +23,8 @@ spec:
     spec:
       automountServiceAccountToken: true
       terminationGracePeriodSeconds: 185
+      imagePullSecrets:
+        - name: registry-credentials
       initContainers:
       - name: wait-on-backends
         image: busybox:1.37.0
@@ -40,7 +42,8 @@ spec:
         env:
         - name: CONFIG_PATH
           value: /etc/beta9/.config.yaml
-        image: registry.localhost:5000/beta9-gateway:latest
+        image: registry.agentosaurus.com/beta9-gateway:latest
+        imagePullPolicy: Always
         name: main
         readinessProbe:
           initialDelaySeconds: 5

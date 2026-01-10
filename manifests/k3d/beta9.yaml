@@ -57,6 +57,8 @@ spec:
     spec:
       hostNetwork: true  # Allow gateway to access host's Tailscale network
       dnsPolicy: ClusterFirstWithHostNet  # Use cluster DNS with hostNetwork
+      imagePullSecrets:
+        - name: registry-credentials
       initContainers:
       - name: wait-for-deps
         image: busybox:1.37.0
@@ -69,7 +71,8 @@ spec:
            echo "All dependencies ready!"']
       containers:
       - name: gateway
-        image: registry.localhost:5000/beta9-gateway:latest
+        image: registry.agentosaurus.com/beta9-gateway:latest
+        imagePullPolicy: Always
         command:
         - /usr/local/bin/gateway
         env:
@@ -132,7 +135,8 @@ spec:
     spec:
       containers:
       - name: proxy
-        image: registry.localhost:5000/beta9-proxy:latest
+        image: registry.agentosaurus.com/beta9-proxy:latest
+        imagePullPolicy: Always
         command:
         - /usr/local/bin/proxy
         securityContext:
