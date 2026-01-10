@@ -12,8 +12,6 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const AgentVersion = "0.1.0-go"
-
 // KeepalivePayload is the request body for keepalive updates
 type KeepalivePayload struct {
 	MachineID    string          `json:"machine_id"`
@@ -27,6 +25,8 @@ type KeepalivePayload struct {
 type KeepaliveLoop struct {
 	config              *AgentConfig
 	metricsCollector    *MetricsCollector
+	state               *AgentState
+	lastMetrics         *MachineMetrics
 	consecutiveFailures int32
 	maxFailures         int32
 	stopCh              chan struct{}
@@ -42,6 +42,26 @@ func NewKeepaliveLoop(config *AgentConfig) *KeepaliveLoop {
 		stopCh:           make(chan struct{}),
 		doneCh:           make(chan struct{}),
 	}
+}
+
+// NewKeepaliveLoopWithState creates a keepalive loop that updates agent state
+func NewKeepaliveLoopWithState(config *AgentConfig, state *AgentState) *KeepaliveLoop {
+	return &KeepaliveLoop{
+		config:           config,
+		metricsCollector: NewMetricsCollector(),
+		state:            state,
+		maxFailures:      3,
+		stopCh:           make(chan struct{}),
+		doneCh:           make(chan struct{}),
+	}
+}
+
+// GetLastMetrics returns the last collected metrics
+func (k *KeepaliveLoop) GetLastMetrics() *MachineMetrics {
+	if k.lastMetrics != nil {
+		return k.lastMetrics
+	}
+	return &MachineMetrics{}
 }
 
 // Start begins the keepalive loop in a goroutine
@@ -99,11 +119,14 @@ func (k *KeepaliveLoop) sendKeepalive(ctx context.Context) bool {
 		metrics = &MachineMetrics{}
 	}
 
+	// Store last metrics for TUI
+	k.lastMetrics = metrics
+
 	payload := &KeepalivePayload{
 		MachineID:    k.config.MachineID,
 		ProviderName: k.config.ProviderName,
 		PoolName:     k.config.PoolName,
-		AgentVersion: AgentVersion,
+		AgentVersion: "0.2.0-go",
 		Metrics:      metrics,
 	}
 
@@ -150,6 +173,9 @@ func (k *KeepaliveLoop) sendKeepalive(ctx context.Context) bool {
 		log.Debug().
 			Str("machine_id", k.config.MachineID).
 			Msg("Keepalive successful")
+		if k.state != nil {
+			k.state.UpdateHeartbeat(true)
+		}
 		return true
 	}
 
@@ -159,6 +185,9 @@ func (k *KeepaliveLoop) sendKeepalive(ctx context.Context) bool {
 		Int32("failure_count", failures).
 		Int32("max_failures", k.maxFailures).
 		Msg("Keepalive failed")
+	if k.state != nil {
+		k.state.UpdateHeartbeat(false)
+	}
 	return false
 }
 

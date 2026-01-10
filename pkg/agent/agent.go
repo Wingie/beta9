@@ -12,19 +12,45 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const AgentVersion = "0.2.0"
+
 // Agent represents the Beta9 agent
 type Agent struct {
 	config        *AgentConfig
 	keepaliveLoop *KeepaliveLoop
+	jobMonitor    *JobMonitor
+	state         *AgentState
+	tui           *TUI
+	useTUI        bool
 	ctx           context.Context
 	cancel        context.CancelFunc
 }
 
-// New creates a new agent instance
+// New creates a new agent instance (legacy, no TUI)
 func New(config *AgentConfig) *Agent {
+	return NewWithTUI(config, false)
+}
+
+// NewWithTUI creates a new agent instance with optional TUI
+func NewWithTUI(config *AgentConfig, useTUI bool) *Agent {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	state := NewAgentState(
+		config.MachineID,
+		config.PoolName,
+		config.GatewayURL(),
+	)
+
+	var tui *TUI
+	if useTUI {
+		tui = NewTUI()
+	}
+
 	return &Agent{
 		config: config,
+		state:  state,
+		tui:    tui,
+		useTUI: useTUI,
 		ctx:    ctx,
 		cancel: cancel,
 	}
@@ -32,6 +58,63 @@ func New(config *AgentConfig) *Agent {
 
 // Run starts the agent lifecycle
 func (a *Agent) Run() error {
+	if a.useTUI {
+		return a.runWithTUI()
+	}
+	return a.runWithLogs()
+}
+
+// runWithTUI runs the agent with TUI dashboard
+func (a *Agent) runWithTUI() error {
+	// Clear screen and show initial state
+	a.tui.Clear()
+
+	// Validate config
+	if err := a.config.Validate(); err != nil {
+		return err
+	}
+
+	// Setup signal handlers
+	a.setupSignalHandlers()
+
+	// Step 1: Register machine
+	a.state.Status = "REGISTERING"
+	a.renderTUI()
+
+	result := RegisterMachine(a.ctx, a.config)
+	if result.Error != nil {
+		a.state.Status = "ERROR"
+		a.renderTUI()
+		return result.Error
+	}
+
+	a.state.Status = "REGISTERED"
+	a.renderTUI()
+
+	// Handle --once mode
+	if a.config.Once {
+		success := SendSingleKeepalive(a.ctx, a.config)
+		a.state.UpdateHeartbeat(success)
+		a.renderTUI()
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+
+	// Step 2: Start job monitor
+	a.jobMonitor = NewJobMonitor(a.state)
+	a.jobMonitor.RefreshPods(a.ctx)
+	a.jobMonitor.Start(a.ctx)
+
+	// Step 3: Start keepalive loop
+	a.keepaliveLoop = NewKeepaliveLoopWithState(a.config, a.state)
+	a.keepaliveLoop.Start(a.ctx)
+
+	// Step 4: TUI refresh loop
+	return a.tuiLoop()
+}
+
+// runWithLogs runs the agent with traditional log output
+func (a *Agent) runWithLogs() error {
 	log.Info().
 		Str("version", AgentVersion).
 		Str("machine_id", a.config.MachineID).
@@ -83,13 +166,63 @@ func (a *Agent) Run() error {
 	return a.monitorHealth()
 }
 
+// tuiLoop renders the TUI periodically
+func (a *Agent) tuiLoop() error {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			return nil
+		case <-ticker.C:
+			a.renderTUI()
+
+			// Check health
+			if a.keepaliveLoop != nil && !a.keepaliveLoop.IsHealthy() {
+				return &ErrKeepaliveFailed{
+					StatusCode: 0,
+					Body:       "too many consecutive failures",
+				}
+			}
+		}
+	}
+}
+
+// renderTUI renders the current state to terminal
+func (a *Agent) renderTUI() {
+	if a.tui == nil {
+		return
+	}
+
+	// Update metrics from keepalive if available
+	if a.keepaliveLoop != nil {
+		metrics := a.keepaliveLoop.GetLastMetrics()
+		a.state.UpdateMetrics(
+			metrics.CpuUtilizationPct,
+			metrics.MemoryUtilizationPct,
+			metrics.FreeGpuCount,
+		)
+	}
+
+	a.tui.Clear()
+	output := a.tui.Render(a.state)
+	os.Stdout.WriteString(output)
+}
+
 func (a *Agent) setupSignalHandlers() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		sig := <-sigCh
-		log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
+		if a.useTUI {
+			// Clear TUI and show shutdown message
+			a.tui.Clear()
+			os.Stdout.WriteString("Shutting down...\n")
+		} else {
+			log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
+		}
 		a.Shutdown()
 	}()
 }
@@ -118,12 +251,21 @@ func (a *Agent) monitorHealth() error {
 
 // Shutdown gracefully stops the agent
 func (a *Agent) Shutdown() {
-	log.Info().Msg("Shutting down agent...")
+	if !a.useTUI {
+		log.Info().Msg("Shutting down agent...")
+	}
+
+	if a.jobMonitor != nil {
+		a.jobMonitor.Stop()
+	}
 	if a.keepaliveLoop != nil {
 		a.keepaliveLoop.Stop()
 	}
 	a.cancel()
-	log.Info().Msg("Agent shutdown complete")
+
+	if !a.useTUI {
+		log.Info().Msg("Agent shutdown complete")
+	}
 }
 
 // GenerateMachineID creates a random 8-character hex machine ID
