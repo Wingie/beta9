@@ -390,6 +390,8 @@ data:
       externalImageRegistry: "registry.agentosaurus.com"  # HTTPS registry for external workers
       imageName: "beta9-worker"
       imageTag: "latest"
+      imagePullSecrets:
+        - "registry-credentials"  # k8s secret for registry.agentosaurus.com auth
       pools:
         external:
           mode: external
