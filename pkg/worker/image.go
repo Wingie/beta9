@@ -865,7 +865,7 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 		return err
 	}
 
-	fmt.Fprintf(f, *request.BuildOptions.Dockerfile)
+	fmt.Fprint(f, *request.BuildOptions.Dockerfile)
 	f.Close()
 
 	imagePath := filepath.Join(buildPath, "image")

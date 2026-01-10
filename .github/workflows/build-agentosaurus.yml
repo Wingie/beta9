@@ -1,3 +1,5 @@
+# Builds multi-arch images (arm64 + amd64) and pushes to registry.agentosaurus.com
+# Deploy manually with: ssh flow "cd ~/FlowState/backend/remote_servers/scripts && ./beta9_deploy.sh"
 name: Build and Push to Agentosaurus Registry
 
 on:
