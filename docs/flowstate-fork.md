@@ -96,13 +96,13 @@ if err != nil {
 
 ### 3. Added Python Agent
 
-**Location:** `cmd/agent/`
+**Location:** `beta9_agent/`
 
 **Purpose:** Open-source replacement for the closed-source Beam agent binary.
 
 **Files:**
 ```
-cmd/agent/
+beta9_agent/
 ├── __init__.py
 ├── main.py            # Entry point, CLI
 ├── config.py          # Configuration
@@ -196,9 +196,9 @@ kubectl rollout restart deployment gateway -n beta9
 ### 3. (Optional) Use Python Agent
 
 ```bash
-cd backend/beta9/cmd/agent
+cd backend/beta9/beta9_agent
 pip install -r requirements.txt
-python -m cmd.agent --token ... --pool-name gpu
+python -m beta9_agent --token ... --pool-name gpu
 ```
 
 ---
@@ -235,7 +235,7 @@ These changes could be contributed upstream as:
 
 | File | Purpose |
 |------|---------|
-| `cmd/agent/*` | Python agent implementation |
+| `beta9_agent/*` | Python agent implementation |
 | `docs/self-hosting/*` | Self-hosting documentation |
 | `docs/external-workers/*` | External worker documentation |
 | `docs/api-reference/machine-api.md` | API documentation |

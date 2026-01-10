@@ -2,10 +2,10 @@
 """Beta9 Agent - Open-source replacement for closed-source agent binary.
 
 Usage:
-    python -m cmd.agent --token TOKEN --machine-id ID --pool-name POOL
+    python -m beta9_agent --token TOKEN --machine-id ID --pool-name POOL
 
 Or with environment variables:
-    BETA9_TOKEN=xxx BETA9_MACHINE_ID=abc123 python -m cmd.agent
+    BETA9_TOKEN=xxx BETA9_MACHINE_ID=abc123 python -m beta9_agent
 """
 
 import signal

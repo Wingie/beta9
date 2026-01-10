@@ -43,7 +43,7 @@ This Python agent replaces the closed-source Beam agent binary (`release.beam.cl
 ### Install Dependencies
 
 ```bash
-cd backend/beta9/cmd/agent
+cd backend/beta9/beta9_agent
 pip install -r requirements.txt
 ```
 
@@ -60,7 +60,7 @@ pip install -r requirements.txt
 ### Basic Usage
 
 ```bash
-python -m cmd.agent \
+python -m beta9_agent \
     --token "YOUR_MACHINE_TOKEN" \
     --machine-id "abc12345" \
     --pool-name gpu \
@@ -75,7 +75,7 @@ python -m cmd.agent \
 ssh -L 1994:localhost:31994 your-gateway-host
 
 # Terminal 2: Run agent
-python -m cmd.agent \
+python -m beta9_agent \
     --token "YOUR_TOKEN" \
     --pool-name gpu \
     --gateway-host localhost \
@@ -85,7 +85,7 @@ python -m cmd.agent \
 ### One-Time Test Run
 
 ```bash
-python -m cmd.agent \
+python -m beta9_agent \
     --token "YOUR_TOKEN" \
     --pool-name gpu \
     --once \
@@ -124,7 +124,7 @@ export BETA9_HOSTNAME="100.100.74.117"  # Your Tailscale IP
 export BETA9_K3S_TOKEN="your-k3s-bearer-token"
 export BETA9_DEBUG="true"
 
-python -m cmd.agent
+python -m beta9_agent
 ```
 
 ## External Worker Setup (Tailscale + Rancher Desktop)
@@ -155,7 +155,7 @@ tailscale ip -4
 ### 3. Run Agent
 
 ```bash
-python -m cmd.agent \
+python -m beta9_agent \
   --token "<machine_token_from_beta9_machine_create>" \
   --machine-id "abc12345" \
   --pool-name external \
@@ -256,14 +256,14 @@ The agent automatically retries keepalive on transient errors.
 ### Running Tests
 
 ```bash
-cd backend/beta9/cmd/agent
+cd backend/beta9/beta9_agent
 python -m pytest tests/
 ```
 
 ### Debug Mode
 
 ```bash
-python -m cmd.agent --debug ...
+python -m beta9_agent --debug ...
 ```
 
 Enables:
@@ -274,7 +274,7 @@ Enables:
 ### Dry Run
 
 ```bash
-python -m cmd.agent --dry-run ...
+python -m beta9_agent --dry-run ...
 ```
 
 Shows configuration without making any API calls.
@@ -323,7 +323,7 @@ python --version  # Need 3.10+
 pip list | grep -E "httpx|psutil|click"
 
 # Run with debug
-python -m cmd.agent --debug --dry-run ...
+python -m beta9_agent --debug --dry-run ...
 ```
 
 ### Registration fails
@@ -341,7 +341,7 @@ beta9 machine create --pool gpu
 The machine expired. Re-run the agent to re-register:
 
 ```bash
-python -m cmd.agent --token "..." --pool-name gpu ...
+python -m beta9_agent --token "..." --pool-name gpu ...
 ```
 
 ## See Also

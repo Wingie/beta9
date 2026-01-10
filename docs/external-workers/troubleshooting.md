@@ -39,7 +39,7 @@ kubectl exec -n beta9 $REDIS_POD -- redis-cli keys "provider:machine:*"
 beta9 machine create --pool gpu
 
 # Use new token immediately
-python -m cmd.agent --token "NEW_TOKEN" ...
+python -m beta9_agent --token "NEW_TOKEN" ...
 ```
 
 ### Error: "Invalid pool name" (500)
@@ -274,13 +274,13 @@ tailscale status
 **Solutions:**
 ```bash
 # Install dependencies
-pip install -r cmd/agent/requirements.txt
+pip install -r beta9_agent/requirements.txt
 
 # Check Python version (3.10+ required)
 python --version
 
 # Run with debug
-python -m cmd.agent --debug ...
+python -m beta9_agent --debug ...
 ```
 
 ### Agent Can't Detect GPUs
@@ -326,7 +326,7 @@ kubectl logs -n beta9 -l app=gateway --tail=20 2>/dev/null
 ### Verbose Agent Run
 
 ```bash
-python -m cmd.agent \
+python -m beta9_agent \
     --token "$TOKEN" \
     --machine-id "$MACHINE_ID" \
     --pool-name gpu \

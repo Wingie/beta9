@@ -112,14 +112,14 @@ ssh -fNL 1994:localhost:31994 your-gateway-host
 ### Step 4: Install and Run Agent
 
 ```bash
-# Clone the repo or copy cmd/agent/ directory
-cd /path/to/beta9/cmd/agent
+# Clone the repo or copy beta9_agent/ directory
+cd /path/to/beta9/beta9_agent
 
 # Install dependencies
 pip install -r requirements.txt
 
 # Run agent with token from Step 2
-python -m cmd.agent \
+python -m beta9_agent \
     --token "YOUR_TOKEN_HERE" \
     --machine-id "1165a9b6" \
     --pool-name gpu \

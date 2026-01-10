@@ -1,4 +1,4 @@
-"""Allow running as: python -m cmd.agent"""
+"""Allow running as: python -m beta9_agent"""
 
 from .main import main
 

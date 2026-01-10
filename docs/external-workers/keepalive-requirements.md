@@ -108,7 +108,7 @@ When the 5-minute TTL expires without a keepalive:
 The agent's keepalive loop:
 
 ```python
-# From cmd/agent/keepalive.py
+# From beta9_agent/keepalive.py
 
 async def keepalive_loop(config: AgentConfig, interval: int = 60):
     """Send keepalive every interval seconds."""
