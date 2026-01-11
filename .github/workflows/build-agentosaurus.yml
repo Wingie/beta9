@@ -37,16 +37,34 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            image=moby/buildkit:latest
 
       - name: Login to Registry (with retry)
         run: |
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             echo "Login attempt $i..."
-            echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin && break
-            echo "Login failed, retrying in 5s..."
-            sleep 5
+            if echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin; then
+              echo "Login succeeded"
+              break
+            fi
+            echo "Login failed, retrying in 10s..."
+            sleep 10
           done
-          docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin <<< "${{ secrets.REGISTRY_PASSWD }}" || exit 1
+
+      - name: Warmup registry connection
+        run: |
+          echo "Testing registry connectivity..."
+          for i in 1 2 3 4 5; do
+            if curl -sf --connect-timeout 30 --max-time 60 "https://${{ env.REGISTRY }}/v2/" > /dev/null 2>&1; then
+              echo "Registry is responsive"
+              break
+            fi
+            echo "Registry not ready, waiting 15s... (attempt $i)"
+            sleep 15
+          done
 
       - name: Build and push gateway
         uses: docker/build-push-action@v5
@@ -81,16 +99,34 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            image=moby/buildkit:latest
 
       - name: Login to Registry (with retry)
         run: |
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             echo "Login attempt $i..."
-            echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin && break
-            echo "Login failed, retrying in 5s..."
-            sleep 5
+            if echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin; then
+              echo "Login succeeded"
+              break
+            fi
+            echo "Login failed, retrying in 10s..."
+            sleep 10
           done
-          docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin <<< "${{ secrets.REGISTRY_PASSWD }}" || exit 1
+
+      - name: Warmup registry connection
+        run: |
+          echo "Testing registry connectivity..."
+          for i in 1 2 3 4 5; do
+            if curl -sf --connect-timeout 30 --max-time 60 "https://${{ env.REGISTRY }}/v2/" > /dev/null 2>&1; then
+              echo "Registry is responsive"
+              break
+            fi
+            echo "Registry not ready, waiting 15s... (attempt $i)"
+            sleep 15
+          done
 
       - name: Build and push worker
         uses: docker/build-push-action@v5
@@ -125,16 +161,34 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            image=moby/buildkit:latest
 
       - name: Login to Registry (with retry)
         run: |
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             echo "Login attempt $i..."
-            echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin && break
-            echo "Login failed, retrying in 5s..."
-            sleep 5
+            if echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin; then
+              echo "Login succeeded"
+              break
+            fi
+            echo "Login failed, retrying in 10s..."
+            sleep 10
           done
-          docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin <<< "${{ secrets.REGISTRY_PASSWD }}" || exit 1
+
+      - name: Warmup registry connection
+        run: |
+          echo "Testing registry connectivity..."
+          for i in 1 2 3 4 5; do
+            if curl -sf --connect-timeout 30 --max-time 60 "https://${{ env.REGISTRY }}/v2/" > /dev/null 2>&1; then
+              echo "Registry is responsive"
+              break
+            fi
+            echo "Registry not ready, waiting 15s... (attempt $i)"
+            sleep 15
+          done
 
       - name: Build and push runner
         uses: docker/build-push-action@v5
