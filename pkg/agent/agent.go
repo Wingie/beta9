@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -26,7 +27,8 @@ type Agent struct {
 	useTUI        bool
 	ctx           context.Context
 	cancel        context.CancelFunc
-	ollama        *OllamaManager // Inference server manager
+	ollama        *OllamaManager  // Inference server manager
+	control       *ControlServer  // Control API server
 }
 
 // New creates a new agent instance (legacy, no TUI)
@@ -56,7 +58,7 @@ func NewWithTUI(config *AgentConfig, useTUI bool) *Agent {
 	}
 	ollama := NewOllamaManager(tailscaleIP, DefaultOllamaPort)
 
-	return &Agent{
+	agent := &Agent{
 		config: config,
 		state:  state,
 		tui:    tui,
@@ -65,6 +67,11 @@ func NewWithTUI(config *AgentConfig, useTUI bool) *Agent {
 		cancel: cancel,
 		ollama: ollama,
 	}
+
+	// Initialize control server (will be started in Run)
+	agent.control = NewControlServer(agent, DefaultControlPort)
+
+	return agent
 }
 
 // detectTailscaleIP attempts to detect the Tailscale IP
@@ -109,7 +116,13 @@ func (a *Agent) runWithTUI() error {
 	a.setupSignalHandlers()
 
 	// Note: OllamaManager is initialized but NOT started here
-	// Ollama only starts when gateway sends "start-inference" command
+	// Ollama only starts when control API receives "start-inference" command
+
+	// Start control server (for receiving start-inference commands)
+	if err := a.control.Start(a.ctx); err != nil {
+		return err
+	}
+	a.state.AddLog(fmt.Sprintf("Control API listening on :%d", DefaultControlPort))
 
 	// Step 1: Register machine
 	a.state.Status = "REGISTERING"
@@ -167,7 +180,13 @@ func (a *Agent) runWithLogs() error {
 	a.setupSignalHandlers()
 
 	// Note: OllamaManager is initialized but NOT started here
-	// Ollama only starts when gateway sends "start-inference" command
+	// Ollama only starts when control API receives "start-inference" command
+
+	// Start control server (for receiving start-inference commands)
+	if err := a.control.Start(a.ctx); err != nil {
+		return err
+	}
+	a.state.AddLog(fmt.Sprintf("Control API listening on :%d", DefaultControlPort))
 
 	// Step 1: Register machine
 	log.Info().Msg("Registering machine with gateway...")
@@ -297,6 +316,9 @@ func (a *Agent) Shutdown() {
 	if a.keepaliveLoop != nil {
 		a.keepaliveLoop.Stop()
 	}
+	if a.control != nil {
+		a.control.Stop()
+	}
 	if a.ollama != nil {
 		a.ollama.Stop()
 	}
@@ -311,7 +333,7 @@ func (a *Agent) Shutdown() {
 	}
 }
 
-// StartInference starts the inference server (called by gateway command)
+// StartInference starts the inference server (called by control API)
 func (a *Agent) StartInference() error {
 	if a.ollama == nil {
 		return nil
@@ -319,12 +341,18 @@ func (a *Agent) StartInference() error {
 
 	if a.ollama.IsRunning() {
 		log.Info().Msg("Inference server already running")
+		a.state.AddLog("Inference: already running")
 		return nil
 	}
 
-	log.Info().Msg("Starting inference server (gateway command)...")
+	log.Info().Msg("Starting inference server...")
+	a.state.AddLog("Inference: starting Ollama...")
+	a.state.UpdateInference("starting", a.ollama.TailscaleIP(), DefaultOllamaPort, nil)
+
 	if err := a.ollama.Start(a.ctx); err != nil {
 		log.Error().Err(err).Msg("Failed to start inference server")
+		a.state.AddLog("Inference: FAILED - " + err.Error())
+		a.state.UpdateInference("error", "", 0, nil)
 		return err
 	}
 
@@ -333,16 +361,21 @@ func (a *Agent) StartInference() error {
 			Int("port", DefaultOllamaPort).
 			Str("tailscale_ip", a.ollama.TailscaleIP()).
 			Msg("Inference server ready")
+		a.state.AddLog("Inference: ready on :" + fmt.Sprintf("%d", DefaultOllamaPort))
+		a.state.UpdateInference("running", a.ollama.TailscaleIP(), DefaultOllamaPort, nil)
 	}
 
 	return nil
 }
 
-// StopInference stops the inference server (called by gateway command)
+// StopInference stops the inference server (called by control API)
 func (a *Agent) StopInference() {
 	if a.ollama != nil && a.ollama.IsRunning() {
-		log.Info().Msg("Stopping inference server (gateway command)...")
+		log.Info().Msg("Stopping inference server...")
+		a.state.AddLog("Inference: stopping...")
 		a.ollama.Stop()
+		a.state.AddLog("Inference: stopped")
+		a.state.UpdateInference("stopped", "", 0, nil)
 	}
 }
 
