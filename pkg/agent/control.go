@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,7 @@ func (c *ControlServer) Start(ctx context.Context) error {
 	mux.HandleFunc("/inference/start", c.handleInferenceStart)
 	mux.HandleFunc("/inference/stop", c.handleInferenceStop)
 	mux.HandleFunc("/inference/status", c.handleInferenceStatus)
+	mux.HandleFunc("/inference/pull", c.handleInferencePull)
 
 	// Agent status
 	mux.HandleFunc("/status", c.handleStatus)
@@ -112,6 +114,95 @@ func (c *ControlServer) handleInferenceStop(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"message": "Inference server stopped",
+	})
+}
+
+// handleInferencePull pulls a model and streams progress to TUI logs
+func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request body
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status": "error",
+			"error":  "Invalid request body",
+		})
+		return
+	}
+
+	if req.Model == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status": "error",
+			"error":  "Model name required",
+		})
+		return
+	}
+
+	log.Info().Str("model", req.Model).Msg("Control: pull model command received")
+	c.agent.state.AddLog(fmt.Sprintf("Pulling model: %s", req.Model))
+
+	// Call Ollama pull API
+	pullReq := map[string]any{"name": req.Model}
+	body, _ := json.Marshal(pullReq)
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://localhost:%d/api/pull", DefaultOllamaPort),
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		c.agent.state.AddLog(fmt.Sprintf("Pull failed: %s", err.Error()))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Stream progress to logs
+	decoder := json.NewDecoder(resp.Body)
+	lastStatus := ""
+	for {
+		var progress struct {
+			Status    string `json:"status"`
+			Digest    string `json:"digest"`
+			Total     int64  `json:"total"`
+			Completed int64  `json:"completed"`
+		}
+		if err := decoder.Decode(&progress); err != nil {
+			break
+		}
+
+		// Update logs with progress (avoid duplicate messages)
+		status := progress.Status
+		if progress.Digest != "" && progress.Total > 0 {
+			pct := float64(progress.Completed) / float64(progress.Total) * 100
+			status = fmt.Sprintf("%s %.0f%%", progress.Status, pct)
+		}
+		if status != lastStatus {
+			c.agent.state.AddLog(fmt.Sprintf("Pull: %s", status))
+			lastStatus = status
+		}
+	}
+
+	c.agent.state.AddLog(fmt.Sprintf("Model %s ready", req.Model))
+
+	// Update models list
+	models := c.getOllamaModels()
+	if c.agent.state != nil {
+		c.agent.state.UpdateInference("running", c.agent.ollama.TailscaleIP(), DefaultOllamaPort, models)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"message": fmt.Sprintf("Model %s pulled successfully", req.Model),
 	})
 }
 
