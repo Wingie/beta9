@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +26,7 @@ type Agent struct {
 	useTUI        bool
 	ctx           context.Context
 	cancel        context.CancelFunc
+	ollama        *OllamaManager // Inference server manager
 }
 
 // New creates a new agent instance (legacy, no TUI)
@@ -46,6 +49,13 @@ func NewWithTUI(config *AgentConfig, useTUI bool) *Agent {
 		tui = NewTUI()
 	}
 
+	// Initialize OllamaManager with Tailscale IP (or hostname)
+	tailscaleIP := config.Hostname
+	if tailscaleIP == "" {
+		tailscaleIP = detectTailscaleIP()
+	}
+	ollama := NewOllamaManager(tailscaleIP, DefaultOllamaPort)
+
 	return &Agent{
 		config: config,
 		state:  state,
@@ -53,7 +63,28 @@ func NewWithTUI(config *AgentConfig, useTUI bool) *Agent {
 		useTUI: useTUI,
 		ctx:    ctx,
 		cancel: cancel,
+		ollama: ollama,
 	}
+}
+
+// detectTailscaleIP attempts to detect the Tailscale IP
+func detectTailscaleIP() string {
+	// Try environment variable first
+	if ip := os.Getenv("TAILSCALE_IP"); ip != "" {
+		return ip
+	}
+
+	// Try running tailscale ip command
+	cmd := exec.Command("tailscale", "ip", "-4")
+	output, err := cmd.Output()
+	if err == nil {
+		ip := strings.TrimSpace(string(output))
+		if ip != "" {
+			return ip
+		}
+	}
+
+	return "localhost"
 }
 
 // Run starts the agent lifecycle
@@ -76,6 +107,11 @@ func (a *Agent) runWithTUI() error {
 
 	// Setup signal handlers
 	a.setupSignalHandlers()
+
+	// Start Ollama inference server (non-blocking, logs errors)
+	if err := a.ollama.Start(a.ctx); err != nil {
+		log.Warn().Err(err).Msg("Failed to start Ollama, inference disabled")
+	}
 
 	// Step 1: Register machine
 	a.state.Status = "REGISTERING"
@@ -131,6 +167,16 @@ func (a *Agent) runWithLogs() error {
 
 	// Setup signal handlers
 	a.setupSignalHandlers()
+
+	// Start Ollama inference server
+	if err := a.ollama.Start(a.ctx); err != nil {
+		log.Warn().Err(err).Msg("Failed to start Ollama, inference disabled")
+	} else if a.ollama.IsRunning() {
+		log.Info().
+			Int("port", DefaultOllamaPort).
+			Str("tailscale_ip", a.ollama.TailscaleIP()).
+			Msg("Ollama inference server ready")
+	}
 
 	// Step 1: Register machine
 	log.Info().Msg("Registering machine with gateway...")
@@ -259,6 +305,9 @@ func (a *Agent) Shutdown() {
 	}
 	if a.keepaliveLoop != nil {
 		a.keepaliveLoop.Stop()
+	}
+	if a.ollama != nil {
+		a.ollama.Stop()
 	}
 	a.cancel()
 

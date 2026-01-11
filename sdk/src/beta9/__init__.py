@@ -1,4 +1,4 @@
-from . import env, schema
+from . import env, inference, schema
 from .abstractions import experimental, integrations
 from .abstractions.base.container import Container
 from .abstractions.endpoint import ASGI as asgi
@@ -45,6 +45,7 @@ from .type import (
 )
 
 __all__ = [
+    "inference",
     "Map",
     "Image",
     "Queue",
