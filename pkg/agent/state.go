@@ -77,7 +77,7 @@ func NewAgentState(machineID, poolName, gateway string) *AgentState {
 		InferenceStatus: "stopped",
 		InferenceModels: make([]string, 0),
 		Logs:            make([]string, 0),
-		MaxLogs:         5,
+		MaxLogs:         10,
 	}
 }
 
@@ -201,12 +201,14 @@ func (s *AgentState) AddLog(msg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Truncate message if too long
-	if len(msg) > 70 {
-		msg = msg[:67] + "..."
+	// Add timestamp and truncate message if too long
+	timestamp := time.Now().Format("15:04:05")
+	entry := timestamp + " " + msg
+	if len(entry) > 70 {
+		entry = entry[:67] + "..."
 	}
 
-	s.Logs = append(s.Logs, msg)
+	s.Logs = append(s.Logs, entry)
 	if len(s.Logs) > s.MaxLogs {
 		s.Logs = s.Logs[len(s.Logs)-s.MaxLogs:]
 	}
