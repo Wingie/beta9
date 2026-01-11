@@ -226,8 +226,8 @@ func runWithConfigFile() {
 	once := flag.Bool("once", false, "Run once then exit")
 	flag.Parse()
 
-	// Configure logging
-	configureLogging(*debug)
+	// Configure logging (disable in TUI mode to avoid screen interference)
+	configureLogging(*debug, *useTUI)
 
 	agentCfg := cfg.ToAgentConfig()
 	agentCfg.Debug = *debug
@@ -265,11 +265,14 @@ func runWithFlags() {
 		return
 	}
 
-	configureLogging(*debug)
+	// Configure logging (disable in TUI mode to avoid screen interference)
+	configureLogging(*debug, *useTUI)
 
 	if *machineID == "" {
 		*machineID = agent.GenerateMachineID()
-		log.Info().Str("machine_id", *machineID).Msg("Generated machine ID")
+		if !*useTUI {
+			log.Info().Str("machine_id", *machineID).Msg("Generated machine ID")
+		}
 	}
 
 	config := &agent.AgentConfig{
@@ -295,8 +298,15 @@ func runWithFlags() {
 	}
 }
 
-func configureLogging(debug bool) {
+func configureLogging(debug bool, useTUI bool) {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+
+	if useTUI {
+		// In TUI mode, disable all log output to avoid interfering with display
+		zerolog.SetGlobalLevel(zerolog.Disabled)
+		return
+	}
+
 	if debug {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
