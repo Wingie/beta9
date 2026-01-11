@@ -119,11 +119,16 @@ FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS nvidia-container-toolkit
 ARG TARGETOS
 ARG TARGETARCH
 
+# Convert ARGs to ENV so they're available inside heredoc
+ENV TARGETOS=${TARGETOS}
+ENV TARGETARCH=${TARGETARCH}
+
 WORKDIR /workspace
 
 RUN apt-get update && apt-get install -y build-essential
 
 RUN <<EOT
+set -ex
 git clone https://github.com/beam-cloud/nvidia-container-toolkit.git .
 # Cross-compile for target architecture
 GOOS=${TARGETOS} GOARCH=${TARGETARCH} make build
