@@ -32,25 +32,25 @@ all: build
 ## build: Build for current platform
 build:
 	@echo "Building $(BINARY) $(VERSION)..."
-	cd $(BETA9_ROOT) && $(GOBUILD) $(LDFLAGS) -o $(CURDIR)/$(BINARY) ./cmd/agent-go/
+	cd $(BETA9_ROOT) && $(GOBUILD) $(LDFLAGS) -o $(CURDIR)/$(BINARY) ./cmd/b9agent/
 	@echo "Built: $(BINARY)"
 
 ## build-linux: Build for Linux amd64
 build-linux:
 	@echo "Building $(BINARY) for Linux amd64..."
-	cd $(BETA9_ROOT) && GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(CURDIR)/$(BINARY)-linux-amd64 ./cmd/agent-go/
+	cd $(BETA9_ROOT) && GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(CURDIR)/$(BINARY)-linux-amd64 ./cmd/b9agent/
 	@echo "Built: $(BINARY)-linux-amd64"
 
 ## build-darwin: Build for macOS amd64
 build-darwin:
 	@echo "Building $(BINARY) for macOS amd64..."
-	cd $(BETA9_ROOT) && GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(CURDIR)/$(BINARY)-darwin-amd64 ./cmd/agent-go/
+	cd $(BETA9_ROOT) && GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(CURDIR)/$(BINARY)-darwin-amd64 ./cmd/b9agent/
 	@echo "Built: $(BINARY)-darwin-amd64"
 
 ## build-darwin-arm64: Build for macOS arm64 (Apple Silicon)
 build-darwin-arm64:
 	@echo "Building $(BINARY) for macOS arm64..."
-	cd $(BETA9_ROOT) && GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(CURDIR)/$(BINARY)-darwin-arm64 ./cmd/agent-go/
+	cd $(BETA9_ROOT) && GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(CURDIR)/$(BINARY)-darwin-arm64 ./cmd/b9agent/
 	@echo "Built: $(BINARY)-darwin-arm64"
 
 ## build-all: Build for all platforms
