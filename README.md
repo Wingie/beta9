@@ -1,284 +1,156 @@
-<div align="center">
-<p align="center">
-<img alt="Logo" src="static/beam-logo-white.png#gh-dark-mode-only" width="30%">
-<img alt="Logo" src="static/beam-logo-dark.png#gh-light-mode-only" width="30%">
-</p>
+# Beta9 - Distributed GPU Compute Platform
 
-## Run AI Workloads at Scale
+**A fork of [beam-cloud/beta9](https://github.com/beam-cloud/beta9) for [Agentosaurus](https://agentosaurus.com)**
 
-<p align="center">
-  </a>
-    <a href="https://colab.research.google.com/drive/1jSDyYY7FY3Y3jJlCzkmHlH8vTyF-TEmB?usp=sharing">
-    <img alt="Colab" src="https://colab.research.google.com/assets/colab-badge.svg">
-  </a>
-  <a href="https://github.com/beam-cloud/beta9/stargazers">
-    <img alt="⭐ Star the Repo" src="https://img.shields.io/github/stars/beam-cloud/beta9">
-  </a>
-  <a href="https://docs.beam.cloud">
-    <img alt="Documentation" src="https://img.shields.io/badge/docs-quickstart-purple">
-  </a>
-  <a href="https://join.slack.com/t/beam-cloud/shared_invite/zt-39hbkt8ty-CTVv4NsgLoYArjWaVkwcFw">
-    <img alt="Join Slack" src="https://img.shields.io/badge/Beam-Join%20Slack-orange?logo=slack">
-  </a>
-    <a href="https://twitter.com/beam_cloud">
-    <img alt="Twitter" src="https://img.shields.io/twitter/follow/beam_cloud.svg?style=social&logo=twitter">
-  </a>
-    <a href="https://github.com/beam-cloud/beta9?tab=AGPL-3.0-1-ov-file">
-    <img alt="AGPL" src="https://img.shields.io/badge/License-AGPL-green">
-  </a>
-</p>
+Beta9 is an open-source distributed GPU compute platform enabling serverless AI workloads across heterogeneous hardware. This fork extends the original with support for external GPU workers, Apple Silicon (MPS) inference, and a unified control API for inference lifecycle management.
 
-</div>
+## Project Status
 
-**[Beam](https://beam.cloud?utm_source=github_readme)** is a fast, open-source runtime for serverless AI workloads. It gives you a Pythonic interface to deploy and scale AI applications with zero infrastructure overhead.
+**Work in Progress** - This fork is under active development as the compute infrastructure layer for Agentosaurus, a platform focused on democratizing GPU access for climate research and AI workloads within the European Union.
 
-![Watch the demo](static/readme.gif)
+## Vision
 
-## ✨ Features
+Build a distributed GPU compute platform that:
 
-- **Fast Image Builds**: Launch containers in under a second using a custom container runtime
-- **Parallelization and Concurrency**: Fan out workloads to 100s of containers
-- **First-Class Developer Experience**: Hot-reloading, webhooks, and scheduled jobs
-- **Scale-to-Zero**: Workloads are serverless by default
-- **Volume Storage**: Mount distributed storage volumes
-- **GPU Support**: Run on our cloud (4090s, H100s, and more) or bring your own GPUs
+- **Brings Your Own GPU**: Connect any machine (cloud VMs, workstations, Mac Studios) to a unified compute pool
+- **Supports Heterogeneous Hardware**: NVIDIA CUDA, Apple MPS, AMD ROCm (planned), Intel Arc (planned)
+- **Enables Serverless by Default**: Scale to zero, pay only for compute time used
+- **Maintains EU Data Sovereignty**: All data and compute remains within European infrastructure
+- **Prioritizes Carbon Efficiency**: Verified renewable energy usage with transparent carbon reporting
 
-## 📦 Installation
-
-```shell
-pip install beam-client
-```
-
-## ⚡️ Quickstart
-
-1. Create an account [here](https://beam.cloud?utm_source=github_readme)
-2. Follow our [Getting Started Guide](https://platform.beam.cloud/onboarding?utm_source=github_readme)
-
-## Creating a sandbox
-
-Spin up isolated containers to run LLM-generated code:
-
-```python
-from beam import Image, Sandbox
-
-
-sandbox = Sandbox(image=Image()).create()
-response = sandbox.process.run_code("print('I am running remotely')")
-
-print(response.result)
-```
-
-## Deploy a serverless inference endpoint
-
-Create an autoscaling endpoint for your custom model:
-
-```python
-from beam import Image, endpoint
-from beam import QueueDepthAutoscaler
-
-@endpoint(
-    image=Image(python_version="python3.11"),
-    gpu="A10G",
-    cpu=2,
-    memory="16Gi",
-    autoscaler=QueueDepthAutoscaler(max_containers=5, tasks_per_container=30)
-)
-def handler():
-    return {"label": "cat", "confidence": 0.97}
-```
-
-## Run background tasks
-
-Schedule resilient background tasks (or replace your Celery queue) by adding a simple decorator:
-
-```python
-from beam import Image, TaskPolicy, schema, task_queue
-
-
-class Input(schema.Schema):
-    image_url = schema.String()
-
-
-@task_queue(
-    name="image-processor",
-    image=Image(python_version="python3.11"),
-    cpu=1,
-    memory=1024,
-    inputs=Input,
-    task_policy=TaskPolicy(max_retries=3),
-)
-def my_background_task(input: Input, *, context):
-    image_url = input.image_url
-    print(f"Processing image: {image_url}")
-    return {"image_url": image_url}
-
-
-if __name__ == "__main__":
-    # Invoke a background task from your app (without deploying it)
-    my_background_task.put(image_url="https://example.com/image.jpg")
-
-    # You can also deploy this behind a versioned endpoint with:
-    # beam deploy app.py:my_background_task --name image-processor
-```
-
-> ## Self-Hosting vs Cloud
->
-> Beta9 is the open-source engine powering [Beam](https://beam.cloud), our fully-managed cloud platform. You can self-host Beta9 for free or choose managed cloud hosting through Beam.
-
----
-
-## Fork: External Worker Support
-
-This fork of [beam-cloud/beta9](https://github.com/beam-cloud/beta9) adds support for **external GPU workers** - connecting machines outside your k3s cluster to participate in job execution.
-
-### The Journey
-
-**Problem**: Beta9's original architecture required:
-1. A closed-source agent binary (~70MB) not included in the repo
-2. Tailscale VPN for network connectivity
-
-**Solution**: We built an open-source Go agent (`b9agent`) that:
-- Registers external machines with the gateway via HTTP
-- Maintains keepalive heartbeats to stay in the worker pool
-- Uses Tailscale mesh VPN for secure machine-to-machine connectivity
-- Provides a real-time TUI dashboard showing worker status and jobs
-
-### Architecture Overview
+## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              TAILSCALE MESH VPN                              │
-│  (Encrypted overlay network - all machines share private 100.x.x.x IPs)      │
-└──────────────────────────────────────────────────────────────────────────────┘
-         │                           │                           │
-         ▼                           ▼                           ▼
-┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
-│   GATEWAY       │         │   WORKER 1      │         │   WORKER 2      │
-│   (k3s master)  │         │   (external)    │         │   (external)    │
-│                 │         │                 │         │                 │
-│  ┌───────────┐  │         │  ┌───────────┐  │         │  ┌───────────┐  │
-│  │ beta9-gw  │◄─┼─────────┼──│ b9agent   │  │         │  │ b9agent   │  │
-│  │ :1994     │  │   HTTP  │  │ (Go TUI)  │  │         │  │ (Go TUI)  │  │
-│  └───────────┘  │         │  └───────────┘  │         │  └───────────┘  │
-│        │        │         │        │        │         │        │        │
-│        ▼        │         │        ▼        │         │        ▼        │
-│  ┌───────────┐  │         │  ┌───────────┐  │         │  ┌───────────┐  │
-│  │ k3s API   │◄─┼─────────┼──│ kubelet   │  │         │  │ kubelet   │  │
-│  │ :6443     │  │  JOIN   │  │ (k3s)     │  │         │  │ (k3s)     │  │
-│  └───────────┘  │         │  └───────────┘  │         │  └───────────┘  │
-│        │        │         │        │        │         │        │        │
-│        ▼        │         │        ▼        │         │        ▼        │
-│  ┌───────────┐  │         │  ┌───────────┐  │         │  ┌───────────┐  │
-│  │ scheduler │──┼─────────┼──│ PODS      │  │         │  │ PODS      │  │
-│  └───────────┘  │         │  │ (jobs)    │  │         │  │ (jobs)    │  │
-│                 │         │  └───────────┘  │         │  └───────────┘  │
-└─────────────────┘         └─────────────────┘         └─────────────────┘
-     Oracle Cloud              Mac (M-series)           Lambda Labs (GPU)
+                          TAILSCALE MESH VPN
+            (Encrypted overlay network - 100.x.x.x addressing)
+    ┌─────────────────────────────────────────────────────────────┐
+    │                                                             │
+    ▼                           ▼                           ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   GATEWAY       │     │   WORKER 1      │     │   WORKER 2      │
+│   (OCI Cloud)   │     │   (Mac MPS)     │     │   (NVIDIA GPU)  │
+│                 │     │                 │     │                 │
+│  ┌───────────┐  │     │  ┌───────────┐  │     │  ┌───────────┐  │
+│  │ Gateway   │◄─┼─────┼──│ b9agent   │  │     │  │ b9agent   │  │
+│  │ :1993/94  │  │     │  │ :9999     │  │     │  │ :9999     │  │
+│  └───────────┘  │     │  └─────┬─────┘  │     │  └─────┬─────┘  │
+│        │        │     │        │        │     │        │        │
+│        ▼        │     │        ▼        │     │        ▼        │
+│  ┌───────────┐  │     │  ┌───────────┐  │     │  ┌───────────┐  │
+│  │ k3s API   │◄─┼─────┼──│ Ollama    │  │     │  │ vLLM      │  │
+│  │ Scheduler │  │     │  │ :11434    │  │     │  │ :8000     │  │
+│  └───────────┘  │     │  └───────────┘  │     │  └───────────┘  │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+     Control Plane           MPS Inference         CUDA Inference
 ```
 
-### Component Roles
+## Key Features
 
-| Component | Role | Location |
-|-----------|------|----------|
-| **Gateway** | Central API server, receives jobs, manages machine registry | k3s master (cloud) |
-| **Agent** (`b9agent`) | Registers machine, sends heartbeats, monitors jobs | Each worker machine |
-| **Worker** | k3s node that executes pods (containers) scheduled by gateway | Each worker machine |
-| **Tailscale** | Mesh VPN providing encrypted 100.x.x.x network | All machines |
+### External Worker Support
 
-### Multi-Machine Connection Guide
+Connect machines outside your Kubernetes cluster to participate in distributed job execution:
 
-**Prerequisites:**
-1. All machines must be on the same Tailscale network
-2. Gateway k3s cluster running with `beta9-gateway` service exposed
-3. k3s join token from gateway (for worker k3s to join cluster)
+- HTTP-based machine registration with the gateway
+- Keepalive heartbeats to maintain worker pool membership
+- Tailscale mesh VPN for secure machine-to-machine connectivity
+- Real-time TUI dashboard showing worker status and job execution
 
-**Connect a new machine:**
+### Apple Silicon (MPS) Inference
 
-```bash
-# 1. Install Tailscale and join your network
-curl -fsSL https://tailscale.com/install.sh | sh
-tailscale up --authkey=<YOUR_TAILSCALE_KEY>
+Native support for Apple Silicon GPUs via Metal Performance Shaders:
 
-# 2. Note your Tailscale IP (100.x.x.x)
-tailscale ip -4
+- Ollama-based inference server management
+- Automatic Tailscale IP binding for mesh accessibility
+- Control API for inference lifecycle (start/stop/pull models)
+- Model pull progress streaming to TUI logs
 
-# 3. Create machine token on gateway
-beta9 machine create --pool external
+### Control API
 
-# 4. Initialize agent config on worker
-b9agent init \
-  --gateway <GATEWAY_TAILSCALE_IP>:1994 \
-  --token <MACHINE_TOKEN> \
-  --pool external
+HTTP control server (port 9999) for external management:
 
-# 5. Join k3s cluster (as worker node)
-curl -sfL https://get.k3s.io | K3S_URL=https://<GATEWAY_TAILSCALE_IP>:6443 \
-  K3S_TOKEN=<K3S_JOIN_TOKEN> sh -
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/inference/start` | POST | Start Ollama inference server |
+| `/inference/stop` | POST | Stop inference server |
+| `/inference/status` | GET | Get inference server status |
+| `/inference/pull` | POST | Pull model with progress logging |
+| `/status` | GET | Get agent status |
+| `/health` | GET | Health check |
 
-# 6. Start the agent (TUI dashboard)
-b9agent
-```
+### TUI Dashboard
 
-**Verify connection:**
-```bash
-# On gateway - check machine is registered and ready
-beta9 machine list
-
-# On worker - TUI shows status, jobs appear when scheduled
-```
-
-### Gateway API Modifications
-
-#### 1. Added Machine Keepalive Endpoint
-
-**File**: `pkg/api/v1/machine.go`
-
-Added `POST /api/v1/machine/keepalive` - required because upstream gateway had the internal function but no HTTP endpoint.
-
-#### 2. Fixed Tailscale Dependency in Registration
-
-**File**: `pkg/api/v1/machine.go`
-
-Made `GetRemoteConfig()` errors non-fatal for external workers.
-
-### Machine State Lifecycle
+Real-time terminal interface showing:
 
 ```
-┌─────────┐    ┌────────────┐    ┌─────────────────┐
-│ pending │───>│ registered │───>│     ready       │
-└─────────┘    └────────────┘    └─────────────────┘
-     │               │                    │
-beta9 machine    POST              POST /keepalive
-create          /register          (every 60 sec)
-```
-
-**TTL**: Machine state expires after 5 minutes without keepalive.
-
-### Agent TUI Dashboard
-
-The Go agent provides a real-time dashboard:
-
-```
-╔══ Beta9 Agent: 159ecc90 ══════════════════════════════════════════════════════╗
-║ Status: READY │ Gateway: 100.72.101.23 │ Pool: external │ Uptime: 2h 34m      ║
-║ CPU: 18.2% │ Memory: 56.1% │ GPUs: 0 │ Last Heartbeat: 3s ago                 ║
-╠═══════════════════════════════════════════════════════════════════════════════╣
-║ WORKER PODS                                                                   ║
-╟───────────────────────────────────────────────────────────────────────────────╢
-║ worker-abc123   RUNNING     hello_beta9:hello     12s                         ║
-║ worker-def456   COMPLETED   hello_beta9:hello    847ms  (2 min ago)           ║
-║ worker-ghi789   FAILED      test_job:process     1.2s   (5 min ago)           ║
-╚═══════════════════════════════════════════════════════════════════════════════╝
+╔══ Beta9 Agent: 1c1b50c8 ═══════════════════════════════════════════════╗
+║ Status: READY │ Gateway: http://100.72.101.23:1994 │ Pool: external    ║
+║ CPU: 28.1% │ Memory: 78.1% │ GPUs: 0 │ Last Heartbeat: 25s ago         ║
+╠════════════════════════════════════════════════════════════════════════╣
+║ WORKER PODS                                                            ║
+╟────────────────────────────────────────────────────────────────────────╢
+║ No jobs yet                                                            ║
+╠════════════════════════════════════════════════════════════════════════╣
+║ INFERENCE                                                              ║
+╟────────────────────────────────────────────────────────────────────────╢
+║ Status: running │ Endpoint: 100.100.74.117:11434                       ║
+║ Models: gemma3:1b                                                      ║
+╠════════════════════════════════════════════════════════════════════════╣
+║ LOGS                                                                   ║
+╟────────────────────────────────────────────────────────────────────────╢
+║ 10:15:23 Control API listening on :9999                                ║
+║ 10:15:24 Inference: starting Ollama...                                 ║
+║ 10:15:26 Inference: ready on :11434                                    ║
+╚════════════════════════════════════════════════════════════════════════╝
 Press Ctrl+C to quit
 ```
 
-**Agent Config** (`~/.b9agent/config.yaml`):
+## Quick Start
+
+### Prerequisites
+
+- Go 1.21+ (for building the agent)
+- Tailscale account and network
+- Ollama (for Mac inference)
+
+### 1. Build the Agent
+
+```bash
+cd backend/beta9
+go build ./cmd/b9agent/...
+```
+
+### 2. Initialize Configuration
+
+```bash
+./b9agent init \
+  --gateway <GATEWAY_TAILSCALE_IP>:1994 \
+  --token <MACHINE_TOKEN> \
+  --pool external
+```
+
+### 3. Start the Agent
+
+```bash
+./b9agent
+```
+
+### 4. Test Inference (from remote machine)
+
+```bash
+# Test inference pipeline
+TEST_MODEL=llama3.2 ./backend/remote_servers/scripts/dgpu/test_inference.sh
+```
+
+## Configuration
+
+Agent configuration is stored in `~/.b9agent/config.yaml`:
+
 ```yaml
 gateway:
   host: "100.72.101.23"
   port: 1994
 machine:
-  id: "159ecc90"
+  id: "1c1b50c8"
   token: "<machine-token>"
   hostname: "100.100.74.117"
 pool: "external"
@@ -286,40 +158,135 @@ k3s:
   token: "<k3s-bearer-token>"
 ```
 
----
+## Python SDK
 
-## TODOs
+The inference module provides a lightweight client for inference endpoints:
 
-### MPS (Metal Performance Shaders) Inference Engine
-- [ ] Add MPS device detection for Apple Silicon (M1/M2/M3) GPUs
-- [ ] Expose MPS capability in machine registration metrics
-- [ ] Enable PyTorch MPS backend for ML inference on Mac workers
-- [ ] Connect MPS workers to Tailscale mesh for job scheduling
+```python
+from beta9 import inference
 
-### Custom Device Support
-- [ ] Abstract device detection beyond NVIDIA GPUs
-- [ ] Support AMD ROCm devices
-- [ ] Support Intel Arc/oneAPI devices
-- [ ] Support cloud-specific accelerators (TPU, Trainium, Inferentia)
-- [ ] Device capability reporting in keepalive metrics
+# Configure endpoint
+inference.configure(host="100.100.74.117", port=11434)
 
-### Agent Improvements
-- [ ] Interactive TUI with log viewing (press Enter on job)
-- [ ] `b9agent config show/set` subcommands
-- [ ] Auto-reconnect on gateway disconnect
-- [ ] Prometheus metrics endpoint
+# Chat completion
+result = inference.chat(
+    model="llama3.2",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(result.content)
 
----
+# Text generation
+result = inference.generate(
+    model="llama3.2",
+    prompt="Once upon a time"
+)
 
-## 👋 Contributing
+# Embeddings
+embedding = inference.embed(
+    model="nomic-embed-text",
+    input="Hello world"
+)
 
-We welcome contributions big or small. These are the most helpful things for us:
+# List models
+models = inference.list_models()
+```
 
-- Submit a [feature request](https://github.com/beam-cloud/beta9/issues/new?assignees=&labels=&projects=&template=feature-request.md&title=) or [bug report](https://github.com/beam-cloud/beta9/issues/new?assignees=&labels=&projects=&template=bug-report.md&title=)
-- Open a PR with a new feature or improvement
+## Testing
 
-## ❤️ Thanks to Our Contributors
+Run the inference test suite:
 
-<a href="https://github.com/beam-cloud/beta9/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=beam-cloud/beta9" />
-</a>
+```bash
+# Default model (llama3.2)
+./backend/remote_servers/scripts/dgpu/test_inference.sh
+
+# Custom model
+TEST_MODEL=gemma3:1b ./backend/remote_servers/scripts/dgpu/test_inference.sh
+
+# Custom host
+BETA9_INFERENCE_HOST=100.100.74.117 ./backend/remote_servers/scripts/dgpu/test_inference.sh
+```
+
+Test output:
+
+```
+[0/6] Sending start-inference command to agent... ✓
+[1/6] Testing health endpoint...                  ✓
+[2/6] Checking model availability...              ✓
+[3/6] Testing chat via curl...                    ✓
+[4/6] Testing Python SDK...                       ✓
+[5/6] Testing latency (3 requests)...             ✓
+[6/6] Stopping inference server...                ✓
+```
+
+## Roadmap
+
+### Phase 1: Foundation (Current)
+
+- [x] External worker registration and keepalive
+- [x] Apple Silicon (MPS) inference via Ollama
+- [x] Control API for inference lifecycle
+- [x] TUI dashboard with inference status and logs
+- [x] Python SDK for inference
+
+### Phase 2: Multi-Backend Inference
+
+- [ ] vLLM integration for NVIDIA GPUs
+- [ ] SGLang integration for structured outputs
+- [ ] Model routing based on hardware capabilities
+- [ ] Automatic model format conversion (GGUF/Safetensors)
+
+### Phase 3: Production Hardening
+
+- [ ] Prometheus metrics export
+- [ ] Carbon footprint tracking
+- [ ] Rate limiting and quotas
+- [ ] Multi-tenant isolation
+
+### Phase 4: Enterprise Features
+
+- [ ] EU AI Act compliance reporting
+- [ ] Model provenance tracking
+- [ ] Audit logging
+- [ ] SSO integration
+
+## Project Structure
+
+```
+beta9/
+├── cmd/
+│   └── b9agent/           # Go agent binary
+│       └── main.go
+├── pkg/
+│   └── agent/
+│       ├── agent.go       # Agent lifecycle management
+│       ├── control.go     # HTTP control API
+│       ├── inference.go   # OllamaManager and inference types
+│       ├── state.go       # Agent state for TUI
+│       └── tui.go         # Terminal UI rendering
+├── sdk/
+│   └── src/
+│       └── beta9/
+│           └── inference.py  # Python inference SDK
+└── docs/
+    └── external-workers/     # External worker documentation
+```
+
+## Related Projects
+
+- **[Agentosaurus](https://agentosaurus.com)** - Organization discovery platform and parent project
+- **[FlowState](https://github.com/Wingie/flowstate-agents)** - AI presentation system using this compute layer
+- **[beam-cloud/beta9](https://github.com/beam-cloud/beta9)** - Upstream project
+
+## License
+
+This fork maintains the same AGPL-3.0 license as the upstream beta9 project.
+
+## Contributing
+
+Contributions are welcome. Please open an issue to discuss proposed changes before submitting a pull request.
+
+## Acknowledgments
+
+- [Beam Cloud](https://beam.cloud) for the original beta9 project
+- [Ollama](https://ollama.ai) for the inference server
+- [Tailscale](https://tailscale.com) for the mesh VPN infrastructure
