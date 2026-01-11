@@ -49,6 +49,25 @@ make install
 /usr/local/bin/skopeo --version
 EOT
 
+# Cross-compile gateway binary on native architecture (FAST)
+# ========================
+FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS gateway-builder
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+COPY go.mod go.sum ./
+ENV GOTOOLCHAIN=auto
+RUN go mod download && go mod verify
+
+COPY . .
+
+# Native cross-compilation - no QEMU needed!
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -o /usr/local/bin/gateway /workspace/cmd/gateway/main.go
+
 # Target used in development environments
 FROM base AS build
 
@@ -65,7 +84,8 @@ COPY --from=skopeo /usr/local/bin/skopeo /usr/local/bin/skopeo
 COPY --from=skopeo /workspace/default-policy.json /etc/containers/policy.json
 COPY . .
 
-RUN go build -o /usr/local/bin/gateway /workspace/cmd/gateway/main.go
+# Use pre-built cross-compiled binary
+COPY --from=gateway-builder /usr/local/bin/gateway /usr/local/bin/gateway
 
 
 # Target used in production-like environments
@@ -75,7 +95,8 @@ WORKDIR /workspace
 
 RUN apt-get autoclean
 
-COPY --from=build /usr/local/bin/gateway /usr/local/bin/
+# Use cross-compiled binary directly (faster than going through build stage)
+COPY --from=gateway-builder /usr/local/bin/gateway /usr/local/bin/
 COPY --from=skopeo /usr/local/bin/skopeo /usr/local/bin/skopeo
 COPY --from=skopeo /workspace/default-policy.json /etc/containers/policy.json
 RUN /usr/local/bin/skopeo --version
