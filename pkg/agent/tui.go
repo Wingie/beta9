@@ -137,11 +137,57 @@ func (t *TUI) Render(state *AgentState) string {
 		sb.WriteString(t.renderLine(boxVertical, fmt.Sprintf(" %sNo jobs yet%s ", colorDim, colorReset), boxVertical))
 	} else {
 		for i, job := range snapshot.Jobs {
-			if i >= 10 { // Show max 10 jobs
-				sb.WriteString(t.renderLine(boxVertical, fmt.Sprintf(" %s... and %d more%s ", colorDim, len(snapshot.Jobs)-10, colorReset), boxVertical))
+			if i >= 5 { // Show max 5 jobs
+				sb.WriteString(t.renderLine(boxVertical, fmt.Sprintf(" %s... and %d more%s ", colorDim, len(snapshot.Jobs)-5, colorReset), boxVertical))
 				break
 			}
 			sb.WriteString(t.renderLine(boxVertical, t.formatJob(job), boxVertical))
+		}
+	}
+
+	// Separator
+	sb.WriteString(t.renderLine(boxMidLeft, "", boxMidRight))
+
+	// Inference status header
+	sb.WriteString(t.renderLine(boxVertical, " INFERENCE ", boxVertical))
+	sb.WriteString(t.renderLine(boxMidHoriz, "", boxMidHoriz))
+
+	// Inference status content
+	inferenceColor := t.inferenceStatusColor(snapshot.InferenceStatus)
+	if snapshot.InferenceStatus == "stopped" {
+		sb.WriteString(t.renderLine(boxVertical, fmt.Sprintf(" Status: %s%s%s │ Waiting for start command ",
+			inferenceColor, snapshot.InferenceStatus, colorReset), boxVertical))
+	} else {
+		endpoint := fmt.Sprintf("%s:%d", snapshot.InferenceIP, snapshot.InferencePort)
+		if snapshot.InferenceIP == "" {
+			endpoint = "not configured"
+		}
+		sb.WriteString(t.renderLine(boxVertical, fmt.Sprintf(" Status: %s%s%s │ Endpoint: %s ",
+			inferenceColor, snapshot.InferenceStatus, colorReset, endpoint), boxVertical))
+	}
+
+	// Models list
+	if len(snapshot.InferenceModels) > 0 {
+		models := strings.Join(snapshot.InferenceModels, ", ")
+		if len(models) > 50 {
+			models = models[:47] + "..."
+		}
+		sb.WriteString(t.renderLine(boxVertical, fmt.Sprintf(" Models: %s ", models), boxVertical))
+	}
+
+	// Separator for logs
+	sb.WriteString(t.renderLine(boxMidLeft, "", boxMidRight))
+
+	// Logs header
+	sb.WriteString(t.renderLine(boxVertical, " LOGS ", boxVertical))
+	sb.WriteString(t.renderLine(boxMidHoriz, "", boxMidHoriz))
+
+	// Logs content
+	if len(snapshot.Logs) == 0 {
+		sb.WriteString(t.renderLine(boxVertical, fmt.Sprintf(" %sNo recent logs%s ", colorDim, colorReset), boxVertical))
+	} else {
+		for _, logLine := range snapshot.Logs {
+			sb.WriteString(t.renderLine(boxVertical, fmt.Sprintf(" %s%s%s ", colorDim, logLine, colorReset), boxVertical))
 		}
 	}
 
@@ -187,6 +233,22 @@ func (t *TUI) statusColor(status string) string {
 		return colorRed + colorBold
 	case "STARTING":
 		return colorCyan + colorBold
+	default:
+		return colorWhite
+	}
+}
+
+// inferenceStatusColor returns ANSI color for inference status
+func (t *TUI) inferenceStatusColor(status string) string {
+	switch status {
+	case "running":
+		return colorGreen + colorBold
+	case "starting":
+		return colorYellow + colorBold
+	case "stopped":
+		return colorDim
+	case "error":
+		return colorRed + colorBold
 	default:
 		return colorWhite
 	}

@@ -53,17 +53,31 @@ type AgentState struct {
 	Jobs        []JobInfo
 	RunningJobs int
 	TotalJobs   int
+
+	// Inference
+	InferenceStatus string // "stopped", "starting", "running", "error"
+	InferenceIP     string
+	InferencePort   int
+	InferenceModels []string // List of loaded models
+
+	// Logs (ring buffer for TUI display)
+	Logs    []string
+	MaxLogs int
 }
 
 // NewAgentState creates a new agent state
 func NewAgentState(machineID, poolName, gateway string) *AgentState {
 	return &AgentState{
-		MachineID: machineID,
-		PoolName:  poolName,
-		Gateway:   gateway,
-		Status:    "STARTING",
-		StartTime: time.Now(),
-		Jobs:      make([]JobInfo, 0),
+		MachineID:       machineID,
+		PoolName:        poolName,
+		Gateway:         gateway,
+		Status:          "STARTING",
+		StartTime:       time.Now(),
+		Jobs:            make([]JobInfo, 0),
+		InferenceStatus: "stopped",
+		InferenceModels: make([]string, 0),
+		Logs:            make([]string, 0),
+		MaxLogs:         5,
 	}
 }
 
@@ -165,5 +179,35 @@ func (s *AgentState) GetSnapshot() AgentState {
 	snapshot := *s
 	snapshot.Jobs = make([]JobInfo, len(s.Jobs))
 	copy(snapshot.Jobs, s.Jobs)
+	snapshot.Logs = make([]string, len(s.Logs))
+	copy(snapshot.Logs, s.Logs)
+	snapshot.InferenceModels = make([]string, len(s.InferenceModels))
+	copy(snapshot.InferenceModels, s.InferenceModels)
 	return snapshot
+}
+
+// UpdateInference updates inference server status
+func (s *AgentState) UpdateInference(status, ip string, port int, models []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.InferenceStatus = status
+	s.InferenceIP = ip
+	s.InferencePort = port
+	s.InferenceModels = models
+}
+
+// AddLog adds a log entry to the ring buffer
+func (s *AgentState) AddLog(msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Truncate message if too long
+	if len(msg) > 70 {
+		msg = msg[:67] + "..."
+	}
+
+	s.Logs = append(s.Logs, msg)
+	if len(s.Logs) > s.MaxLogs {
+		s.Logs = s.Logs[len(s.Logs)-s.MaxLogs:]
+	}
 }

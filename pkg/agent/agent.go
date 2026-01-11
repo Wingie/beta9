@@ -108,10 +108,8 @@ func (a *Agent) runWithTUI() error {
 	// Setup signal handlers
 	a.setupSignalHandlers()
 
-	// Start Ollama inference server (non-blocking, logs errors)
-	if err := a.ollama.Start(a.ctx); err != nil {
-		log.Warn().Err(err).Msg("Failed to start Ollama, inference disabled")
-	}
+	// Note: OllamaManager is initialized but NOT started here
+	// Ollama only starts when gateway sends "start-inference" command
 
 	// Step 1: Register machine
 	a.state.Status = "REGISTERING"
@@ -168,15 +166,8 @@ func (a *Agent) runWithLogs() error {
 	// Setup signal handlers
 	a.setupSignalHandlers()
 
-	// Start Ollama inference server
-	if err := a.ollama.Start(a.ctx); err != nil {
-		log.Warn().Err(err).Msg("Failed to start Ollama, inference disabled")
-	} else if a.ollama.IsRunning() {
-		log.Info().
-			Int("port", DefaultOllamaPort).
-			Str("tailscale_ip", a.ollama.TailscaleIP()).
-			Msg("Ollama inference server ready")
-	}
+	// Note: OllamaManager is initialized but NOT started here
+	// Ollama only starts when gateway sends "start-inference" command
 
 	// Step 1: Register machine
 	log.Info().Msg("Registering machine with gateway...")
@@ -318,6 +309,46 @@ func (a *Agent) Shutdown() {
 	if !a.useTUI {
 		log.Info().Msg("Agent shutdown complete")
 	}
+}
+
+// StartInference starts the inference server (called by gateway command)
+func (a *Agent) StartInference() error {
+	if a.ollama == nil {
+		return nil
+	}
+
+	if a.ollama.IsRunning() {
+		log.Info().Msg("Inference server already running")
+		return nil
+	}
+
+	log.Info().Msg("Starting inference server (gateway command)...")
+	if err := a.ollama.Start(a.ctx); err != nil {
+		log.Error().Err(err).Msg("Failed to start inference server")
+		return err
+	}
+
+	if a.ollama.IsRunning() {
+		log.Info().
+			Int("port", DefaultOllamaPort).
+			Str("tailscale_ip", a.ollama.TailscaleIP()).
+			Msg("Inference server ready")
+	}
+
+	return nil
+}
+
+// StopInference stops the inference server (called by gateway command)
+func (a *Agent) StopInference() {
+	if a.ollama != nil && a.ollama.IsRunning() {
+		log.Info().Msg("Stopping inference server (gateway command)...")
+		a.ollama.Stop()
+	}
+}
+
+// IsInferenceRunning returns whether the inference server is running
+func (a *Agent) IsInferenceRunning() bool {
+	return a.ollama != nil && a.ollama.IsRunning()
 }
 
 // GenerateMachineID creates a random 8-character hex machine ID
