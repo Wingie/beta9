@@ -1,3 +1,4 @@
+# Beta9 Gateway - Multi-arch build with cross-compilation
 FROM golang:1.22-bookworm AS base
 
 RUN apt-get update && \
