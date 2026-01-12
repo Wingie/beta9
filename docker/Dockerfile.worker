@@ -125,11 +125,19 @@ ENV TARGETARCH=${TARGETARCH}
 
 WORKDIR /workspace
 
-RUN apt-get update && apt-get install -y build-essential
+RUN apt-get update && apt-get install -y build-essential gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu
 
 RUN <<EOT
 set -ex
 git clone https://github.com/beam-cloud/nvidia-container-toolkit.git .
+
+# Set cross-compiler based on target architecture
+if [ "${TARGETARCH}" = "arm64" ]; then
+    export CC=aarch64-linux-gnu-gcc
+elif [ "${TARGETARCH}" = "amd64" ]; then
+    export CC=x86_64-linux-gnu-gcc
+fi
+
 # Cross-compile for target architecture
 GOOS=${TARGETOS} GOARCH=${TARGETARCH} make build
 GOOS=${TARGETOS} GOARCH=${TARGETARCH} make binaries
