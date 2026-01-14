@@ -11,6 +11,11 @@ This Python agent replaces the closed-source Beam agent binary (`release.beam.cl
 - **Full source visibility** - Understand exactly what runs on your machines
 - **Cross-platform** - Works on Linux and macOS (for testing)
 
+## Demo
+
+![Demo 1](assets/demo_1.png)
+![Demo 2](assets/demo_2.png)
+
 ## Architecture
 
 ```

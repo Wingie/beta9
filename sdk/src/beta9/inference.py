@@ -40,9 +40,9 @@ from typing import Dict, List, Optional, Union
 
 import httpx
 
-# Default inference endpoint (Ollama-compatible API)
+# Default inference endpoint (Beta9 Gateway)
 DEFAULT_INFERENCE_HOST = os.getenv("BETA9_INFERENCE_HOST", "localhost")
-DEFAULT_INFERENCE_PORT = int(os.getenv("BETA9_INFERENCE_PORT", "11434"))
+DEFAULT_INFERENCE_PORT = int(os.getenv("BETA9_INFERENCE_PORT", "1994"))  # Gateway HTTP port
 
 
 @dataclass

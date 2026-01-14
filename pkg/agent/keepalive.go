@@ -14,11 +14,19 @@ import (
 
 // KeepalivePayload is the request body for keepalive updates
 type KeepalivePayload struct {
-	MachineID    string          `json:"machine_id"`
-	ProviderName string          `json:"provider_name"`
-	PoolName     string          `json:"pool_name"`
-	AgentVersion string          `json:"agent_version"`
-	Metrics      *MachineMetrics `json:"metrics"`
+	MachineID    string           `json:"machine_id"`
+	ProviderName string           `json:"provider_name"`
+	PoolName     string           `json:"pool_name"`
+	AgentVersion string           `json:"agent_version"`
+	Metrics      *MachineMetrics  `json:"metrics"`
+	Inference    *InferenceStatus `json:"inference,omitempty"`
+}
+
+type InferenceStatus struct {
+	Status string   `json:"status"` // stopped, starting, running, error
+	IP     string   `json:"ip,omitempty"`
+	Port   int      `json:"port,omitempty"`
+	Models []string `json:"models,omitempty"`
 }
 
 // KeepaliveLoop manages periodic keepalive updates to the gateway
@@ -128,6 +136,21 @@ func (k *KeepaliveLoop) sendKeepalive(ctx context.Context) bool {
 		PoolName:     k.config.PoolName,
 		AgentVersion: "0.2.0-go",
 		Metrics:      metrics,
+	}
+
+	// Add inference status if state is available
+	if k.state != nil {
+		inferenceObj := &InferenceStatus{
+			Status: k.state.InferenceStatus,
+			Port:   k.state.InferencePort,
+			Models: k.state.InferenceModels,
+		}
+		// If inference is running, use Tailscale IP
+		if k.state.InferenceStatus == "running" && k.state.InferenceIP != "" {
+			inferenceObj.IP = k.state.InferenceIP
+		}
+
+		payload.Inference = inferenceObj
 	}
 
 	log.Debug().

@@ -28,27 +28,51 @@ type RegisterMachineRequest struct {
 }
 
 type MachineKeepaliveRequest struct {
-	MachineID    string                      `json:"machine_id"`
-	ProviderName string                      `json:"provider_name"`
-	PoolName     string                      `json:"pool_name"`
-	AgentVersion string                      `json:"agent_version"`
+	MachineID    string                        `json:"machine_id"`
+	ProviderName string                        `json:"provider_name"`
+	PoolName     string                        `json:"pool_name"`
+	AgentVersion string                        `json:"agent_version"`
 	Metrics      *types.ProviderMachineMetrics `json:"metrics"`
+	Inference    *InferenceStatus              `json:"inference,omitempty"`
+}
+
+type InferenceStatus struct {
+	Status string   `json:"status"` // stopped, starting, running, error
+	IP     string   `json:"ip,omitempty"`
+	Port   int      `json:"port,omitempty"`
+	Models []string `json:"models,omitempty"`
 }
 
 type MachineGroup struct {
-	providerRepo repository.ProviderRepository
-	tailscale    *network.Tailscale
-	routerGroup  *echo.Group
-	config       types.AppConfig
-	workerRepo   repository.WorkerRepository
+	providerRepo      repository.ProviderRepository
+	tailscale         *network.Tailscale
+	routerGroup       *echo.Group
+	config            types.AppConfig
+	workerRepo        repository.WorkerRepository
+	inferenceRegistry interface {
+		RegisterNode(info interface{})
+		UpdateHeartbeat(nodeID string)
+		UpdateNodeModels(nodeID string, models interface{})
+	}
 }
 
-func NewMachineGroup(g *echo.Group, providerRepo repository.ProviderRepository, tailscale *network.Tailscale, config types.AppConfig, workerRepo repository.WorkerRepository) *MachineGroup {
+// Interface for model registry to avoid circular imports if possible,
+// or we need to import it. Since gateway imports apiv1, apiv1 cannot import gateway.
+// We'll define the interface here or pass it as 'any' and cast it, or better, move model registry to a shared package.
+// For now, let's use a narrow interface matching methods we need.
+type InferenceRegistry interface {
+	RegisterNode(info any)
+	UpdateHeartbeat(nodeID string)
+	UpdateNodeModels(nodeID string, models any)
+}
+
+func NewMachineGroup(g *echo.Group, providerRepo repository.ProviderRepository, tailscale *network.Tailscale, config types.AppConfig, workerRepo repository.WorkerRepository, inferenceRegistry any) *MachineGroup {
 	group := &MachineGroup{routerGroup: g,
-		providerRepo: providerRepo,
-		tailscale:    tailscale,
-		config:       config,
-		workerRepo:   workerRepo,
+		providerRepo:      providerRepo,
+		tailscale:         tailscale,
+		config:            config,
+		workerRepo:        workerRepo,
+		inferenceRegistry: inferenceRegistry.(InferenceRegistry),
 	}
 
 	g.GET("/:workspaceId/gpus", auth.WithWorkspaceAuth(group.GPUCounts))
@@ -178,6 +202,24 @@ func (g *MachineGroup) RegisterMachine(ctx echo.Context) error {
 	})
 }
 
+// Helper structs for reflection/dynamic typing without importing gateway
+type NodeInferenceInfo struct {
+	NodeID        string                `json:"node_id"`
+	TailscaleIP   string                `json:"tailscale_ip"`
+	Port          int                   `json:"port"`
+	GPUType       string                `json:"gpu_type"`
+	TotalVRAM     int64                 `json:"total_vram_mb"`
+	AvailableVRAM int64                 `json:"available_vram_mb"`
+	Models        map[string]*ModelInfo `json:"models"`
+}
+
+type ModelInfo struct {
+	Name      string `json:"name"`
+	LoadState string `json:"load_state"`
+	LastUsed  any    `json:"last_used"`
+	LoadedAt  any    `json:"loaded_at"`
+}
+
 func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
 	cc, _ := ctx.(*auth.HttpAuthContext)
 	if (cc.AuthInfo.Token.TokenType != types.TokenTypeMachine) && (cc.AuthInfo.Token.TokenType != types.TokenTypeWorker) {
@@ -208,6 +250,53 @@ func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
 	)
 	if err != nil {
 		return HTTPInternalServerError(fmt.Sprintf("Failed to update keepalive: %v", err))
+	}
+
+	// Update inference status if available
+	if request.Inference != nil && g.inferenceRegistry != nil {
+		if request.Inference.Status == "running" {
+			// Register if needed (idempotent usually) or just update heartbeat
+			// Since we don't have full VRAM info here (it's in metrics but flat),
+			// we construct a best-effort update.
+
+			// Transform models list to map
+			modelsMap := make(map[string]*ModelInfo)
+			for _, m := range request.Inference.Models {
+				modelsMap[m] = &ModelInfo{
+					Name:      m,
+					LoadState: "ready", // Assume ready if reported
+				}
+			}
+
+			// If verify registration needs more info, we might need to handle that.
+			// Ideally we call UpdateHeartbeat and UpdateNodeModels
+			g.inferenceRegistry.UpdateHeartbeat(request.MachineID)
+			g.inferenceRegistry.UpdateNodeModels(request.MachineID, modelsMap)
+
+			// Also ensure node is registered with IP if not already?
+			// The registry.RegisterNode does upsert.
+			// We can try to register it on every heartbeat to be safe or only if missing?
+			// For now let's just update models/heartbeat which should be enough if registered via /inference/nodes/register
+			// But wait, the agent doesn't call /inference/nodes/register explicitly in its main loop?
+			// Ah, the agent doesn't seem to call /inference/nodes/register in `runWithTUI`?
+			// It probably should rely on keepalive.
+
+			// So let's do a RegisterNode call here with available info
+			info := &NodeInferenceInfo{
+				NodeID:      request.MachineID,
+				TailscaleIP: request.Inference.IP,
+				Port:        request.Inference.Port,
+				GPUType:     "MPS", // TODO: Infer from metrics?
+				Models:      modelsMap,
+				// VRAM from metrics if available
+			}
+			// metrics has GPU info?
+			// request.Metrics is *types.ProviderMachineMetrics
+			// It has GpuCount but maybe not VRAM details easily?
+			// Let's rely on update for now.
+
+			g.inferenceRegistry.RegisterNode(info)
+		}
 	}
 
 	// Fetch updated machine state to include in response

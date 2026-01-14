@@ -3,49 +3,17 @@ package gateway
 import (
 	"sync"
 	"time"
+
+	"github.com/beam-cloud/beta9/pkg/types"
 )
 
 // ============================================================================
 // Model Registry - Tracks model availability across nodes
 // ============================================================================
 
-// LoadState represents model loading status
-type LoadState string
-
-const (
-	LoadStateIdle    LoadState = "idle"    // Not loaded, available to pull
-	LoadStateLoading LoadState = "loading" // Currently loading weights
-	LoadStateReady   LoadState = "ready"   // In GPU memory, ready to serve
-	LoadStateError   LoadState = "error"   // Failed to load
-)
-
-// NodeInferenceInfo tracks inference capability of a node
-type NodeInferenceInfo struct {
-	NodeID        string                `json:"node_id"`
-	TailscaleIP   string                `json:"tailscale_ip"`
-	Port          int                   `json:"port"`
-	GPUType       string                `json:"gpu_type"` // "MPS", "CUDA", "ROCm", "CPU"
-	TotalVRAM     int64                 `json:"total_vram_mb"`
-	AvailableVRAM int64                 `json:"available_vram_mb"`
-	Models        map[string]*ModelInfo `json:"models"`
-	LastHeartbeat time.Time             `json:"last_heartbeat"`
-	Healthy       bool                  `json:"healthy"`
-}
-
-// ModelInfo tracks individual model status on a node
-type ModelInfo struct {
-	Name         string    `json:"name"`
-	LoadState    LoadState `json:"load_state"`
-	SizeGB       float64   `json:"size_gb"`
-	LastUsed     time.Time `json:"last_used"`
-	LoadedAt     time.Time `json:"loaded_at"`
-	RequestCount int64     `json:"request_count"`
-	Error        string    `json:"error,omitempty"`
-}
-
 // ModelRegistry tracks model availability across all nodes
 type ModelRegistry struct {
-	nodes map[string]*NodeInferenceInfo
+	nodes map[string]*types.NodeInferenceInfo
 	mu    sync.RWMutex
 
 	// HeartbeatTimeout is how long before a node is considered unhealthy
@@ -55,13 +23,13 @@ type ModelRegistry struct {
 // NewModelRegistry creates a new ModelRegistry
 func NewModelRegistry() *ModelRegistry {
 	return &ModelRegistry{
-		nodes:            make(map[string]*NodeInferenceInfo),
+		nodes:            make(map[string]*types.NodeInferenceInfo),
 		HeartbeatTimeout: 30 * time.Second,
 	}
 }
 
 // RegisterNode registers or updates a node's inference capability
-func (r *ModelRegistry) RegisterNode(info *NodeInferenceInfo) {
+func (r *ModelRegistry) RegisterNode(info *types.NodeInferenceInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -74,7 +42,7 @@ func (r *ModelRegistry) RegisterNode(info *NodeInferenceInfo) {
 			if newModel, exists := info.Models[name]; exists {
 				// Preserve stats that node doesn't send
 				newModel.RequestCount = existingModel.RequestCount
-				if newModel.LoadedAt.IsZero() && existingModel.LoadState == LoadStateReady {
+				if newModel.LoadedAt.IsZero() && existingModel.LoadState == types.LoadStateReady {
 					newModel.LoadedAt = existingModel.LoadedAt
 				}
 			}
@@ -85,7 +53,7 @@ func (r *ModelRegistry) RegisterNode(info *NodeInferenceInfo) {
 }
 
 // UpdateNodeModels updates model states for a node
-func (r *ModelRegistry) UpdateNodeModels(nodeID string, models map[string]*ModelInfo) {
+func (r *ModelRegistry) UpdateNodeModels(nodeID string, models map[string]*types.ModelInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -122,11 +90,11 @@ func (r *ModelRegistry) RemoveNode(nodeID string) {
 
 // FindNodeForModel finds the best node to serve a specific model
 // Returns nil if no suitable node is found
-func (r *ModelRegistry) FindNodeForModel(model string, preferGPU string) *NodeInferenceInfo {
+func (r *ModelRegistry) FindNodeForModel(model string, preferGPU string) *types.NodeInferenceInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var bestNode *NodeInferenceInfo
+	var bestNode *types.NodeInferenceInfo
 	var bestScore int
 
 	for _, node := range r.nodes {
@@ -147,13 +115,13 @@ func (r *ModelRegistry) FindNodeForModel(model string, preferGPU string) *NodeIn
 		score := 0
 
 		switch modelInfo.LoadState {
-		case LoadStateReady:
+		case types.LoadStateReady:
 			score += 100 // Strongly prefer already-loaded models
-		case LoadStateLoading:
+		case types.LoadStateLoading:
 			score += 10 // Slightly prefer loading over idle
-		case LoadStateIdle:
+		case types.LoadStateIdle:
 			score += 1
-		case LoadStateError:
+		case types.LoadStateError:
 			continue // Skip nodes with error state
 		}
 
@@ -182,11 +150,11 @@ func (r *ModelRegistry) FindNodeForModel(model string, preferGPU string) *NodeIn
 }
 
 // FindAnyNodeWithCapacity finds any healthy node with GPU capacity
-func (r *ModelRegistry) FindAnyNodeWithCapacity(minVRAMMB int64, preferGPU string) *NodeInferenceInfo {
+func (r *ModelRegistry) FindAnyNodeWithCapacity(minVRAMMB int64, preferGPU string) *types.NodeInferenceInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var bestNode *NodeInferenceInfo
+	var bestNode *types.NodeInferenceInfo
 	var bestVRAM int64
 
 	for _, node := range r.nodes {
@@ -214,11 +182,11 @@ func (r *ModelRegistry) FindAnyNodeWithCapacity(minVRAMMB int64, preferGPU strin
 }
 
 // ListModels returns all models across all nodes
-func (r *ModelRegistry) ListModels() map[string][]*NodeInferenceInfo {
+func (r *ModelRegistry) ListModels() map[string][]*types.NodeInferenceInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	result := make(map[string][]*NodeInferenceInfo)
+	result := make(map[string][]*types.NodeInferenceInfo)
 
 	for _, node := range r.nodes {
 		if !r.isNodeHealthy(node) {
@@ -234,11 +202,11 @@ func (r *ModelRegistry) ListModels() map[string][]*NodeInferenceInfo {
 }
 
 // ListNodes returns all registered nodes
-func (r *ModelRegistry) ListNodes() []*NodeInferenceInfo {
+func (r *ModelRegistry) ListNodes() []*types.NodeInferenceInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	nodes := make([]*NodeInferenceInfo, 0, len(r.nodes))
+	nodes := make([]*types.NodeInferenceInfo, 0, len(r.nodes))
 	for _, node := range r.nodes {
 		nodes = append(nodes, node)
 	}
@@ -246,7 +214,7 @@ func (r *ModelRegistry) ListNodes() []*NodeInferenceInfo {
 }
 
 // GetNode returns info for a specific node
-func (r *ModelRegistry) GetNode(nodeID string) *NodeInferenceInfo {
+func (r *ModelRegistry) GetNode(nodeID string) *types.NodeInferenceInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.nodes[nodeID]
@@ -272,7 +240,7 @@ func (r *ModelRegistry) MarkModelLoaded(nodeID, model string) {
 
 	if node, ok := r.nodes[nodeID]; ok {
 		if modelInfo, exists := node.Models[model]; exists {
-			modelInfo.LoadState = LoadStateReady
+			modelInfo.LoadState = types.LoadStateReady
 			modelInfo.LoadedAt = time.Now()
 			modelInfo.Error = ""
 		}
@@ -286,7 +254,7 @@ func (r *ModelRegistry) MarkModelError(nodeID, model, errorMsg string) {
 
 	if node, ok := r.nodes[nodeID]; ok {
 		if modelInfo, exists := node.Models[model]; exists {
-			modelInfo.LoadState = LoadStateError
+			modelInfo.LoadState = types.LoadStateError
 			modelInfo.Error = errorMsg
 		}
 	}
@@ -310,7 +278,7 @@ func (r *ModelRegistry) CleanupStaleNodes() int {
 }
 
 // isNodeHealthy checks if a node is healthy (internal, no lock)
-func (r *ModelRegistry) isNodeHealthy(node *NodeInferenceInfo) bool {
+func (r *ModelRegistry) isNodeHealthy(node *types.NodeInferenceInfo) bool {
 	if !node.Healthy {
 		return false
 	}
@@ -335,7 +303,7 @@ func (r *ModelRegistry) Stats() map[string]interface{} {
 		}
 		for _, model := range node.Models {
 			totalModels++
-			if model.LoadState == LoadStateReady {
+			if model.LoadState == types.LoadStateReady {
 				readyModels++
 			}
 		}

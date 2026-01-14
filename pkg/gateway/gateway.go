@@ -79,6 +79,7 @@ type Gateway struct {
 	cancelFunc           context.CancelFunc
 	baseRouteGroup       *echo.Group
 	rootRouteGroup       *echo.Group
+	InferenceRegistry    *ModelRegistry
 }
 
 func NewGateway() (*Gateway, error) {
@@ -234,8 +235,17 @@ func (g *Gateway) initHttp() error {
 	g.baseRouteGroup = e.Group(apiv1.HttpServerBaseRoute)
 	g.rootRouteGroup = e.Group(apiv1.HttpServerRootRoute)
 
+	// Register inference routes
+	// Note: Authentication is skipped for now to facilitate testing, or use authMiddleware if needed
+	inferenceGroup := g.baseRouteGroup.Group("/inference")
+	if g.InferenceRegistry == nil {
+		g.InferenceRegistry = NewModelRegistry()
+	}
+	inferenceService := NewInferenceService(g.ctx, g.InferenceRegistry)
+	inferenceService.RegisterRoutes(inferenceGroup)
+
 	apiv1.NewHealthGroup(g.baseRouteGroup.Group("/health"), g.RedisClient, g.BackendRepo)
-	apiv1.NewMachineGroup(g.baseRouteGroup.Group("/machine", authMiddleware), g.ProviderRepo, g.Tailscale, g.Config, g.workerRepo)
+	apiv1.NewMachineGroup(g.baseRouteGroup.Group("/machine", authMiddleware), g.ProviderRepo, g.Tailscale, g.Config, g.workerRepo, g.InferenceRegistry)
 	apiv1.NewWorkspaceGroup(g.baseRouteGroup.Group("/workspace", authMiddleware), g.BackendRepo, g.WorkspaceRepo, g.DefaultStorageClient, g.Config)
 	apiv1.NewTokenGroup(g.baseRouteGroup.Group("/token", authMiddleware), g.BackendRepo, g.WorkspaceRepo, g.Config)
 	apiv1.NewTaskGroup(g.baseRouteGroup.Group("/task", authMiddleware), g.RedisClient, g.TaskRepo, g.ContainerRepo, g.BackendRepo, g.TaskDispatcher, g.Scheduler, g.Config)
@@ -244,6 +254,9 @@ func (g *Gateway) initHttp() error {
 	apiv1.NewConcurrencyLimitGroup(g.baseRouteGroup.Group("/concurrency-limit", authMiddleware), g.BackendRepo, g.WorkspaceRepo)
 	apiv1.NewDeploymentGroup(g.baseRouteGroup.Group("/deployment", authMiddleware), g.BackendRepo, g.ContainerRepo, *g.Scheduler, g.RedisClient, g.Config)
 	apiv1.NewAppGroup(g.baseRouteGroup.Group("/app", authMiddleware), g.BackendRepo, g.Config, g.ContainerRepo, *g.Scheduler, g.RedisClient)
+
+	// Start registry cleanup
+	StartRegistryCleanup(g.ctx, g.InferenceRegistry)
 
 	return nil
 }
