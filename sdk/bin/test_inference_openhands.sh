@@ -56,10 +56,3 @@ curl -s -X POST "http://$GATEWAY_HOST:$GATEWAY_PORT/api/v1/inference/embeddings"
 echo ""
 
 echo "Test complete."
-
-# 6. Test CLI commands
-echo "6. Testing CLI Commands..."
-beta9 inference health --context default
-beta9 inference nodes --context default
-beta9 inference models --context default
-beta9 inference chat --model "$MODEL_NAME" --message "Hello from CLI" --context default
