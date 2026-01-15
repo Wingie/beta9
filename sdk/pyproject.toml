@@ -25,6 +25,7 @@ dependencies = [
     "websockets>=13,<14",
     "pyyaml<7.0.0,>=6.0.0",
     "httpx<1.0.0,>=0.27.0",
+    "sentry-sdk>=1.0.0",
 ]
 name = "beta9"
 version = "0.1.243"

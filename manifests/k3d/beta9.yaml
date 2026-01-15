@@ -78,6 +78,10 @@ spec:
         env:
         - name: CONFIG_PATH
           value: /etc/beta9/config.yaml
+        - name: SENTRY_DSN
+          value: "${SENTRY_DSN}"  # From .env via envsubst
+        - name: SENTRY_ENVIRONMENT
+          value: "${SENTRY_ENVIRONMENT:-development}"
         ports:
         - name: grpc
           containerPort: 1993
