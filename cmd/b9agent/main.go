@@ -16,8 +16,25 @@ import (
 
 var version = "0.2.0"
 
+package main
+
+import (
+  "log"
+
+  "github.com/getsentry/sentry-go"
+)
+
+
 func main() {
 	// Check for subcommands first
+
+	  err := sentry.Init(sentry.ClientOptions{
+    Dsn: "https://e87dca2b7d851b75c7c4971ebaf46f0b@o4510715842330624.ingest.de.sentry.io/4510715850719312",
+  })
+  if err != nil {
+    log.Fatalf("sentry.Init: %s", err)
+  }
+
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "init":
