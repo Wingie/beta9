@@ -399,7 +399,7 @@ data:
       directRedisHost: "${TAILSCALE_CONTROLPLANE_IP}"  # OCI Tailscale IP - bypass tsnet service discovery for external workers
     # External worker pools for machines connecting via tunnel
     worker:
-      imageRegistry: "localhost:5000"  # Local registry for workers on same cluster
+      imageRegistry: "registry.agentosaurus.com"  # HTTPS registry for all workers
       externalRegistryPort: 30500       # NodePort fallback for HTTP registry (via Tailscale)
       externalImageRegistry: "registry.agentosaurus.com"  # HTTPS registry for external workers
       imageName: "beta9-worker"
