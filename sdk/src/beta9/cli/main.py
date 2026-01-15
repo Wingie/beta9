@@ -26,6 +26,7 @@ from . import (
     token,
     volume,
     worker,
+    inference,
 )
 from .extraclick import CLICK_CONTEXT_SETTINGS, ClickCommonGroup, CommandGroupCollection
 
@@ -109,6 +110,7 @@ def load_cli(check_config=True, **kwargs: Any) -> CLI:
     cli.register(shell)
     cli.register(run)
     cli.register(dev)
+    cli.register(inference)
 
     if check_config:
         cli.check_config()
