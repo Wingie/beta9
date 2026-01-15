@@ -212,12 +212,8 @@ spec:
     auth:
       enabled: false
     image:
-      registry: registry.agentosaurus.com
-      repository: bitnami/redis
-      tag: "latest"
+      tag: "7.2.4"
       pullPolicy: IfNotPresent
-      pullSecrets:
-        - registry-credentials
     master:
       configuration: |
         activedefrag yes
@@ -249,12 +245,8 @@ spec:
           password: password
           database: main
     image:
-      registry: registry.agentosaurus.com
-      repository: bitnami/postgresql
-      tag: "latest"
+      tag: "16.2.0"
       pullPolicy: IfNotPresent
-      pullSecrets:
-        - registry-credentials
     primary:
       extendedConfiguration: |
         max_connections=400
@@ -293,12 +285,8 @@ spec:
     auth:
       enabled: false
     image:
-      registry: registry.agentosaurus.com
-      repository: bitnami/redis
-      tag: "latest"
+      tag: "7.2.4"
       pullPolicy: IfNotPresent
-      pullSecrets:
-        - registry-credentials
     master:
       persistence:
         size: 1Gi
