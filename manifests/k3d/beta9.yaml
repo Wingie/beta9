@@ -210,7 +210,7 @@ spec:
     auth:
       enabled: false
     image:
-      registry: registry.agentosaurus.com
+      registry: docker.io
       repository: bitnami/redis
       tag: "7.2.4"
       pullPolicy: IfNotPresent
@@ -245,7 +245,7 @@ spec:
           password: password
           database: main
     image:
-      registry: registry.agentosaurus.com
+      registry: docker.io
       repository: bitnami/postgresql
       tag: "16.2.0"
       pullPolicy: IfNotPresent
@@ -283,7 +283,7 @@ spec:
     auth:
       enabled: false
     image:
-      registry: registry.agentosaurus.com
+      registry: docker.io
       repository: bitnami/redis
       tag: "7.2.4"
       pullPolicy: IfNotPresent
