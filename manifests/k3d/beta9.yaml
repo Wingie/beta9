@@ -73,7 +73,7 @@ spec:
            echo "All dependencies ready!"']
       containers:
       - name: gateway
-        image: registry.agentosaurus.com/beta9-gateway:latest
+        image: registry.agentosaurus.com/beta9-gateway:v0.1.0
         imagePullPolicy: IfNotPresent
         command:
         - /usr/local/bin/gateway
