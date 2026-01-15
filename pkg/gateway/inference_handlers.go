@@ -7,6 +7,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog/log"
+
+	"github.com/beam-cloud/beta9/pkg/types"
 )
 
 // ============================================================================
@@ -224,13 +226,13 @@ func (s *InferenceService) handleListNodes(c echo.Context) error {
 
 // NodeRegistrationRequest is the payload for node registration
 type NodeRegistrationRequest struct {
-	NodeID        string                `json:"node_id"`
-	TailscaleIP   string                `json:"tailscale_ip"`
-	Port          int                   `json:"port"`
-	GPUType       string                `json:"gpu_type"`
-	TotalVRAM     int64                 `json:"total_vram_mb"`
-	AvailableVRAM int64                 `json:"available_vram_mb"`
-	Models        map[string]*ModelInfo `json:"models"`
+	NodeID        string                      `json:"node_id"`
+	TailscaleIP   string                      `json:"tailscale_ip"`
+	Port          int                         `json:"port"`
+	GPUType       string                      `json:"gpu_type"`
+	TotalVRAM     int64                       `json:"total_vram_mb"`
+	AvailableVRAM int64                       `json:"available_vram_mb"`
+	Models        map[string]*types.ModelInfo `json:"models"`
 }
 
 // handleRegisterNode handles POST /v1/inference/nodes/register
@@ -253,10 +255,10 @@ func (s *InferenceService) handleRegisterNode(c echo.Context) error {
 	}
 
 	if req.Models == nil {
-		req.Models = make(map[string]*ModelInfo)
+		req.Models = make(map[string]*types.ModelInfo)
 	}
 
-	info := &NodeInferenceInfo{
+	info := &types.NodeInferenceInfo{
 		NodeID:        req.NodeID,
 		TailscaleIP:   req.TailscaleIP,
 		Port:          req.Port,
@@ -282,8 +284,8 @@ func (s *InferenceService) handleRegisterNode(c echo.Context) error {
 
 // HeartbeatRequest is the payload for heartbeats
 type HeartbeatRequest struct {
-	Models        map[string]*ModelInfo `json:"models,omitempty"`
-	AvailableVRAM int64                 `json:"available_vram_mb,omitempty"`
+	Models        map[string]*types.ModelInfo `json:"models,omitempty"`
+	AvailableVRAM int64                       `json:"available_vram_mb,omitempty"`
 }
 
 // handleHeartbeat handles POST /v1/inference/nodes/:nodeId/heartbeat

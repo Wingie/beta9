@@ -113,17 +113,23 @@ func (t *TUI) Render(state *AgentState) string {
 		t.formatDuration(snapshot.Uptime()))
 	sb.WriteString(t.renderLine(boxVertical, statusLine, boxVertical))
 
-	// Metrics line
+	// Metrics line with progress bars
 	heartbeatAgo := "never"
 	if !snapshot.LastHeartbeat.IsZero() {
 		heartbeatAgo = t.formatDuration(snapshot.TimeSinceHeartbeat()) + " ago"
 	}
-	metricsLine := fmt.Sprintf(" CPU: %.1f%% │ Memory: %.1f%% │ GPUs: %d │ Last Heartbeat: %s ",
-		snapshot.CPUPercent,
-		snapshot.MemoryPercent,
-		snapshot.GPUCount,
-		heartbeatAgo)
+
+	cpuBar := t.drawProgressBar(snapshot.CPUPercent, 10)
+	memBar := t.drawProgressBar(snapshot.MemoryPercent, 10)
+
+	metricsLine := fmt.Sprintf(" CPU: [%s] %.1f%% │ Memory: [%s] %.1f%% │ GPUs: %d ",
+		cpuBar, snapshot.CPUPercent,
+		memBar, snapshot.MemoryPercent,
+		snapshot.GPUCount)
 	sb.WriteString(t.renderLine(boxVertical, metricsLine, boxVertical))
+
+	heartbeatLine := fmt.Sprintf(" Last Heartbeat: %s ", heartbeatAgo)
+	sb.WriteString(t.renderLine(boxVertical, heartbeatLine, boxVertical))
 
 	// Separator
 	sb.WriteString(t.renderLine(boxMidLeft, "", boxMidRight))
@@ -347,4 +353,35 @@ func stripANSI(s string) string {
 		result = result[:start] + result[start+end+1:]
 	}
 	return result
+}
+
+// drawProgressBar creates an ASCII progress bar
+func (t *TUI) drawProgressBar(percent float64, width int) string {
+	if width < 1 {
+		width = 10
+	}
+	// Limit percent to 0-100
+	if percent < 0 {
+		percent = 0
+	} else if percent > 100 {
+		percent = 100
+	}
+
+	filled := int((percent / 100.0) * float64(width))
+	if filled > width {
+		filled = width
+	}
+
+	// Use block characters for smoother look
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+
+	// Colorize based on usage
+	color := colorGreen
+	if percent > 80 {
+		color = colorRed
+	} else if percent > 60 {
+		color = colorYellow
+	}
+
+	return color + bar + colorReset
 }

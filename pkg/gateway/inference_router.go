@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/rs/zerolog/log"
 )
 
@@ -18,12 +19,12 @@ import (
 
 // ChatRequest is the incoming chat request format (OpenAI-compatible)
 type ChatRequest struct {
-	Model       string         `json:"model"`
-	Messages    []ChatMessage  `json:"messages"`
-	Temperature float64        `json:"temperature,omitempty"`
-	MaxTokens   int            `json:"max_tokens,omitempty"`
-	Stream      bool           `json:"stream,omitempty"`
-	PreferGPU   string         `json:"prefer_gpu,omitempty"` // "MPS", "CUDA", etc.
+	Model       string        `json:"model"`
+	Messages    []ChatMessage `json:"messages"`
+	Temperature float64       `json:"temperature,omitempty"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
+	Stream      bool          `json:"stream,omitempty"`
+	PreferGPU   string        `json:"prefer_gpu,omitempty"` // "MPS", "CUDA", etc.
 }
 
 // ChatMessage represents a chat message
@@ -104,7 +105,7 @@ func NewInferenceRouter(registry *ModelRegistry) *InferenceRouter {
 }
 
 // Route finds the best node for a model request
-func (r *InferenceRouter) Route(model string, preferGPU string) (*NodeInferenceInfo, error) {
+func (r *InferenceRouter) Route(model string, preferGPU string) (*types.NodeInferenceInfo, error) {
 	node := r.registry.FindNodeForModel(model, preferGPU)
 	if node == nil {
 		return nil, &RouterError{
@@ -183,10 +184,10 @@ func (r *InferenceRouter) Chat(ctx context.Context, req *ChatRequest) (*ChatResp
 			Role    string `json:"role"`
 			Content string `json:"content"`
 		} `json:"message"`
-		Done               bool  `json:"done"`
-		TotalDuration      int64 `json:"total_duration"`
-		PromptEvalCount    int   `json:"prompt_eval_count"`
-		EvalCount          int   `json:"eval_count"`
+		Done            bool  `json:"done"`
+		TotalDuration   int64 `json:"total_duration"`
+		PromptEvalCount int   `json:"prompt_eval_count"`
+		EvalCount       int   `json:"eval_count"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&ollamaResp); err != nil {
@@ -354,12 +355,12 @@ func (r *InferenceRouter) ListModels() map[string][]ModelLocation {
 
 // ModelLocation describes where a model is available
 type ModelLocation struct {
-	NodeID      string    `json:"node_id"`
-	TailscaleIP string    `json:"tailscale_ip"`
-	Port        int       `json:"port"`
-	GPUType     string    `json:"gpu_type"`
-	LoadState   LoadState `json:"load_state"`
-	LastUsed    time.Time `json:"last_used"`
+	NodeID      string          `json:"node_id"`
+	TailscaleIP string          `json:"tailscale_ip"`
+	Port        int             `json:"port"`
+	GPUType     string          `json:"gpu_type"`
+	LoadState   types.LoadState `json:"load_state"`
+	LastUsed    time.Time       `json:"last_used"`
 }
 
 // Health returns router health status
@@ -462,7 +463,7 @@ func (r *InferenceRouter) UnloadModel(ctx context.Context, nodeID, model string)
 	// Update registry regardless of response
 	if node := r.registry.GetNode(nodeID); node != nil {
 		if modelInfo, exists := node.Models[model]; exists {
-			modelInfo.LoadState = LoadStateIdle
+			modelInfo.LoadState = types.LoadStateIdle
 		}
 	}
 

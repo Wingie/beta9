@@ -38,3 +38,10 @@ pyrightconfig.json
 /b9agent
 /gateway
 /worker
+agent-go
+cmd/agent-go/b9agent
+b9agent
+b9gateway-linux
+gateway
+worker
+>>>>>>> wingie/main
