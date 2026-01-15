@@ -161,6 +161,7 @@ WORKDIR /workspace
 COPY go.mod go.sum ./
 # Allow Go toolchain to auto-download newer versions if needed
 ENV GOTOOLCHAIN=auto
+ENV GOPROXY=direct
 RUN go mod download
 COPY --exclude=sdk . .
 
@@ -250,7 +251,7 @@ EOT
 # Hard-disable any AMDGPU plugin that might exist from base layers or future package updates
 RUN mkdir -p /usr/lib/criu/plugins.disabled && \
     if [ -e /usr/lib/criu/amdgpu_plugin.so ]; then \
-        mv /usr/lib/criu/amdgpu_plugin.so /usr/lib/criu/plugins.disabled/ ; \
+    mv /usr/lib/criu/amdgpu_plugin.so /usr/lib/criu/plugins.disabled/ ; \
     fi && \
     true
 
@@ -274,9 +275,9 @@ RUN apt-get install -y ripgrep wget
 
 
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      wget https://github.com/beam-cloud/goproc/releases/download/v0.1.5/goproc-0.1.5-linux-arm64 -O /usr/local/bin/goproc && chmod +x /usr/local/bin/goproc ; \
+    wget https://github.com/beam-cloud/goproc/releases/download/v0.1.5/goproc-0.1.5-linux-arm64 -O /usr/local/bin/goproc && chmod +x /usr/local/bin/goproc ; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
-      wget https://github.com/beam-cloud/goproc/releases/download/v0.1.5/goproc-0.1.5-linux-amd64 -O /usr/local/bin/goproc && chmod +x /usr/local/bin/goproc ; \
+    wget https://github.com/beam-cloud/goproc/releases/download/v0.1.5/goproc-0.1.5-linux-amd64 -O /usr/local/bin/goproc && chmod +x /usr/local/bin/goproc ; \
     fi
 
 RUN apt-get remove -y curl && \
@@ -308,9 +309,9 @@ COPY ./bin/volume_cache_arm.so /usr/local/lib/volume_cache_arm.so
 
 RUN if [ "$(uname -m)" = "x86_64" ]; then \
     cp /usr/local/lib/volume_cache_x86.so /usr/local/lib/volume_cache.so; \
-else \
+    else \
     cp /usr/local/lib/volume_cache_arm.so /usr/local/lib/volume_cache.so; \
-fi
+    fi
 
 COPY --from=worker /usr/local/bin/worker /usr/local/bin/worker
 COPY --from=worker /usr/local/bin/worker-debug /usr/local/bin/worker-debug

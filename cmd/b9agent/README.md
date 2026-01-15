@@ -1,4 +1,4 @@
-# b9agent - Beta9 External Worker Agent
+# b9agent
 
 A Go-based agent for connecting external machines to a Beta9 cluster as workers.
 
@@ -74,7 +74,7 @@ b9agent config
 The agent displays a real-time dashboard showing:
 
 ```
-╔══ Beta9 Agent: 159ecc90 ══════════════════════════════════════════════════════╗
+╔══ b9agent: 159ecc90 ══════════════════════════════════════════════════════════╗
 ║ Status: READY │ Gateway: 100.72.101.23 │ Pool: external │ Uptime: 2h 34m      ║
 ║ CPU: 18.2% │ Memory: 56.1% │ GPUs: 0 │ Last Heartbeat: 3s ago                 ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
@@ -127,6 +127,17 @@ k3s:
 | `BETA9_POOL_NAME` | Pool name (default: external) |
 | `BETA9_HOSTNAME` | Hostname for gateway to reach k3s |
 | `B9AGENT_CONFIG` | Custom config file path |
+
+## Sentry Integration
+
+We strongly recommend using [Sentry](https://sentry.io) for error tracking. It offers a generous free tier and significantly helps in debugging production issues.
+
+The agent, gateway, and SDK are instrumented to report errors if the `SENTRY_DSN` environment variable is set.
+
+To enable it:
+1. Create a Sentry project and get your DSN.
+2. Add `SENTRY_DSN=https://...@sentry.io/...` to your `.env` file or export it in your shell.
+3. Restart the agent/gateway.
 
 ## Prerequisites
 
