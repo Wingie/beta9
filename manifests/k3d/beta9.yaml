@@ -71,8 +71,8 @@ spec:
            echo "All dependencies ready!"']
       containers:
       - name: gateway
-        image: registry.agentosaurus.com/beta9-gateway:latest
-        imagePullPolicy: Always
+        image: registry.agentosaurus.com/beta9-gateway:v0.1.0
+        imagePullPolicy: IfNotPresent
         command:
         - /usr/local/bin/gateway
         env:
@@ -135,8 +135,8 @@ spec:
     spec:
       containers:
       - name: proxy
-        image: registry.agentosaurus.com/beta9-proxy:latest
-        imagePullPolicy: Always
+        image: registry.agentosaurus.com/beta9-proxy:v0.1.0
+        imagePullPolicy: IfNotPresent
         command:
         - /usr/local/bin/proxy
         securityContext:

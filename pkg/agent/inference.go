@@ -238,9 +238,11 @@ func (m *OllamaManager) EnsureModelLoaded(ctx context.Context, model string) err
 		}
 		m.models[model] = state
 	}
+	// Read LoadState under mutex to prevent race
+	loadState := state.LoadState
 	m.mu.Unlock()
 
-	if state.LoadState == LoadStateReady {
+	if loadState == LoadStateReady {
 		m.mu.Lock()
 		state.LastUsed = time.Now()
 		m.mu.Unlock()

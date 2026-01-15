@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,7 @@ type KeepaliveLoop struct {
 	config              *AgentConfig
 	metricsCollector    *MetricsCollector
 	state               *AgentState
+	mu                  sync.RWMutex
 	lastMetrics         *MachineMetrics
 	consecutiveFailures int32
 	maxFailures         int32
@@ -119,8 +121,10 @@ func (k *KeepaliveLoop) sendKeepalive(ctx context.Context) bool {
 		metrics = &MachineMetrics{}
 	}
 
-	// Store last metrics for TUI
+	// Store last metrics for TUI (protected by mutex)
+	k.mu.Lock()
 	k.lastMetrics = metrics
+	k.mu.Unlock()
 
 	payload := &KeepalivePayload{
 		MachineID:    k.config.MachineID,
