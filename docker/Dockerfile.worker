@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7-labs
 ARG BASE_STAGE=dev
 
-FROM golang:1.22.10-bookworm AS golang
+FROM golang:1.23-bookworm AS golang
+...
+FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS worker
 
 RUN apt-get update && apt-get install -y curl git
 
@@ -151,7 +153,7 @@ EOT
 
 # beta9 worker - cross-compile on native architecture (FAST)
 # ========================
-FROM --platform=$BUILDPLATFORM golang:1.22.10-bookworm AS worker
+FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS worker
 
 ARG TARGETOS
 ARG TARGETARCH

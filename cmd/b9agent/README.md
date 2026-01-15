@@ -14,7 +14,7 @@ A Go-based agent for connecting external machines to a Beta9 cluster as workers.
 ### Quick Install (macOS/Linux)
 
 ```bash
-cd cmd/agent-go
+cd cmd/b9agent
 make install
 ```
 
