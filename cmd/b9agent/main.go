@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/beam-cloud/beta9/pkg/agent"
+	"github.com/getsentry/sentry-go"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -17,7 +18,21 @@ import (
 var version = "0.2.0"
 
 func main() {
+	// Initialize Sentry if DSN is provided
+	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
+		err := sentry.Init(sentry.ClientOptions{
+			Dsn: dsn,
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("sentry.Init failed")
+		} else {
+			// Flush buffered events before the program terminates.
+			defer sentry.Flush(2 * time.Second)
+		}
+	}
+
 	// Check for subcommands first
+
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "init":

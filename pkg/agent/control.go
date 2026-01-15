@@ -147,11 +147,12 @@ func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Reque
 	log.Info().Str("model", req.Model).Msg("Control: pull model command received")
 	c.agent.state.AddLog(fmt.Sprintf("Pulling model: %s", req.Model))
 
-	// Call Ollama pull API
+	// Call Ollama pull API with timeout
 	pullReq := map[string]any{"name": req.Model}
 	body, _ := json.Marshal(pullReq)
 
-	resp, err := http.Post(
+	client := &http.Client{Timeout: 30 * time.Minute} // Model pulls can take a while
+	resp, err := client.Post(
 		fmt.Sprintf("http://localhost:%d/api/pull", DefaultOllamaPort),
 		"application/json",
 		bytes.NewReader(body),
@@ -240,17 +241,17 @@ func (c *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	snapshot := c.agent.state.GetSnapshot()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"machine_id":        snapshot.MachineID,
-		"pool":              snapshot.PoolName,
-		"status":            snapshot.Status,
-		"uptime_seconds":    int(snapshot.Uptime().Seconds()),
-		"inference_status":  snapshot.InferenceStatus,
-		"inference_port":    snapshot.InferencePort,
-		"running_jobs":      snapshot.RunningJobs,
-		"total_jobs":        snapshot.TotalJobs,
-		"cpu_percent":       snapshot.CPUPercent,
-		"memory_percent":    snapshot.MemoryPercent,
-		"gpu_count":         snapshot.GPUCount,
+		"machine_id":       snapshot.MachineID,
+		"pool":             snapshot.PoolName,
+		"status":           snapshot.Status,
+		"uptime_seconds":   int(snapshot.Uptime().Seconds()),
+		"inference_status": snapshot.InferenceStatus,
+		"inference_port":   snapshot.InferencePort,
+		"running_jobs":     snapshot.RunningJobs,
+		"total_jobs":       snapshot.TotalJobs,
+		"cpu_percent":      snapshot.CPUPercent,
+		"memory_percent":   snapshot.MemoryPercent,
+		"gpu_count":        snapshot.GPUCount,
 	})
 }
 

@@ -32,7 +32,9 @@ okteto.yaml
 .vscode/launch.json
 pyrightconfig.json
 .go-version
-agent-go
-cmd/agent-go/b9agent
-gateway
-worker
+# Build output binaries (not source directories)
+/agent-go
+/cmd/agent-go/b9agent
+/b9agent
+/gateway
+/worker

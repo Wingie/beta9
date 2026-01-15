@@ -10,12 +10,12 @@ import (
 
 // ConfigFile represents the persistent config file structure
 type ConfigFile struct {
-	Gateway  GatewayConfig  `yaml:"gateway"`
-	Machine  MachineConfig  `yaml:"machine"`
-	Pool     string         `yaml:"pool"`
-	Provider string         `yaml:"provider,omitempty"`
-	K3s      K3sConfig      `yaml:"k3s,omitempty"`
-	Debug    bool           `yaml:"debug,omitempty"`
+	Gateway  GatewayConfig `yaml:"gateway"`
+	Machine  MachineConfig `yaml:"machine"`
+	Pool     string        `yaml:"pool"`
+	Provider string        `yaml:"provider,omitempty"`
+	K3s      K3sConfig     `yaml:"k3s,omitempty"`
+	Debug    bool          `yaml:"debug,omitempty"`
 }
 
 // GatewayConfig holds gateway connection settings
@@ -83,11 +83,17 @@ func LoadConfigFile() (*ConfigFile, error) {
 // SaveConfigFile saves config to YAML file
 func SaveConfigFile(cfg *ConfigFile) error {
 	configDir := DefaultConfigDir()
+	path := DefaultConfigPath()
+
+	// Respect B9AGENT_CONFIG override
+	if envPath := os.Getenv("B9AGENT_CONFIG"); envPath != "" {
+		path = envPath
+		configDir = filepath.Dir(path)
+	}
+
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
-
-	path := DefaultConfigPath()
 
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -97,6 +103,11 @@ func SaveConfigFile(cfg *ConfigFile) error {
 	// Write with restrictive permissions (contains token)
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	// Enforce permissions on existing files
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("failed to set config file permissions: %w", err)
 	}
 
 	return nil

@@ -83,7 +83,7 @@ func (s *InferenceService) handleChat(c echo.Context) error {
 			})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": err.Error(),
+			"error": "internal server error",
 		})
 	}
 
@@ -139,11 +139,11 @@ func (s *InferenceService) handleListModels(c echo.Context) error {
 	data := make([]map[string]interface{}, 0)
 	for model, locations := range models {
 		data = append(data, map[string]interface{}{
-			"id":         model,
-			"object":     "model",
-			"created":    time.Now().Unix(),
-			"owned_by":   "cluster",
-			"locations":  locations,
+			"id":        model,
+			"object":    "model",
+			"created":   time.Now().Unix(),
+			"owned_by":  "cluster",
+			"locations": locations,
 		})
 	}
 
@@ -325,20 +325,19 @@ func (s *InferenceService) handleHealth(c echo.Context) error {
 //
 // Example usage in gateway.go:
 //
-//   func (g *Gateway) initHttp() error {
-//       // ... existing code ...
+//	func (g *Gateway) initHttp() error {
+//	    // ... existing code ...
 //
-//       // Add inference routes
-//       g.inferenceRegistry = NewModelRegistry()
-//       inferenceService := NewInferenceService(g.ctx, g.inferenceRegistry)
-//       inferenceService.RegisterRoutes(g.baseRouteGroup.Group("/inference"))
+//	    // Add inference routes
+//	    g.inferenceRegistry = NewModelRegistry()
+//	    inferenceService := NewInferenceService(g.ctx, g.inferenceRegistry)
+//	    inferenceService.RegisterRoutes(g.baseRouteGroup.Group("/inference"))
 //
-//       // Start cleanup goroutine
-//       go g.cleanupStaleInferenceNodes()
+//	    // Start cleanup goroutine
+//	    go g.cleanupStaleInferenceNodes()
 //
-//       return nil
-//   }
-//
+//	    return nil
+//	}
 func AddInferenceRoutes(ctx context.Context, g *echo.Group) (*InferenceService, *ModelRegistry) {
 	registry := NewModelRegistry()
 	service := NewInferenceService(ctx, registry)

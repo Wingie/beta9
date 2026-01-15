@@ -71,7 +71,12 @@ func RegisterMachine(ctx context.Context, config *AgentConfig) *RegistrationResu
 		Int("gpu_count", gpuCount).
 		Msg("Registering machine with gateway")
 
-	log.Debug().Interface("payload", payload).Msg("Registration payload")
+	log.Debug().
+		Str("machine_id", payload.MachineID).
+		Str("pool", payload.PoolName).
+		Str("hostname", payload.Hostname).
+		Str("provider", payload.ProviderName).
+		Msg("Registration payload (sensitive fields redacted)")
 
 	if config.DryRun {
 		log.Info().Msg("Dry run mode - skipping actual registration")
@@ -105,13 +110,25 @@ func RegisterMachine(ctx context.Context, config *AgentConfig) *RegistrationResu
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return &RegistrationResult{
+			Error: &ErrRegistrationFailed{
+				Reason: fmt.Sprintf("failed to read response: %v", err),
+			},
+		}
+	}
 
 	switch resp.StatusCode {
 	case http.StatusOK:
 		var result RegistrationResponse
 		if err := json.Unmarshal(respBody, &result); err != nil {
 			log.Debug().Err(err).Str("body", string(respBody)).Msg("Failed to parse registration response")
+			return &RegistrationResult{
+				Error: &ErrRegistrationFailed{
+					Reason: fmt.Sprintf("invalid JSON response: %v", err),
+				},
+			}
 		}
 		log.Info().
 			Str("machine_id", config.MachineID).

@@ -3,15 +3,30 @@ package main
 import (
 	"os"
 
+	"time"
+
 	"github.com/beam-cloud/beta9/pkg/common"
 	"github.com/beam-cloud/beta9/pkg/metrics"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/beam-cloud/beta9/pkg/worker"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/getsentry/sentry-go"
 )
 
 func main() {
+	// Initialize Sentry
+	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
+		err := sentry.Init(sentry.ClientOptions{
+			Dsn: dsn,
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("sentry.Init failed")
+		} else {
+			defer sentry.Flush(2 * time.Second)
+		}
+	}
 	configManager, err := common.NewConfigManager[types.AppConfig]()
 	if err != nil {
 		log.Fatal().Err(err).Msg("error creating config manager")

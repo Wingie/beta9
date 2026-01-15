@@ -72,12 +72,16 @@ spec:
       containers:
       - name: gateway
         image: registry.agentosaurus.com/beta9-gateway:latest
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         command:
         - /usr/local/bin/gateway
         env:
         - name: CONFIG_PATH
           value: /etc/beta9/config.yaml
+        - name: SENTRY_DSN
+          value: "${SENTRY_DSN}"  # From .env via envsubst
+        - name: SENTRY_ENVIRONMENT
+          value: "${SENTRY_ENVIRONMENT:-development}"
         ports:
         - name: grpc
           containerPort: 1993
@@ -136,7 +140,7 @@ spec:
       containers:
       - name: proxy
         image: registry.agentosaurus.com/beta9-proxy:latest
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         command:
         - /usr/local/bin/proxy
         securityContext:
@@ -206,8 +210,10 @@ spec:
     auth:
       enabled: false
     image:
-      tag: latest
-      pullPolicy: Always
+      registry: docker.io
+      repository: bitnami/redis
+      tag: "7.2.4"
+      pullPolicy: IfNotPresent
     master:
       configuration: |
         activedefrag yes
@@ -239,8 +245,10 @@ spec:
           password: password
           database: main
     image:
-      tag: latest
-      pullPolicy: Always
+      registry: docker.io
+      repository: bitnami/postgresql
+      tag: "16.2.0"
+      pullPolicy: IfNotPresent
     primary:
       extendedConfiguration: |
         max_connections=400
@@ -275,8 +283,10 @@ spec:
     auth:
       enabled: false
     image:
-      tag: latest
-      pullPolicy: Always
+      registry: docker.io
+      repository: bitnami/redis
+      tag: "7.2.4"
+      pullPolicy: IfNotPresent
     master:
       persistence:
         size: 1Gi
