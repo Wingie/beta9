@@ -152,11 +152,18 @@ class InferenceClient:
         payload = {
             "model": model,
             "messages": msg_list,
-            "stream": False,
+            "stream": options.stream,
+            "options": {
+                "temperature": options.temperature,
+                "top_p": options.top_p,
+            },
         }
-
-        if options.temperature is not None:
-            payload["options"] = {"temperature": options.temperature}
+        if options.max_tokens is not None:
+            payload["options"]["num_predict"] = options.max_tokens
+        if options.frequency_penalty != 0:
+            payload["options"]["frequency_penalty"] = options.frequency_penalty
+        if options.presence_penalty != 0:
+            payload["options"]["presence_penalty"] = options.presence_penalty
 
         try:
             resp = self._client.post(f"{self.base_url}/api/chat", json=payload)
@@ -272,14 +279,15 @@ class InferenceClient:
 
             # Ollama returns embeddings in different formats depending on version
             embeddings = data.get("embeddings", [])
-            if len(embeddings) > 0:
-                embedding = embeddings[0]
-            else:
-                embedding = data.get("embedding", [])
+            if len(embeddings) == 0:
+                # Fallback for older Ollama versions
+                single = data.get("embedding", [])
+                embeddings = [single] if single else []
 
+            # Return all embeddings for batch input
             return EmbeddingResult(
                 model=model,
-                embedding=embedding,
+                embedding=embeddings[0] if len(embeddings) == 1 else embeddings,
                 usage={
                     "prompt_tokens": data.get("prompt_eval_count", 0),
                 },
@@ -395,6 +403,12 @@ def configure(
         timeout: Request timeout in seconds
     """
     global _default_client
+    # Close previous client to prevent socket leaks
+    if _default_client is not None:
+        try:
+            _default_client._client.close()
+        except Exception:
+            pass
     _default_client = InferenceClient(host=host, port=port, timeout=timeout)
 
 

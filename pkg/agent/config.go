@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -49,7 +50,12 @@ type AgentConfig struct {
 
 // GatewayURL returns the full gateway URL for API calls
 func (c *AgentConfig) GatewayURL() string {
-	return fmt.Sprintf("%s://%s:%d", c.GatewayScheme, c.GatewayHost, c.GatewayPort)
+	host := c.GatewayHost
+	// Wrap IPv6 addresses in brackets for URL compatibility
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		host = "[" + host + "]"
+	}
+	return fmt.Sprintf("%s://%s:%d", c.GatewayScheme, host, c.GatewayPort)
 }
 
 // RegisterURL returns the URL for machine registration endpoint

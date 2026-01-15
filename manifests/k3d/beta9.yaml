@@ -206,8 +206,8 @@ spec:
     auth:
       enabled: false
     image:
-      tag: latest
-      pullPolicy: Always
+      tag: "7.2.4"
+      pullPolicy: IfNotPresent
     master:
       configuration: |
         activedefrag yes
@@ -239,8 +239,8 @@ spec:
           password: password
           database: main
     image:
-      tag: latest
-      pullPolicy: Always
+      tag: "16.2.0"
+      pullPolicy: IfNotPresent
     primary:
       extendedConfiguration: |
         max_connections=400
@@ -275,8 +275,8 @@ spec:
     auth:
       enabled: false
     image:
-      tag: latest
-      pullPolicy: Always
+      tag: "7.2.4"
+      pullPolicy: IfNotPresent
     master:
       persistence:
         size: 1Gi

@@ -71,7 +71,12 @@ func RegisterMachine(ctx context.Context, config *AgentConfig) *RegistrationResu
 		Int("gpu_count", gpuCount).
 		Msg("Registering machine with gateway")
 
-	log.Debug().Interface("payload", payload).Msg("Registration payload")
+	log.Debug().
+		Str("machine_id", payload.MachineID).
+		Str("pool", payload.PoolName).
+		Str("hostname", payload.Hostname).
+		Str("provider", payload.ProviderName).
+		Msg("Registration payload (sensitive fields redacted)")
 
 	if config.DryRun {
 		log.Info().Msg("Dry run mode - skipping actual registration")

@@ -65,6 +65,42 @@ type AgentState struct {
 	MaxLogs int
 }
 
+// AgentStateSnapshot is a copy-safe version of AgentState for TUI rendering
+type AgentStateSnapshot struct {
+	MachineID       string
+	PoolName        string
+	Gateway         string
+	Status          string
+	CPUPercent      float64
+	MemoryPercent   float64
+	GPUCount        int
+	StartTime       time.Time
+	LastHeartbeat   time.Time
+	HeartbeatStatus string
+	Jobs            []JobInfo
+	RunningJobs     int
+	TotalJobs       int
+	InferenceStatus string
+	InferenceIP     string
+	InferencePort   int
+	InferenceModels []string
+	Logs            []string
+	MaxLogs         int
+}
+
+// Uptime returns the agent uptime
+func (s AgentStateSnapshot) Uptime() time.Duration {
+	return time.Since(s.StartTime)
+}
+
+// TimeSinceHeartbeat returns time since last heartbeat
+func (s AgentStateSnapshot) TimeSinceHeartbeat() time.Duration {
+	if s.LastHeartbeat.IsZero() {
+		return 0
+	}
+	return time.Since(s.LastHeartbeat)
+}
+
 // NewAgentState creates a new agent state
 func NewAgentState(machineID, poolName, gateway string) *AgentState {
 	return &AgentState{
@@ -173,16 +209,38 @@ func (s *AgentState) GetJobs() []JobInfo {
 }
 
 // GetSnapshot returns a snapshot of the state for rendering
-func (s *AgentState) GetSnapshot() AgentState {
+func (s *AgentState) GetSnapshot() AgentStateSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	snapshot := *s
+
+	// Build snapshot field-by-field to avoid copying the mutex
+	snapshot := AgentStateSnapshot{
+		MachineID:       s.MachineID,
+		PoolName:        s.PoolName,
+		Gateway:         s.Gateway,
+		Status:          s.Status,
+		CPUPercent:      s.CPUPercent,
+		MemoryPercent:   s.MemoryPercent,
+		GPUCount:        s.GPUCount,
+		StartTime:       s.StartTime,
+		LastHeartbeat:   s.LastHeartbeat,
+		HeartbeatStatus: s.HeartbeatStatus,
+		RunningJobs:     s.RunningJobs,
+		TotalJobs:       s.TotalJobs,
+		InferenceStatus: s.InferenceStatus,
+		InferenceIP:     s.InferenceIP,
+		InferencePort:   s.InferencePort,
+		MaxLogs:         s.MaxLogs,
+	}
+
+	// Deep copy slices
 	snapshot.Jobs = make([]JobInfo, len(s.Jobs))
 	copy(snapshot.Jobs, s.Jobs)
 	snapshot.Logs = make([]string, len(s.Logs))
 	copy(snapshot.Logs, s.Logs)
 	snapshot.InferenceModels = make([]string, len(s.InferenceModels))
 	copy(snapshot.InferenceModels, s.InferenceModels)
+
 	return snapshot
 }
 
@@ -193,7 +251,9 @@ func (s *AgentState) UpdateInference(status, ip string, port int, models []strin
 	s.InferenceStatus = status
 	s.InferenceIP = ip
 	s.InferencePort = port
-	s.InferenceModels = models
+	// Copy slice to prevent data races from caller mutations
+	s.InferenceModels = make([]string, len(models))
+	copy(s.InferenceModels, models)
 }
 
 // AddLog adds a log entry to the ring buffer
@@ -209,7 +269,7 @@ func (s *AgentState) AddLog(msg string) {
 	}
 
 	s.Logs = append(s.Logs, entry)
-	if len(s.Logs) > s.MaxLogs {
+	if s.MaxLogs > 0 && len(s.Logs) > s.MaxLogs {
 		s.Logs = s.Logs[len(s.Logs)-s.MaxLogs:]
 	}
 }
