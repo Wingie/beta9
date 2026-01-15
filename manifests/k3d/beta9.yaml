@@ -212,7 +212,7 @@ spec:
     image:
       registry: docker.io
       repository: bitnami/redis
-      tag: "7.2.4"
+      tag: "latest"
       pullPolicy: IfNotPresent
     master:
       configuration: |
@@ -247,7 +247,7 @@ spec:
     image:
       registry: docker.io
       repository: bitnami/postgresql
-      tag: "16.2.0"
+      tag: "latest"
       pullPolicy: IfNotPresent
     primary:
       extendedConfiguration: |
@@ -285,7 +285,7 @@ spec:
     image:
       registry: docker.io
       repository: bitnami/redis
-      tag: "7.2.4"
+      tag: "latest"
       pullPolicy: IfNotPresent
     master:
       persistence:
