@@ -2,8 +2,7 @@
 ARG BASE_STAGE=dev
 
 FROM golang:1.23-bookworm AS golang
-...
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS worker
+
 
 RUN apt-get update && apt-get install -y curl git
 
@@ -163,7 +162,6 @@ WORKDIR /workspace
 COPY go.mod go.sum ./
 # Allow Go toolchain to auto-download newer versions if needed
 ENV GOTOOLCHAIN=auto
-ENV GOPROXY=direct
 RUN go mod download
 COPY --exclude=sdk . .
 
