@@ -40,6 +40,7 @@ pyrightconfig.json
 /worker
 agent-go
 cmd/agent-go/b9agent
+cmd/b9agent/b9agent
 b9agent
 b9gateway-linux
 gateway
