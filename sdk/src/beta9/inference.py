@@ -88,7 +88,8 @@ class EmbeddingResult:
     """Result from an embedding call."""
 
     model: str
-    embedding: List[float] = field(default_factory=list)
+    embedding: List[float] = field(default_factory=list)  # Legacy: First embedding if batch
+    embeddings: List[List[float]] = field(default_factory=list)  # New: All embeddings
     usage: Optional[Dict[str, int]] = None
     error: Optional[str] = None
 
@@ -215,11 +216,18 @@ class InferenceClient:
         payload = {
             "model": model,
             "prompt": prompt,
-            "stream": False,
+            "stream": options.stream,
         }
 
-        if options.temperature is not None:
-            payload["options"] = {"temperature": options.temperature}
+        # Add all options to payload
+        payload["options"] = {
+            "temperature": options.temperature,
+            "top_p": options.top_p,
+            "frequency_penalty": options.frequency_penalty,
+            "presence_penalty": options.presence_penalty,
+        }
+        if options.max_tokens is not None:
+            payload["options"]["num_predict"] = options.max_tokens
 
         try:
             resp = self._client.post(f"{self.base_url}/api/generate", json=payload)
@@ -278,16 +286,23 @@ class InferenceClient:
             data = resp.json()
 
             # Ollama returns embeddings in different formats depending on version
-            embeddings = data.get("embeddings", [])
-            if len(embeddings) == 0:
-                # Fallback for older Ollama versions
-                single = data.get("embedding", [])
-                embeddings = [single] if single else []
+            # New format: {"embeddings": [[...], [...]]}
+            # Old format: {"embedding": [...]}
+            batch_embeddings = data.get("embeddings", [])
+            
+            if len(batch_embeddings) == 0:
+                # Fallback check for single embedding
+                single = data.get("embedding", None)
+                if single:
+                    batch_embeddings = [single]
 
-            # Return all embeddings for batch input
+            # Populate legacy 'embedding' with first result for backward compat
+            first_embedding = batch_embeddings[0] if batch_embeddings else []
+
             return EmbeddingResult(
                 model=model,
-                embedding=embeddings[0] if len(embeddings) == 1 else embeddings,
+                embedding=first_embedding,
+                embeddings=batch_embeddings,
                 usage={
                     "prompt_tokens": data.get("prompt_eval_count", 0),
                 },
