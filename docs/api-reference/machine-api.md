@@ -102,10 +102,10 @@ Content-Type: application/json
 
 ```bash
 curl -X POST http://localhost:1994/api/v1/machine/register \
-  -H "Authorization: Bearer swwMV_WA4C_FxN-_UY5UiRgdg2dTM1GUDLVUzO9c6fzyOs0BUJuXKLfxb-QcZkwAnlOGscu0U3WYmF1eQpcSBg==" \
+  -H "Authorization: Bearer swwMV_WA4C" \
   -H "Content-Type: application/json" \
   -d '{
-    "token": "swwMV_WA4C_FxN-_UY5UiRgdg2dTM1GUDLVUzO9c6fzyOs0BUJuXKLfxb-QcZkwAnlOGscu0U3WYmF1eQpcSBg==",
+    "token": "swwMV_WA4C_FxN-_",
     "machine_id": "1165a9b6",
     "hostname": "gpu-worker-1",
     "provider_name": "generic",
@@ -213,7 +213,7 @@ Content-Type: application/json
 
 ```bash
 curl -X POST http://localhost:1994/api/v1/machine/keepalive \
-  -H "Authorization: Bearer swwMV_WA4C_FxN-_UY5UiRgdg2dTM1GUDLVUzO9c6fzyOs0BUJuXKLfxb-QcZkwAnlOGscu0U3WYmF1eQpcSBg==" \
+  -H "Authorization: Bearer swwMV_WA4C_=" \
   -H "Content-Type: application/json" \
   -d '{
     "machine_id": "1165a9b6",
