@@ -212,7 +212,7 @@ spec:
     auth:
       enabled: false
     image:
-      registry: docker.io
+      registry: public.ecr.aws
       repository: bitnami/redis
       tag: "7.4.2-debian-12-r3"
       pullPolicy: IfNotPresent
@@ -247,7 +247,7 @@ spec:
           password: password
           database: main
     image:
-      registry: docker.io
+      registry: public.ecr.aws
       repository: bitnami/postgresql
       tag: "17.2.0-debian-12-r14"
       pullPolicy: IfNotPresent
@@ -262,6 +262,8 @@ spec:
     volumePermissions:
       enabled: true
       image:
+        registry: public.ecr.aws
+        repository: bitnami/os-shell
         tag: 12-debian-12-r10
     persistence:
       enabled: true
@@ -285,7 +287,7 @@ spec:
     auth:
       enabled: false
     image:
-      registry: docker.io
+      registry: public.ecr.aws
       repository: bitnami/redis
       tag: "7.4.2-debian-12-r3"
       pullPolicy: IfNotPresent
