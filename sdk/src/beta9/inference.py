@@ -116,11 +116,20 @@ class InferenceClient:
         self,
         host: str = DEFAULT_INFERENCE_HOST,
         port: int = DEFAULT_INFERENCE_PORT,
+        token: Optional[str] = None,
         timeout: float = 300.0,  # 5 minute timeout for slow model loads
     ):
         self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
-        self._client = httpx.Client(timeout=timeout)
+        
+        # Prioritize explicit token, then env var
+        self.token = token or os.getenv("BETA9_INFERENCE_TOKEN")
+        
+        headers = {}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+            
+        self._client = httpx.Client(timeout=timeout, headers=headers)
 
     def chat(
         self,
@@ -407,6 +416,7 @@ def get_client() -> InferenceClient:
 def configure(
     host: str = DEFAULT_INFERENCE_HOST,
     port: int = DEFAULT_INFERENCE_PORT,
+    token: Optional[str] = None,
     timeout: float = 300.0,
 ) -> None:
     """
@@ -415,6 +425,7 @@ def configure(
     Args:
         host: Inference server hostname
         port: Inference server port
+        token: Authentication token (optional)
         timeout: Request timeout in seconds
     """
     global _default_client
@@ -424,7 +435,7 @@ def configure(
             _default_client._client.close()
         except Exception:
             pass
-    _default_client = InferenceClient(host=host, port=port, timeout=timeout)
+    _default_client = InferenceClient(host=host, port=port, token=token, timeout=timeout)
 
 
 # Convenience functions using the default client
