@@ -42,8 +42,8 @@ spec:
         env:
         - name: CONFIG_PATH
           value: /etc/beta9/.config.yaml
-        image: registry.agentosaurus.com/beta9-gateway:latest
-        imagePullPolicy: Always
+        image: registry.agentosaurus.com/beta9-gateway:v0.1.0
+        imagePullPolicy: IfNotPresent
         name: main
         readinessProbe:
           initialDelaySeconds: 5

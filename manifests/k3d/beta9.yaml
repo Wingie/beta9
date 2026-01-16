@@ -71,7 +71,7 @@ spec:
            echo "All dependencies ready!"']
       containers:
       - name: gateway
-        image: registry.agentosaurus.com/beta9-gateway:latest
+        image: registry.agentosaurus.com/beta9-gateway:v0.1.0
         imagePullPolicy: IfNotPresent
         command:
         - /usr/local/bin/gateway
@@ -139,7 +139,7 @@ spec:
     spec:
       containers:
       - name: proxy
-        image: registry.agentosaurus.com/beta9-proxy:latest
+        image: registry.agentosaurus.com/beta9-proxy:v0.1.0
         imagePullPolicy: IfNotPresent
         command:
         - /usr/local/bin/proxy
@@ -212,7 +212,7 @@ spec:
     image:
       registry: docker.io
       repository: bitnami/redis
-      tag: "latest"
+      tag: "7.4.2-debian-12-r3"
       pullPolicy: IfNotPresent
     master:
       configuration: |
@@ -247,7 +247,7 @@ spec:
     image:
       registry: docker.io
       repository: bitnami/postgresql
-      tag: "latest"
+      tag: "17.2.0-debian-12-r14"
       pullPolicy: IfNotPresent
     primary:
       extendedConfiguration: |
@@ -260,7 +260,7 @@ spec:
     volumePermissions:
       enabled: true
       image:
-        tag: latest
+        tag: 12-debian-12-r10
     persistence:
       enabled: true
       size: 1Gi
@@ -285,7 +285,7 @@ spec:
     image:
       registry: docker.io
       repository: bitnami/redis
-      tag: "latest"
+      tag: "7.4.2-debian-12-r3"
       pullPolicy: IfNotPresent
     master:
       persistence:

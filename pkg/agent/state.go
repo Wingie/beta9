@@ -271,5 +271,9 @@ func (s *AgentState) AddLog(msg string) {
 	s.Logs = append(s.Logs, entry)
 	if s.MaxLogs > 0 && len(s.Logs) > s.MaxLogs {
 		s.Logs = s.Logs[len(s.Logs)-s.MaxLogs:]
+	} else if s.MaxLogs == 0 {
+		// MaxLogs of 0 means no logs - clear immediately
+		s.Logs = nil
 	}
+	// Negative MaxLogs is treated as unlimited (no trimming)
 }
