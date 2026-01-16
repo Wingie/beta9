@@ -136,7 +136,7 @@ spec:
       k8s-app: metrics-server
   strategy:
     rollingUpdate:
-      maxUnavailable: 0
+      maxUnavailable: 1
   template:
     metadata:
       labels:

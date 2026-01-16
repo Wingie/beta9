@@ -47,15 +47,15 @@ func DefaultConfigDir() string {
 
 // DefaultConfigPath returns the default config file path
 func DefaultConfigPath() string {
+	if envPath := os.Getenv("B9AGENT_CONFIG"); envPath != "" {
+		return envPath
+	}
 	return filepath.Join(DefaultConfigDir(), "config.yaml")
 }
 
 // ConfigExists checks if a config file exists
 func ConfigExists() bool {
 	path := DefaultConfigPath()
-	if envPath := os.Getenv("B9AGENT_CONFIG"); envPath != "" {
-		path = envPath
-	}
 	_, err := os.Stat(path)
 	return err == nil
 }
@@ -63,9 +63,6 @@ func ConfigExists() bool {
 // LoadConfigFile loads config from YAML file
 func LoadConfigFile() (*ConfigFile, error) {
 	path := DefaultConfigPath()
-	if envPath := os.Getenv("B9AGENT_CONFIG"); envPath != "" {
-		path = envPath
-	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -82,14 +79,8 @@ func LoadConfigFile() (*ConfigFile, error) {
 
 // SaveConfigFile saves config to YAML file
 func SaveConfigFile(cfg *ConfigFile) error {
-	configDir := DefaultConfigDir()
 	path := DefaultConfigPath()
-
-	// Respect B9AGENT_CONFIG override
-	if envPath := os.Getenv("B9AGENT_CONFIG"); envPath != "" {
-		path = envPath
-		configDir = filepath.Dir(path)
-	}
+	configDir := filepath.Dir(path)
 
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)

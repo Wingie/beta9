@@ -4,12 +4,20 @@ FROM golang:1.23-bookworm AS base
 RUN apt-get update && \
     apt-get install -y --no-install-recommends fuse3
 
-# JuiceFS - download pre-built binary (avoids Go 1.25 pyroscope-go compatibility issues)
+# JuiceFS - download pre-built binary with checksum verification
 RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
-    if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi && \
-    curl -L "https://github.com/juicedata/juicefs/releases/download/v1.2.1/juicefs-1.2.1-linux-${ARCH}.tar.gz" | \
-    tar -xz -C /usr/local/bin juicefs && \
+    if [ "$ARCH" = "x86_64" ]; then \
+    ARCH="amd64"; \
+    SHA256="025a1ccf407331aef16cb75bb9e1003102a2dba1b9188e0e101f4b84436bbbb8"; \
+    fi && \
+    if [ "$ARCH" = "aarch64" ]; then \
+    ARCH="arm64"; \
+    SHA256="b8d0ed12f232722f54e08ea1b60c4e50181b4e97247e7d62edf689cd9e477b5f"; \
+    fi && \
+    curl -L --http1.1 "https://github.com/juicedata/juicefs/releases/download/v1.2.1/juicefs-1.2.1-linux-${ARCH}.tar.gz" -o juicefs.tar.gz && \
+    echo "${SHA256}  juicefs.tar.gz" | sha256sum -c - && \
+    tar -xzf juicefs.tar.gz -C /usr/local/bin juicefs && \
+    rm juicefs.tar.gz && \
     chmod +x /usr/local/bin/juicefs
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 

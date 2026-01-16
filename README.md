@@ -290,3 +290,13 @@ Contributions are welcome. Please open an issue to discuss proposed changes befo
 - [Beam Cloud](https://beam.cloud) for the original beta9 project
 - [Ollama](https://ollama.ai) for the inference server
 - [Tailscale](https://tailscale.com) for the mesh VPN infrastructure
+
+## Security & Networking
+
+Beta9 uses **Tailscale** for secure mesh networking between components.
+
+- **Network Isolation:** All traffic between Gateway, Workers, and Clients travels over an encrypted WireGuard mesh.
+- **Endpoint Security:** 
+  - Internal management endpoints (inference control, keepalives) are bound to `0.0.0.0` but are effectively protected because the nodes are only reachable via the private Tailscale network.
+  - The Gateway uses `hostNetwork: true` to expose these services directly to the mesh.
+  - **Note:** Do not expose the Gateway's ports (1993, 1994) to the public internet. Access should only be possible via the Tailscale mesh or a secure ingress.

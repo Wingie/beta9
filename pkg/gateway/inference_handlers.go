@@ -126,7 +126,7 @@ func (s *InferenceService) handleEmbed(c echo.Context) error {
 			})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": err.Error(),
+			"error": "internal server error",
 		})
 	}
 
@@ -176,7 +176,7 @@ func (s *InferenceService) handleLoadModel(c echo.Context) error {
 
 	if err := s.router.LoadModel(ctx, nodeID, model); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": err.Error(),
+			"error": "failed to load model",
 		})
 	}
 
@@ -203,7 +203,7 @@ func (s *InferenceService) handleUnloadModel(c echo.Context) error {
 
 	if err := s.router.UnloadModel(ctx, nodeID, model); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": err.Error(),
+			"error": "failed to unload model",
 		})
 	}
 
