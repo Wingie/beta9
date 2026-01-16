@@ -44,4 +44,4 @@ b9agent
 b9gateway-linux
 gateway
 worker
->>>>>>> wingie/main
+cmd/b9agent/b9agent
