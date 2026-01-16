@@ -41,6 +41,7 @@ pyrightconfig.json
 /gateway
 /worker
 
+
 # Build logs
 *.log
 build_gateway.log
