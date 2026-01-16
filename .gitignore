@@ -44,4 +44,6 @@ b9agent
 b9gateway-linux
 gateway
 worker
+*.log
+b9agent
 cmd/b9agent/b9agent
