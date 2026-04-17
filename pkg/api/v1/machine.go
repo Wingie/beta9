@@ -274,18 +274,19 @@ func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
 			g.inferenceRegistry.UpdateHeartbeat(request.MachineID)
 			g.inferenceRegistry.UpdateNodeModels(request.MachineID, modelsMap)
 
-			// Also ensure node is registered with IP if not already?
-			// The registry.RegisterNode does upsert.
-			// We can try to register it on every heartbeat to be safe or only if missing?
-			// For now let's just update models/heartbeat which should be enough if registered via /inference/nodes/register
-			// But wait, the agent doesn't call /inference/nodes/register explicitly in its main loop?
-			// Ah, the agent doesn't seem to call /inference/nodes/register in `runWithTUI`?
-			// It probably should rely on keepalive.
-
-			// So let's do a RegisterNode call here with available info
+			// Keepalive upserts the node here — the agent's main loop does not
+			// call /inference/nodes/register separately, so this upsert is the
+			// sole registration path. RegisterNode is idempotent.
+			//
+			// The "MPS" fallback below is a temporary macOS-only assumption:
+			// OllamaManager.GetStatus() only returns a non-empty GPUType on
+			// darwin today. When Linux/CUDA worker support lands (Phase 3),
+			// change the fallback to "UNKNOWN" or drop it entirely so the
+			// routing layer can reject unregistered hardware instead of
+			// mis-labelling it as MPS.
 			gpuType := request.Inference.GPUType
 			if gpuType == "" {
-				gpuType = "MPS" // default for backwards compatibility
+				gpuType = "MPS" // backwards-compat for pre-GPUType agents on macOS
 			}
 			info := &NodeInferenceInfo{
 				NodeID:      request.MachineID,
