@@ -194,6 +194,36 @@ spec:
     targetPort: 9090
     protocol: TCP
 ---
+# External NodePort Service so Tailscale peers (SDK, workers, tests) can reach
+# the gateway via the host's stable :31994 (HTTP) / :31993 (gRPC) ports. The
+# internal ClusterIP Service `gateway` above stays for in-cluster traffic.
+# Cubic review finding: the previous manifest referenced 31994/31993 in docs
+# but never materialised a Service, so `ss -tlnp | grep 31994` returned empty
+# on the OCI host.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-nodeport
+  namespace: beta9
+  labels:
+    app: gateway
+    tier: external
+spec:
+  type: NodePort
+  selector:
+    app: gateway
+  ports:
+  - name: http
+    port: 1994
+    targetPort: 1994
+    nodePort: 31994
+    protocol: TCP
+  - name: grpc
+    port: 1993
+    targetPort: 1993
+    nodePort: 31993
+    protocol: TCP
+---
 # NOTE: IngressRouteTCP removed - using NodePort instead (no Traefik dependency)
 ---
 apiVersion: helm.cattle.io/v1
