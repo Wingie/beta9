@@ -280,7 +280,8 @@ class InferenceClient:
         Returns:
             EmbeddingResult with the embedding vector(s)
         """
-        # Handle single string
+        # Track whether caller passed a single string or a list (batch)
+        is_batch = not isinstance(input, str)
         if isinstance(input, str):
             input = [input]
 
@@ -301,10 +302,15 @@ class InferenceClient:
                 single = data.get("embedding", [])
                 embeddings = [single] if single else []
 
-            # Return all embeddings for batch input
+            # Populate fields per contract:
+            #   - `embedding` (singular): the single vector when caller passed a string
+            #     (or first vector for back-compat when batch also returned one result)
+            #   - `embeddings` (plural, list-of-lists): always the full batch result
+            single_vec: List[float] = embeddings[0] if embeddings else []
             return EmbeddingResult(
                 model=model,
-                embedding=embeddings[0] if len(embeddings) == 1 else embeddings,
+                embedding=single_vec if not is_batch else (embeddings[0] if len(embeddings) == 1 else []),
+                embeddings=embeddings if is_batch else [],
                 usage={
                     "prompt_tokens": data.get("prompt_eval_count", 0),
                 },
