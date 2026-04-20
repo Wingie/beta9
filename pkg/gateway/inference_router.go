@@ -457,10 +457,25 @@ func (r *InferenceRouter) UnloadModel(ctx context.Context, nodeID, model string)
 	}
 	defer resp.Body.Close()
 
-	// Drain response
+	// Only clear registry state when the worker acknowledged the unload.
+	// Previously any response (including 4xx/5xx) was treated as success,
+	// producing a cache-coherency bug where the registry reported the model
+	// idle while the worker still had it loaded.
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		log.Error().
+			Int("status", resp.StatusCode).
+			Str("node", nodeID).
+			Str("model", model).
+			Str("body", string(bodyBytes)).
+			Msg("Unload request returned non-OK status; leaving registry state unchanged")
+		return fmt.Errorf("unload failed: node %s returned HTTP %d", nodeID, resp.StatusCode)
+	}
+
+	// Drain response on success
 	io.Copy(io.Discard, resp.Body)
 
-	// Update registry regardless of response
+	// Update registry now that the worker confirmed the unload
 	if node := r.registry.GetNode(nodeID); node != nil {
 		if modelInfo, exists := node.Models[model]; exists {
 			modelInfo.LoadState = types.LoadStateIdle
