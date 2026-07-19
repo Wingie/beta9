@@ -301,10 +301,15 @@ class InferenceClient:
                 single = data.get("embedding", [])
                 embeddings = [single] if single else []
 
-            # Return all embeddings for batch input
+            # Return all embeddings for batch input.
+            # `embedding` keeps the legacy single-vector accessor (first vector);
+            # `embeddings` exposes the full batch. Previously the batch list was
+            # overloaded onto `embedding` and `embeddings` was left empty, so
+            # callers of result.embeddings got nothing back for batch input.
             return EmbeddingResult(
                 model=model,
-                embedding=embeddings[0] if len(embeddings) == 1 else embeddings,
+                embedding=embeddings[0] if embeddings else [],
+                embeddings=embeddings,
                 usage={
                     "prompt_tokens": data.get("prompt_eval_count", 0),
                 },
