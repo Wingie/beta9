@@ -247,7 +247,11 @@ spec:
       postgresql:
         auth:
           username: root
-          password: password
+          # Was the literal string "password" (security baseline P0 #4,
+          # plaintext infra creds). Substituted at apply time by
+          # beta9_deploy.sh's envsubst pass, same pattern as SENTRY_DSN below
+          # — export POSTGRES_PASSWORD before running the deploy script.
+          password: ${POSTGRES_PASSWORD}
           database: main
     image:
       registry: registry.agentosaurus.com
@@ -351,7 +355,10 @@ data:
         host: postgresql
         port: 5432
         username: root
-        password: password
+        # Must match the postgresql HelmChart's auth.password above —
+        # same POSTGRES_PASSWORD substituted at apply time (security
+        # baseline P0 #4).
+        password: ${POSTGRES_PASSWORD}
         name: main
         timezone: UTC
       redis:
