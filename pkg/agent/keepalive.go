@@ -41,6 +41,14 @@ type KeepaliveLoop struct {
 	maxFailures         int32
 	stopCh              chan struct{}
 	doneCh              chan struct{}
+
+	// startOnce guards Start so a second Start() after Stop is a no-op
+	// rather than re-launching the goroutine against an already-closed
+	// stopCh. stopOnce guards Stop so a double-Stop does not panic with
+	// "close of closed channel" (Cubic finding, pkg/agent/keepalive.go).
+	startOnce sync.Once
+	stopOnce  sync.Once
+	started   int32 // atomic flag: 1 after Start has been invoked
 }
 
 // NewKeepaliveLoop creates a new keepalive loop
@@ -76,9 +84,14 @@ func (k *KeepaliveLoop) GetLastMetrics() *MachineMetrics {
 	return &MachineMetrics{}
 }
 
-// Start begins the keepalive loop in a goroutine
+// Start begins the keepalive loop in a goroutine. Calling Start more than
+// once is a no-op; Start after Stop refuses to re-launch (safe on concurrent
+// invocation).
 func (k *KeepaliveLoop) Start(ctx context.Context) {
-	go k.run(ctx)
+	k.startOnce.Do(func() {
+		atomic.StoreInt32(&k.started, 1)
+		go k.run(ctx)
+	})
 }
 
 func (k *KeepaliveLoop) run(ctx context.Context) {
@@ -108,15 +121,22 @@ func (k *KeepaliveLoop) run(ctx context.Context) {
 	}
 }
 
-// Stop signals the keepalive loop to stop and waits for it to finish
+// Stop signals the keepalive loop to stop and waits for it to finish.
+// Safe to call multiple times concurrently; subsequent calls are no-ops.
 func (k *KeepaliveLoop) Stop() {
-	close(k.stopCh)
-	// Wait for loop to finish with timeout
-	select {
-	case <-k.doneCh:
-	case <-time.After(5 * time.Second):
-		log.Warn().Msg("Keepalive loop did not stop within timeout")
-	}
+	k.stopOnce.Do(func() {
+		close(k.stopCh)
+		// Wait for loop to finish with timeout. If Start was never called
+		// there is no goroutine to wait for; skip the wait in that case.
+		if atomic.LoadInt32(&k.started) == 0 {
+			return
+		}
+		select {
+		case <-k.doneCh:
+		case <-time.After(5 * time.Second):
+			log.Warn().Msg("Keepalive loop did not stop within timeout")
+		}
+	})
 }
 
 // IsHealthy returns true if recent keepalives succeeded

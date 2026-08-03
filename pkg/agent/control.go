@@ -64,6 +64,18 @@ type ControlServer struct {
 	agent  *Agent
 	port   int
 	server *http.Server
+
+	// ollamaBaseURL lets tests redirect Ollama calls to an httptest server.
+	// Empty string means default: http://localhost:DefaultOllamaPort
+	ollamaBaseURL string
+}
+
+// ollamaURL returns the Ollama base URL honoring test overrides.
+func (c *ControlServer) ollamaURL() string {
+	if c.ollamaBaseURL != "" {
+		return c.ollamaBaseURL
+	}
+	return fmt.Sprintf("http://localhost:%d", DefaultOllamaPort)
 }
 
 // NewControlServer creates a new control server
@@ -206,6 +218,9 @@ func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Cap request body to prevent memory-exhaustion payloads (P0-A hardening).
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+
 	// Parse request body
 	var req struct {
 		Model string `json:"model"`
@@ -243,7 +258,7 @@ func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Reque
 
 	client := &http.Client{Timeout: 30 * time.Minute} // Model pulls can take a while
 	resp, err := client.Post(
-		fmt.Sprintf("http://localhost:%d/api/pull", DefaultOllamaPort),
+		fmt.Sprintf("%s/api/pull", c.ollamaURL()),
 		"application/json",
 		bytes.NewReader(body),
 	)
@@ -257,9 +272,30 @@ func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Reque
 	}
 	defer resp.Body.Close()
 
-	// Stream progress to logs
+	// Check Ollama's status BEFORE streaming the response body. Previously a
+	// non-200 from Ollama still produced StatusOK downstream because the
+	// decode loop swallowed errors and the handler unconditionally returned
+	// ok (Cubic finding on pkg/agent/control.go:227).
+	if resp.StatusCode != http.StatusOK {
+		bodyPreview := make([]byte, 512)
+		n, _ := resp.Body.Read(bodyPreview)
+		errMsg := string(bodyPreview[:n])
+		c.agent.state.AddLog(fmt.Sprintf("Pull failed: Ollama returned HTTP %d", resp.StatusCode))
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status":        "error",
+			"error":         fmt.Sprintf("Ollama returned HTTP %d", resp.StatusCode),
+			"ollama_body":   errMsg,
+			"ollama_status": resp.StatusCode,
+		})
+		return
+	}
+
+	// Stream progress to logs. Track decode errors so a malformed stream
+	// surfaces as a 502 rather than silent success.
 	decoder := json.NewDecoder(resp.Body)
 	lastStatus := ""
+	var decodeErr error
+	sawAny := false
 	for {
 		var progress struct {
 			Status    string `json:"status"`
@@ -268,8 +304,14 @@ func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Reque
 			Completed int64  `json:"completed"`
 		}
 		if err := decoder.Decode(&progress); err != nil {
+			// io.EOF is a clean end of stream; any other error is a decode
+			// failure that should be reported upstream.
+			if err.Error() != "EOF" {
+				decodeErr = err
+			}
 			break
 		}
+		sawAny = true
 
 		// Update logs with progress (avoid duplicate messages)
 		status := progress.Status
@@ -283,6 +325,19 @@ func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	if decodeErr != nil || !sawAny {
+		reason := "no progress frames received"
+		if decodeErr != nil {
+			reason = decodeErr.Error()
+		}
+		c.agent.state.AddLog(fmt.Sprintf("Pull failed: %s", reason))
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status": "error",
+			"error":  fmt.Sprintf("failed to decode Ollama response: %s", reason),
+		})
+		return
+	}
+
 	c.agent.state.AddLog(fmt.Sprintf("Model %s ready", req.Model))
 
 	// Update models list
@@ -291,7 +346,7 @@ func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Reque
 		c.agent.state.UpdateInference("running", c.agent.ollama.TailscaleIP(), DefaultOllamaPort, models)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusCreated, map[string]any{
 		"status":  "ok",
 		"message": fmt.Sprintf("Model %s pulled successfully", req.Model),
 	})

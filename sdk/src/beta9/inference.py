@@ -280,7 +280,6 @@ class InferenceClient:
         Returns:
             EmbeddingResult with the embedding vector(s)
         """
-        # Handle single string
         if isinstance(input, str):
             input = [input]
 
