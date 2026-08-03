@@ -55,10 +55,11 @@ type AgentState struct {
 	TotalJobs   int
 
 	// Inference
-	InferenceStatus string // "stopped", "starting", "running", "error"
-	InferenceIP     string
-	InferencePort   int
-	InferenceModels []string // List of loaded models
+	InferenceStatus  string // "stopped", "starting", "running", "error"
+	InferenceIP      string
+	InferencePort    int
+	InferenceModels  []string // List of loaded models
+	InferenceGPUType string   // e.g. "MPS", "CUDA", ""
 
 	// Logs (ring buffer for TUI display)
 	Logs    []string
@@ -74,18 +75,19 @@ type AgentStateSnapshot struct {
 	CPUPercent      float64
 	MemoryPercent   float64
 	GPUCount        int
-	StartTime       time.Time
-	LastHeartbeat   time.Time
-	HeartbeatStatus string
-	Jobs            []JobInfo
-	RunningJobs     int
-	TotalJobs       int
-	InferenceStatus string
-	InferenceIP     string
-	InferencePort   int
-	InferenceModels []string
-	Logs            []string
-	MaxLogs         int
+	StartTime        time.Time
+	LastHeartbeat    time.Time
+	HeartbeatStatus  string
+	Jobs             []JobInfo
+	RunningJobs      int
+	TotalJobs        int
+	InferenceStatus  string
+	InferenceIP      string
+	InferencePort    int
+	InferenceModels  []string
+	InferenceGPUType string
+	Logs             []string
+	MaxLogs          int
 }
 
 // Uptime returns the agent uptime
@@ -215,22 +217,23 @@ func (s *AgentState) GetSnapshot() AgentStateSnapshot {
 
 	// Build snapshot field-by-field to avoid copying the mutex
 	snapshot := AgentStateSnapshot{
-		MachineID:       s.MachineID,
-		PoolName:        s.PoolName,
-		Gateway:         s.Gateway,
-		Status:          s.Status,
-		CPUPercent:      s.CPUPercent,
-		MemoryPercent:   s.MemoryPercent,
-		GPUCount:        s.GPUCount,
-		StartTime:       s.StartTime,
-		LastHeartbeat:   s.LastHeartbeat,
-		HeartbeatStatus: s.HeartbeatStatus,
-		RunningJobs:     s.RunningJobs,
-		TotalJobs:       s.TotalJobs,
-		InferenceStatus: s.InferenceStatus,
-		InferenceIP:     s.InferenceIP,
-		InferencePort:   s.InferencePort,
-		MaxLogs:         s.MaxLogs,
+		MachineID:        s.MachineID,
+		PoolName:         s.PoolName,
+		Gateway:          s.Gateway,
+		Status:           s.Status,
+		CPUPercent:       s.CPUPercent,
+		MemoryPercent:    s.MemoryPercent,
+		GPUCount:         s.GPUCount,
+		StartTime:        s.StartTime,
+		LastHeartbeat:    s.LastHeartbeat,
+		HeartbeatStatus:  s.HeartbeatStatus,
+		RunningJobs:      s.RunningJobs,
+		TotalJobs:        s.TotalJobs,
+		InferenceStatus:  s.InferenceStatus,
+		InferenceIP:      s.InferenceIP,
+		InferencePort:    s.InferencePort,
+		InferenceGPUType: s.InferenceGPUType,
+		MaxLogs:          s.MaxLogs,
 	}
 
 	// Deep copy slices
@@ -246,11 +249,17 @@ func (s *AgentState) GetSnapshot() AgentStateSnapshot {
 
 // UpdateInference updates inference server status
 func (s *AgentState) UpdateInference(status, ip string, port int, models []string) {
+	s.UpdateInferenceWithGPU(status, ip, port, models, "")
+}
+
+// UpdateInferenceWithGPU updates inference server status including GPU type
+func (s *AgentState) UpdateInferenceWithGPU(status, ip string, port int, models []string, gpuType string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.InferenceStatus = status
 	s.InferenceIP = ip
 	s.InferencePort = port
+	s.InferenceGPUType = gpuType
 	// Copy slice to prevent data races from caller mutations
 	s.InferenceModels = make([]string, len(models))
 	copy(s.InferenceModels, models)

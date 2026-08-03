@@ -39,10 +39,11 @@ type MachineKeepaliveRequest struct {
 }
 
 type InferenceStatus struct {
-	Status string   `json:"status"` // stopped, starting, running, error
-	IP     string   `json:"ip,omitempty"`
-	Port   int      `json:"port,omitempty"`
-	Models []string `json:"models,omitempty"`
+	Status  string   `json:"status"` // stopped, starting, running, error
+	IP      string   `json:"ip,omitempty"`
+	Port    int      `json:"port,omitempty"`
+	Models  []string `json:"models,omitempty"`
+	GPUType string   `json:"gpu_type,omitempty"` // e.g. "MPS", "CUDA", ""
 }
 
 type MachineGroup struct {
@@ -310,18 +311,17 @@ func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
 			// It probably should rely on keepalive.
 
 			// So let's do a RegisterNode call here with available info
+			gpuType := request.Inference.GPUType
+			if gpuType == "" {
+				gpuType = "MPS" // default for backwards compatibility
+			}
 			info := &types.NodeInferenceInfo{
 				NodeID:      request.MachineID,
 				TailscaleIP: request.Inference.IP,
 				Port:        request.Inference.Port,
-				GPUType:     "MPS", // TODO: Infer from metrics?
+				GPUType:     gpuType,
 				Models:      modelsMap,
-				// VRAM from metrics if available
 			}
-			// metrics has GPU info?
-			// request.Metrics is *types.ProviderMachineMetrics
-			// It has GpuCount but maybe not VRAM details easily?
-			// Let's rely on update for now.
 
 			g.inferenceRegistry.RegisterNode(info)
 		}
