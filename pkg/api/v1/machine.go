@@ -2,10 +2,12 @@ package apiv1
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 
 	"github.com/labstack/echo/v4"
+	"github.com/rs/zerolog/log"
 
 	"github.com/beam-cloud/beta9/pkg/auth"
 	"github.com/beam-cloud/beta9/pkg/network"
@@ -37,10 +39,11 @@ type MachineKeepaliveRequest struct {
 }
 
 type InferenceStatus struct {
-	Status string   `json:"status"` // stopped, starting, running, error
-	IP     string   `json:"ip,omitempty"`
-	Port   int      `json:"port,omitempty"`
-	Models []string `json:"models,omitempty"`
+	Status  string   `json:"status"` // stopped, starting, running, error
+	IP      string   `json:"ip,omitempty"`
+	Port    int      `json:"port,omitempty"`
+	Models  []string `json:"models,omitempty"`
+	GPUType string   `json:"gpu_type,omitempty"` // e.g. "MPS", "CUDA", ""
 }
 
 type MachineGroup struct {
@@ -49,37 +52,56 @@ type MachineGroup struct {
 	routerGroup       *echo.Group
 	config            types.AppConfig
 	workerRepo        repository.WorkerRepository
-	inferenceRegistry interface {
-		RegisterNode(info interface{})
-		UpdateHeartbeat(nodeID string)
-		UpdateNodeModels(nodeID string, models interface{})
-	}
+	inferenceRegistry InferenceRegistry
 }
 
-// Interface for model registry to avoid circular imports if possible,
-// or we need to import it. Since gateway imports apiv1, apiv1 cannot import gateway.
-// We'll define the interface here or pass it as 'any' and cast it, or better, move model registry to a shared package.
-// For now, let's use a narrow interface matching methods we need.
+// InferenceRegistry mirrors the subset of gateway.ModelRegistry's methods
+// this package needs. apiv1 can't import gateway (gateway already imports
+// apiv1), so this narrow interface breaks the cycle — but it must use the
+// SAME concrete parameter types gateway.ModelRegistry actually implements
+// (pkg/types.NodeInferenceInfo / pkg/types.ModelInfo, both already shared
+// and importable here). The previous version declared RegisterNode(any) /
+// UpdateNodeModels(nodeID string, any): Go requires exact signature matches
+// for interface satisfaction, so *gateway.ModelRegistry never satisfied it
+// and `inferenceRegistry.(InferenceRegistry)` below panicked on every
+// gateway startup (P0, beta9 security baseline 2026-04-20 onward).
 type InferenceRegistry interface {
-	RegisterNode(info any)
+	RegisterNode(info *types.NodeInferenceInfo)
 	UpdateHeartbeat(nodeID string)
-	UpdateNodeModels(nodeID string, models any)
+	UpdateNodeModels(nodeID string, models map[string]*types.ModelInfo)
 }
 
 func NewMachineGroup(g *echo.Group, providerRepo repository.ProviderRepository, tailscale *network.Tailscale, config types.AppConfig, workerRepo repository.WorkerRepository, inferenceRegistry any) *MachineGroup {
+	// Non-panicking assertion as defense in depth: if a caller ever passes
+	// something that doesn't satisfy InferenceRegistry, disable inference
+	// keepalive/registration for this group instead of crashing the gateway.
+	registry, ok := inferenceRegistry.(InferenceRegistry)
+	if !ok && inferenceRegistry != nil {
+		log.Warn().
+			Str("type", fmt.Sprintf("%T", inferenceRegistry)).
+			Msg("inferenceRegistry does not implement apiv1.InferenceRegistry; inference keepalive/registration disabled for this machine group")
+	}
 	group := &MachineGroup{routerGroup: g,
 		providerRepo:      providerRepo,
 		tailscale:         tailscale,
 		config:            config,
 		workerRepo:        workerRepo,
-		inferenceRegistry: inferenceRegistry.(InferenceRegistry),
+		inferenceRegistry: registry,
 	}
 
 	g.GET("/:workspaceId/gpus", auth.WithWorkspaceAuth(group.GPUCounts))
-	g.POST("/register", group.RegisterMachine)
-	g.POST("/keepalive", group.MachineKeepalive)
-	g.GET("/config", group.GetConfig)
-	g.GET("/list", group.ListPoolMachines)
+	// RegisterMachine/MachineKeepalive/GetConfig/ListPoolMachines all do
+	// `cc, _ := ctx.(*auth.HttpAuthContext)` and immediately dereference
+	// `cc.AuthInfo...` with no ok-check. Unwrapped, a caller with no token
+	// hits fail-open AuthMiddleware (ctx stays plain echo.Context), so cc
+	// is nil and every one of these routes nil-derefs on the first line
+	// (security baseline P1: "nil-deref panic on unauth /v1/machine/*").
+	// auth.WithAuth guarantees ctx is *HttpAuthContext before the handler
+	// runs, which both fixes the panic and requires real authentication.
+	g.POST("/register", auth.WithAuth(group.RegisterMachine))
+	g.POST("/keepalive", auth.WithAuth(group.MachineKeepalive))
+	g.GET("/config", auth.WithAuth(group.GetConfig))
+	g.GET("/list", auth.WithAuth(group.ListPoolMachines))
 	return group
 }
 
@@ -202,22 +224,22 @@ func (g *MachineGroup) RegisterMachine(ctx echo.Context) error {
 	})
 }
 
-// Helper structs for reflection/dynamic typing without importing gateway
-type NodeInferenceInfo struct {
-	NodeID        string                `json:"node_id"`
-	TailscaleIP   string                `json:"tailscale_ip"`
-	Port          int                   `json:"port"`
-	GPUType       string                `json:"gpu_type"`
-	TotalVRAM     int64                 `json:"total_vram_mb"`
-	AvailableVRAM int64                 `json:"available_vram_mb"`
-	Models        map[string]*ModelInfo `json:"models"`
-}
+// tailscaleCGNAT / isTailscaleAddr duplicate pkg/gateway's inference_handlers.go
+// helper of the same purpose — apiv1 can't import gateway (gateway already
+// imports apiv1), so this is a small, intentional duplication rather than a
+// new shared package for one four-line check. If a third caller ever needs
+// it, move both copies to pkg/network.
+var tailscaleCGNAT = func() *net.IPNet {
+	_, n, err := net.ParseCIDR("100.64.0.0/10")
+	if err != nil {
+		panic(err)
+	}
+	return n
+}()
 
-type ModelInfo struct {
-	Name      string `json:"name"`
-	LoadState string `json:"load_state"`
-	LastUsed  any    `json:"last_used"`
-	LoadedAt  any    `json:"loaded_at"`
+func isTailscaleAddr(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && tailscaleCGNAT.Contains(parsed)
 }
 
 func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
@@ -254,17 +276,24 @@ func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
 
 	// Update inference status if available
 	if request.Inference != nil && g.inferenceRegistry != nil {
+		if request.Inference.Status == "running" && request.Inference.IP != "" && !isTailscaleAddr(request.Inference.IP) {
+			// P1 (beta9 security baseline): a compromised-but-authenticated
+			// worker token could otherwise redirect all chat/embed traffic
+			// for its machine_id to an arbitrary IP via keepalive. Same
+			// CGNAT check as /inference/nodes/register in the gateway package.
+			return HTTPBadRequest("inference.ip must be within the Tailscale CGNAT range (100.64.0.0/10)")
+		}
 		if request.Inference.Status == "running" {
 			// Register if needed (idempotent usually) or just update heartbeat
 			// Since we don't have full VRAM info here (it's in metrics but flat),
 			// we construct a best-effort update.
 
 			// Transform models list to map
-			modelsMap := make(map[string]*ModelInfo)
+			modelsMap := make(map[string]*types.ModelInfo)
 			for _, m := range request.Inference.Models {
-				modelsMap[m] = &ModelInfo{
+				modelsMap[m] = &types.ModelInfo{
 					Name:      m,
-					LoadState: "ready", // Assume ready if reported
+					LoadState: types.LoadStateReady, // Assume ready if reported
 				}
 			}
 
@@ -282,18 +311,17 @@ func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
 			// It probably should rely on keepalive.
 
 			// So let's do a RegisterNode call here with available info
-			info := &NodeInferenceInfo{
+			gpuType := request.Inference.GPUType
+			if gpuType == "" {
+				gpuType = "MPS" // default for backwards compatibility
+			}
+			info := &types.NodeInferenceInfo{
 				NodeID:      request.MachineID,
 				TailscaleIP: request.Inference.IP,
 				Port:        request.Inference.Port,
-				GPUType:     "MPS", // TODO: Infer from metrics?
+				GPUType:     gpuType,
 				Models:      modelsMap,
-				// VRAM from metrics if available
 			}
-			// metrics has GPU info?
-			// request.Metrics is *types.ProviderMachineMetrics
-			// It has GpuCount but maybe not VRAM details easily?
-			// Let's rely on update for now.
 
 			g.inferenceRegistry.RegisterNode(info)
 		}
