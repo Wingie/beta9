@@ -307,14 +307,8 @@ func (g *MachineGroup) MachineKeepalive(ctx echo.Context) error {
 			// We can try to register it on every heartbeat to be safe or only if missing?
 			// For now let's just update models/heartbeat which should be enough if registered via /inference/nodes/register
 			// But wait, the agent doesn't call /inference/nodes/register explicitly in its main loop?
-			// Ah, the agent doesn't seem to call /inference/nodes/register in `runWithTUI`?
-			// It probably should rely on keepalive.
-
-			// So let's do a RegisterNode call here with available info
+			// The agent registers through keepalive rather than /inference/nodes/register, so the node is registered from here with what the keepalive carried.
 			gpuType := request.Inference.GPUType
-			if gpuType == "" {
-				gpuType = "MPS" // default for backwards compatibility
-			}
 			info := &types.NodeInferenceInfo{
 				NodeID:      request.MachineID,
 				TailscaleIP: request.Inference.IP,
