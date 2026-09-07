@@ -24,10 +24,11 @@ type KeepalivePayload struct {
 }
 
 type InferenceStatus struct {
-	Status string   `json:"status"` // stopped, starting, running, error
-	IP     string   `json:"ip,omitempty"`
-	Port   int      `json:"port,omitempty"`
-	Models []string `json:"models,omitempty"`
+	Status  string   `json:"status"` // stopped, starting, running, error
+	IP      string   `json:"ip,omitempty"`
+	Port    int      `json:"port,omitempty"`
+	Models  []string `json:"models,omitempty"`
+	GPUType string   `json:"gpu_type,omitempty"` // e.g. "MPS", "CUDA", ""
 }
 
 // KeepaliveLoop manages periodic keepalive updates to the gateway
@@ -167,9 +168,10 @@ func (k *KeepaliveLoop) sendKeepalive(ctx context.Context) bool {
 	// Add inference status if state is available
 	if k.state != nil {
 		inferenceObj := &InferenceStatus{
-			Status: k.state.InferenceStatus,
-			Port:   k.state.InferencePort,
-			Models: k.state.InferenceModels,
+			Status:  k.state.InferenceStatus,
+			Port:    k.state.InferencePort,
+			Models:  k.state.InferenceModels,
+			GPUType: k.state.InferenceGPUType,
 		}
 		// If inference is running, use Tailscale IP
 		if k.state.InferenceStatus == "running" && k.state.InferenceIP != "" {

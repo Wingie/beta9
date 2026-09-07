@@ -3,9 +3,11 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -13,6 +15,49 @@ import (
 )
 
 const DefaultControlPort = 9999
+
+// DefaultControlBindAddr binds the control server to loopback only by
+// default (P0-2: it used to hardcode 0.0.0.0, reachable by any Tailnet
+// peer with zero authentication). Set BETA9_AGENT_CONTROL_BIND_ADDR to
+// override for setups that genuinely need the gateway to reach this over
+// the Tailnet — the shared-secret check below still gates every request
+// either way.
+const DefaultControlBindAddr = "127.0.0.1"
+
+// isValidOllamaModelName allows only simple local model references
+// (name, name:tag, namespace/name:tag) and rejects anything shaped like a
+// fully-qualified third-party registry reference. P0-2b: `req.Model` used
+// to be forwarded verbatim to Ollama's /api/pull, so a caller could smuggle
+// "registry.attacker.com/model:tag" — a supply-chain pull plus a disk-fill
+// DoS via the 30-minute pull timeout. Charset is an explicit allowlist
+// (not a regex, per this repo's ban on hand-rolled regex for validation);
+// the "does the first path segment contain a dot" check is the same
+// heuristic Docker/Ollama use to tell a registry hostname apart from a
+// plain namespace.
+func isValidOllamaModelName(name string) bool {
+	if name == "" || len(name) > 255 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '.' || r == '-' || r == ':' || r == '/':
+		default:
+			return false
+		}
+	}
+	if strings.Contains(name, "..") || strings.Contains(name, "//") {
+		return false
+	}
+	parts := strings.Split(name, "/")
+	if len(parts) > 2 {
+		return false // deeper than namespace/name is a fully-qualified external registry path
+	}
+	if len(parts) == 2 && strings.Contains(parts[0], ".") {
+		return false // first segment looks like a registry hostname (e.g. registry.attacker.com)
+	}
+	return true
+}
 
 // ControlServer handles external commands to the agent
 type ControlServer struct {
@@ -44,27 +89,63 @@ func NewControlServer(agent *Agent, port int) *ControlServer {
 	}
 }
 
+// requireControlToken wraps a handler so it 401s unless the caller presents
+// the shared secret from BETA9_AGENT_CONTROL_TOKEN as a Bearer token or
+// X-Control-Token header. P0-2: this server previously had zero
+// authentication at all — any Tailnet peer reaching :9999 could start/stop
+// inference or trigger a model pull. Fails closed (503) if the operator
+// hasn't set a token, matching the same policy used for the gateway's
+// cluster-admin auth rather than silently allowing everything.
+func (c *ControlServer) requireControlToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := os.Getenv("BETA9_AGENT_CONTROL_TOKEN")
+		if token == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"status": "error",
+				"error":  "BETA9_AGENT_CONTROL_TOKEN is not configured; refusing control requests",
+			})
+			return
+		}
+		supplied := r.Header.Get("X-Control-Token")
+		if supplied == "" {
+			supplied = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		}
+		if subtle.ConstantTimeCompare([]byte(supplied), []byte(token)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"status": "error",
+				"error":  "missing or invalid control token",
+			})
+			return
+		}
+		next(w, r)
+	}
+}
+
 // Start starts the control server
 func (c *ControlServer) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 
 	// Inference control
-	mux.HandleFunc("/inference/start", c.handleInferenceStart)
-	mux.HandleFunc("/inference/stop", c.handleInferenceStop)
-	mux.HandleFunc("/inference/status", c.handleInferenceStatus)
-	mux.HandleFunc("/inference/pull", c.handleInferencePull)
+	mux.HandleFunc("/inference/start", c.requireControlToken(c.handleInferenceStart))
+	mux.HandleFunc("/inference/stop", c.requireControlToken(c.handleInferenceStop))
+	mux.HandleFunc("/inference/status", c.requireControlToken(c.handleInferenceStatus))
+	mux.HandleFunc("/inference/pull", c.requireControlToken(c.handleInferencePull))
 
 	// Agent status
-	mux.HandleFunc("/status", c.handleStatus)
-	mux.HandleFunc("/health", c.handleHealth)
+	mux.HandleFunc("/status", c.requireControlToken(c.handleStatus))
+	mux.HandleFunc("/health", c.handleHealth) // unauthenticated liveness probe only
 
+	bindAddr := os.Getenv("BETA9_AGENT_CONTROL_BIND_ADDR")
+	if bindAddr == "" {
+		bindAddr = DefaultControlBindAddr
+	}
 	c.server = &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", c.port),
+		Addr:    fmt.Sprintf("%s:%d", bindAddr, c.port),
 		Handler: mux,
 	}
 
 	go func() {
-		log.Info().Int("port", c.port).Msg("Control server starting")
+		log.Info().Str("bind_addr", bindAddr).Int("port", c.port).Msg("Control server starting")
 		if err := c.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("Control server error")
 		}
@@ -130,32 +211,6 @@ func (c *ControlServer) handleInferenceStop(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// isAllowedModelName enforces a narrow allowlist pattern for model names
-// accepted by /inference/pull. Ollama model names are of the form
-// "<namespace>/<name>:<tag>" or "<name>:<tag>" — only A-Z a-z 0-9 . _ - / :
-// are permitted, length <= 128. Explicitly rejects ".." to block path
-// traversal payloads from reaching the Ollama daemon.
-func isAllowedModelName(name string) bool {
-	if name == "" || len(name) > 128 {
-		return false
-	}
-	// Block path-traversal sequences outright.
-	if strings.Contains(name, "..") {
-		return false
-	}
-	for _, ch := range name {
-		switch {
-		case ch >= 'a' && ch <= 'z':
-		case ch >= 'A' && ch <= 'Z':
-		case ch >= '0' && ch <= '9':
-		case ch == '.' || ch == '_' || ch == '-' || ch == '/' || ch == ':':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 // handleInferencePull pulls a model and streams progress to TUI logs
 func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -186,12 +241,10 @@ func (c *ControlServer) handleInferencePull(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// P0-A model-name allowlist: reject anything with shell metacharacters
-	// or path-traversal sequences before forwarding to the Ollama daemon.
-	if !isAllowedModelName(req.Model) {
+	if !isValidOllamaModelName(req.Model) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"status": "error",
-			"error":  "Invalid model name",
+			"error":  "Model name must be a simple local reference (name[:tag] or namespace/name[:tag]), not a fully-qualified registry path",
 		})
 		return
 	}

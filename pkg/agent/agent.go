@@ -357,12 +357,14 @@ func (a *Agent) StartInference() error {
 	}
 
 	if a.ollama.IsRunning() {
+		status := a.ollama.GetStatus()
 		log.Info().
 			Int("port", DefaultOllamaPort).
 			Str("tailscale_ip", a.ollama.TailscaleIP()).
+			Str("gpu_type", status.GPUType).
 			Msg("Inference server ready")
 		a.state.AddLog("Inference: ready on :" + fmt.Sprintf("%d", DefaultOllamaPort))
-		a.state.UpdateInference("running", a.ollama.TailscaleIP(), DefaultOllamaPort, nil)
+		a.state.UpdateInferenceWithGPU("running", a.ollama.TailscaleIP(), DefaultOllamaPort, nil, status.GPUType)
 	}
 
 	return nil
