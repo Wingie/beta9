@@ -1,0 +1,203 @@
+# Builds multi-arch images (arm64 + amd64) and pushes to registry.agentosaurus.com
+# Deploy manually with: ssh flow "cd ~/FlowState/backend/remote_servers/scripts && ./beta9_deploy.sh"
+name: Build and Push to Agentosaurus Registry
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'go.mod'
+      - 'go.sum'
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  REGISTRY: registry.agentosaurus.com
+
+jobs:
+  build-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            image=moby/buildkit:v0.13.0
+
+      - name: Login to Registry (with retry)
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "Login attempt $i..."
+            if echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin; then
+              echo "Login succeeded"
+              break
+            fi
+            echo "Login failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Warmup registry connection
+        run: |
+          echo "Testing registry connectivity..."
+          for i in 1 2 3 4 5; do
+            if curl -sf --connect-timeout 30 --max-time 60 "https://${{ env.REGISTRY }}/v2/" > /dev/null 2>&1; then
+              echo "Registry is responsive"
+              break
+            fi
+            echo "Registry not ready, waiting 15s... (attempt $i)"
+            sleep 15
+          done
+
+      - name: Build and push gateway
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.gateway
+          push: true
+          tags: ${{ env.REGISTRY }}/beta9-gateway:latest
+          platforms: linux/amd64,linux/arm64
+          target: release
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-worker:
+    needs: build-gateway
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            image=moby/buildkit:v0.13.0
+
+      - name: Login to Registry (with retry)
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "Login attempt $i..."
+            if echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin; then
+              echo "Login succeeded"
+              break
+            fi
+            echo "Login failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Warmup registry connection
+        run: |
+          echo "Testing registry connectivity..."
+          for i in 1 2 3 4 5; do
+            if curl -sf --connect-timeout 30 --max-time 60 "https://${{ env.REGISTRY }}/v2/" > /dev/null 2>&1; then
+              echo "Registry is responsive"
+              break
+            fi
+            echo "Registry not ready, waiting 15s... (attempt $i)"
+            sleep 15
+          done
+
+      - name: Build and push worker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.worker
+          push: true
+          tags: ${{ env.REGISTRY }}/beta9-worker:latest
+          platforms: linux/amd64,linux/arm64
+          target: final
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-runner:
+    needs: build-worker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            image=moby/buildkit:v0.13.0
+
+      - name: Login to Registry (with retry)
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "Login attempt $i..."
+            if echo "${{ secrets.REGISTRY_PASSWD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} --password-stdin; then
+              echo "Login succeeded"
+              break
+            fi
+            echo "Login failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Warmup registry connection
+        run: |
+          echo "Testing registry connectivity..."
+          for i in 1 2 3 4 5; do
+            if curl -sf --connect-timeout 30 --max-time 60 "https://${{ env.REGISTRY }}/v2/" > /dev/null 2>&1; then
+              echo "Registry is responsive"
+              break
+            fi
+            echo "Registry not ready, waiting 15s... (attempt $i)"
+            sleep 15
+          done
+
+      - name: Build and push runner
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.runner
+          push: true
+          tags: ${{ env.REGISTRY }}/beta9-runner:py310-latest
+          platforms: linux/amd64,linux/arm64
+          target: py310
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

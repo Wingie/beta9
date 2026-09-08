@@ -26,6 +26,7 @@ require (
 	github.com/cloudevents/sdk-go/v2 v2.15.2
 	github.com/cockroachdb/redact v1.1.8
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6
+	github.com/getsentry/sentry-go v0.49.0
 	github.com/go-faker/faker/v4 v4.6.0
 	github.com/go-playground/validator/v10 v10.26.0
 	github.com/go-viper/mapstructure/v2 v2.4.0
