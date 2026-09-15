@@ -40,7 +40,8 @@ dev = [
     "pytest-env<2.0.0,>=1.1.3",
     "attrs<24.0.0,>=23.2.0",
     "docstring-parser<1.0,>=0.16",
-    "ruff",
+    # Pinned: an unpinned linter changes the ruleset on every release, which red-lined CI for five months with no commit behind it.
+    "ruff==0.11.2",
     "gunicorn<24.0.0,>=22.0.0",
     "requests<3.0.0,>=2.32.3",
     "pytest-cov<6.0.0,>=5.0.0",
