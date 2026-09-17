@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
@@ -76,10 +77,7 @@ type FunctionServiceOpts struct {
 func NewContainerFunctionService(ctx context.Context,
 	opts FunctionServiceOpts,
 ) (FunctionService, error) {
-	keyEventManager, err := common.NewKeyEventManager(opts.RedisClient)
-	if err != nil {
-		return nil, err
-	}
+	keyEventManager := common.NewKeyEventManager(opts.RedisClient)
 
 	fs := &ContainerFunctionService{
 		ctx:              ctx,
@@ -97,7 +95,6 @@ func NewContainerFunctionService(ctx context.Context,
 		eventRepo:        opts.EventRepo,
 		usageMetricsRepo: opts.UsageMetricsRepo,
 	}
-
 	// Register task dispatcher
 	fs.taskDispatcher.Register(string(types.ExecutorFunction), fs.functionTaskFactory)
 
@@ -107,6 +104,7 @@ func NewContainerFunctionService(ctx context.Context,
 	registerFunctionRoutes(fs.routeGroup.Group(scheduleRoutePrefix, authMiddleware), fs)
 
 	go fs.listenForScheduledJobs()
+	go abstractions.ListenForTaskSchedulingFailures(ctx, fs.rdb, fs.backendRepo, fs.taskDispatcher)
 
 	return fs, nil
 }
@@ -122,7 +120,7 @@ func (fs *ContainerFunctionService) FunctionInvoke(in *pb.FunctionInvokeRequest,
 		return err
 	}
 
-	return fs.stream(ctx, stream, authInfo, task, in.StubId, in.Headless)
+	return fs.stream(ctx, stream, authInfo, task, in.Headless)
 }
 
 func (fs *ContainerFunctionService) invoke(ctx context.Context, authInfo *auth.AuthInfo, stubId string, payload *types.TaskPayload) (types.TaskInterface, error) {
@@ -167,9 +165,12 @@ func (fs *ContainerFunctionService) functionTaskFactory(ctx context.Context, msg
 	}, nil
 }
 
-func (fs *ContainerFunctionService) stream(ctx context.Context, stream pb.FunctionService_FunctionInvokeServer, authInfo *auth.AuthInfo, task types.TaskInterface, stubId string, headless bool) error {
+func (fs *ContainerFunctionService) stream(ctx context.Context, stream pb.FunctionService_FunctionInvokeServer, authInfo *auth.AuthInfo, task types.TaskInterface, headless bool) error {
 	taskId := task.Metadata().TaskId
 	containerId := task.Metadata().ContainerId
+	clientCtx := ctx
+	streamDone := make(chan struct{})
+	completionObserved := atomic.Bool{}
 
 	sendCallback := func(o common.OutputMsg) error {
 		if err := stream.Send(&pb.FunctionInvokeResponse{TaskId: taskId, Output: o.Msg, Done: o.Done}); err != nil {
@@ -180,9 +181,18 @@ func (fs *ContainerFunctionService) stream(ctx context.Context, stream pb.Functi
 	}
 
 	exitCallback := func(exitCode int32) error {
+		completionObserved.Store(true)
+		resultLoadStart := time.Now()
 		result, _ := fs.rdb.Get(stream.Context(), Keys.FunctionResult(authInfo.Workspace.Name, taskId)).Bytes()
+		if fs.eventRepo != nil {
+			fs.eventRepo.PushFunctionResultLoaded(authInfo.Workspace.ExternalId, task, exitCode, len(result))
+		}
 		if err := stream.Send(&pb.FunctionInvokeResponse{TaskId: taskId, Done: true, Result: result, ExitCode: int32(exitCode)}); err != nil {
 			return err
+		}
+		if fs.eventRepo != nil {
+			fs.eventRepo.PushFunctionResultDelivery(authInfo.Workspace.ExternalId, task, resultLoadStart, exitCode, len(result))
+			fs.eventRepo.PushFunctionResultSent(authInfo.Workspace.ExternalId, task, exitCode, len(result))
 		}
 		return nil
 	}
@@ -204,41 +214,71 @@ func (fs *ContainerFunctionService) stream(ctx context.Context, stream pb.Functi
 			return
 		}
 
-		<-ctx.Done() // Wait for the stream to be closed to cancel the task
-
-		err = task.Cancel(context.Background(), types.TaskRequestCancelled)
-		if err != nil {
-			log.Error().Err(err).Str("task_id", task.Message().TaskId).Str("stub_id", task.Message().StubId).Str("workspace_id", authInfo.Workspace.ExternalId).Msg("error cancelling task")
+		select {
+		case <-streamDone:
+			return
+		case <-clientCtx.Done():
 		}
 
-		err = fs.taskDispatcher.Complete(context.Background(), authInfo.Workspace.Name, task.Message().StubId, task.Message().TaskId)
-		if err != nil {
+		if completionObserved.Load() {
+			return
+		}
+
+		if fs.eventRepo != nil {
+			fs.eventRepo.PushFunctionStreamCancelRequested(authInfo.Workspace.ExternalId, task)
+		}
+		if err := task.Cancel(context.Background(), types.TaskRequestCancelled); err != nil {
+			log.Error().Err(err).Str("task_id", task.Message().TaskId).Str("stub_id", task.Message().StubId).Str("workspace_id", authInfo.Workspace.ExternalId).Msg("error cancelling task")
+		} else if fs.eventRepo != nil {
+			fs.eventRepo.PushFunctionStreamCancelApplied(authInfo.Workspace.ExternalId, task)
+		}
+
+		if err := fs.taskDispatcher.Complete(context.Background(), authInfo.Workspace.Name, task.Message().StubId, task.Message().TaskId); err != nil {
 			log.Error().Err(err).Str("task_id", task.Message().TaskId).Str("stub_id", task.Message().StubId).Str("workspace_id", authInfo.Workspace.ExternalId).Msg("error completing task")
 		}
 
-		err = fs.rdb.Publish(context.Background(), common.RedisKeys.TaskCancel(authInfo.Workspace.Name, task.Message().StubId, task.Message().TaskId), task.Message().TaskId).Err()
-		if err != nil {
+		if err := fs.rdb.Publish(context.Background(), common.RedisKeys.TaskCancel(authInfo.Workspace.Name, task.Message().StubId, task.Message().TaskId), task.Message().TaskId).Err(); err != nil {
 			log.Error().Err(err).Str("task_id", task.Message().TaskId).Str("stub_id", task.Message().StubId).Str("workspace_id", authInfo.Workspace.ExternalId).Msg("error publishing task cancel event")
 		}
 	}()
 
 	ctx, cancel := common.MergeContexts(fs.ctx, ctx)
-	defer cancel()
-
-	return containerStream.Stream(ctx, authInfo, containerId)
+	err = containerStream.Stream(ctx, authInfo, containerId)
+	close(streamDone)
+	cancel()
+	return err
 }
 
 func (fs *ContainerFunctionService) FunctionGetArgs(ctx context.Context, in *pb.FunctionGetArgsRequest) (*pb.FunctionGetArgsResponse, error) {
 	authInfo, _ := auth.AuthInfoFromContext(ctx)
+	now := time.Now()
+	phaseMetrics := task.NewPhaseMetrics(fs.rdb)
+	phaseLabels := phaseMetrics.Labels(ctx, authInfo.Workspace.Name, in.TaskId, map[string]string{
+		"workspace_id": authInfo.Workspace.ExternalId,
+	})
 
 	value, err := fs.rdb.Get(ctx, Keys.FunctionArgs(authInfo.Workspace.Name, in.TaskId)).Bytes()
 	if err != nil {
+		phaseLabels["success"] = "false"
+		phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_get_args", task.FunctionPhaseStartTask, now, phaseLabels)
 		return &pb.FunctionGetArgsResponse{Ok: false, Args: nil}, nil
 	}
 
 	err = fs.rdb.SetEx(ctx, Keys.FunctionHeartbeat(authInfo.Workspace.Name, in.TaskId), 1, time.Duration(defaultFunctionHeartbeatTimeoutS)*time.Second).Err()
 	if err != nil {
+		phaseLabels["success"] = "false"
+		phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_get_args", task.FunctionPhaseStartTask, now, phaseLabels)
 		return &pb.FunctionGetArgsResponse{Ok: false, Args: nil}, nil
+	}
+
+	phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_get_args", task.FunctionPhaseStartTask, now, phaseLabels)
+	if err := phaseMetrics.Mark(ctx, authInfo.Workspace.Name, in.TaskId, task.FunctionPhaseGetArgs, now); err != nil {
+		log.Debug().Err(err).Str("task_id", in.TaskId).Msg("failed to mark function get_args phase")
+	}
+	if fs.eventRepo != nil {
+		if taskWithRelated, err := fs.backendRepo.GetTaskWithRelated(ctx, in.TaskId); err == nil && taskWithRelated != nil {
+			fs.eventRepo.PushFunctionGetArgs(ctx, fs.rdb, taskWithRelated, now, len(value))
+		}
 	}
 
 	return &pb.FunctionGetArgsResponse{
@@ -249,10 +289,29 @@ func (fs *ContainerFunctionService) FunctionGetArgs(ctx context.Context, in *pb.
 
 func (fs *ContainerFunctionService) FunctionSetResult(ctx context.Context, in *pb.FunctionSetResultRequest) (*pb.FunctionSetResultResponse, error) {
 	authInfo, _ := auth.AuthInfoFromContext(ctx)
+	now := time.Now()
+	phaseMetrics := task.NewPhaseMetrics(fs.rdb)
+	phaseLabels := phaseMetrics.Labels(ctx, authInfo.Workspace.Name, in.TaskId, map[string]string{
+		"workspace_id": authInfo.Workspace.ExternalId,
+	})
 
 	err := fs.rdb.Set(ctx, Keys.FunctionResult(authInfo.Workspace.Name, in.TaskId), in.Result, functionResultExpirationTimeout).Err()
 	if err != nil {
+		phaseLabels["success"] = "false"
+		phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "get_args_to_set_result", task.FunctionPhaseGetArgs, now, phaseLabels)
+		phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_set_result", task.FunctionPhaseStartTask, now, phaseLabels)
 		return &pb.FunctionSetResultResponse{Ok: false}, nil
+	}
+
+	phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "get_args_to_set_result", task.FunctionPhaseGetArgs, now, phaseLabels)
+	phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_set_result", task.FunctionPhaseStartTask, now, phaseLabels)
+	if err := phaseMetrics.Mark(ctx, authInfo.Workspace.Name, in.TaskId, task.FunctionPhaseSetResult, now); err != nil {
+		log.Debug().Err(err).Str("task_id", in.TaskId).Msg("failed to mark function set_result phase")
+	}
+	if fs.eventRepo != nil {
+		if taskWithRelated, err := fs.backendRepo.GetTaskWithRelated(ctx, in.TaskId); err == nil && taskWithRelated != nil {
+			fs.eventRepo.PushFunctionSetResult(ctx, fs.rdb, taskWithRelated, now, len(in.Result))
+		}
 	}
 
 	return &pb.FunctionSetResultResponse{

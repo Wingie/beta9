@@ -103,3 +103,115 @@ func TestBuildServeURL(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildPodURL(t *testing.T) {
+	externalUrl := "http://app.example.com"
+	stub := &types.StubWithRelated{Stub: types.Stub{
+		ExternalId: "e9c29586-c465-4a67-9c9b-25293d1ce77b",
+		Type:       types.StubType(types.StubTypePodDeployment),
+	}}
+
+	tests := []struct {
+		name        string
+		config      *types.StubConfigV1
+		invokeType  string
+		expectedUrl string
+	}{
+		{
+			name: "returns public path URL for unauthenticated pod",
+			config: &types.StubConfigV1{
+				Authorized: false,
+				Ports:      []uint32{8000},
+			},
+			invokeType:  InvokeUrlTypePath,
+			expectedUrl: "http://app.example.com/pod/public/e9c29586-c465-4a67-9c9b-25293d1ce77b/8000",
+		},
+		{
+			name: "returns authenticated path URL for authorized pod",
+			config: &types.StubConfigV1{
+				Authorized: true,
+				Ports:      []uint32{8000},
+			},
+			invokeType:  InvokeUrlTypePath,
+			expectedUrl: "http://app.example.com/pod/id/e9c29586-c465-4a67-9c9b-25293d1ce77b/8000",
+		},
+		{
+			name: "keeps host URL shape for pod ports",
+			config: &types.StubConfigV1{
+				Authorized: false,
+				Ports:      []uint32{8000},
+			},
+			invokeType:  InvokeUrlTypeHost,
+			expectedUrl: "http://e9c29586-c465-4a67-9c9b-25293d1ce77b-8000.app.example.com",
+		},
+		{
+			name: "uses port placeholder for multi-port pods",
+			config: &types.StubConfigV1{
+				Authorized: false,
+				Ports:      []uint32{8000, 9000},
+			},
+			invokeType:  InvokeUrlTypePath,
+			expectedUrl: "http://app.example.com/pod/public/e9c29586-c465-4a67-9c9b-25293d1ce77b/<PORT>",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := BuildPodURL(externalUrl, test.invokeType, stub, test.config)
+			assert.Equal(t, test.expectedUrl, got)
+		})
+	}
+}
+
+func TestBuildPodDeploymentURL(t *testing.T) {
+	got := BuildPodDeploymentURL(
+		"https://svc.example.com",
+		InvokeUrlTypeHost,
+		&types.Deployment{
+			Name:      "postgres",
+			Subdomain: "postgres-a1b2c3d",
+			Version:   3,
+		},
+		&types.StubConfigV1{Ports: []uint32{5432}},
+	)
+	assert.Equal(t, "https://postgres-a1b2c3d-latest-5432.svc.example.com", got)
+}
+
+func TestBuildSandboxURL(t *testing.T) {
+	stub := &types.StubWithRelated{Stub: types.Stub{
+		Type:       types.StubType(types.StubTypeSandbox),
+		ExternalId: "e9c29586-c465-4a67-9c9b-25293d1ce77b",
+	}}
+	containerID := "sandbox-e9c29586-c465-4a67-9c9b-25293d1ce77b-abc12345"
+
+	tests := []struct {
+		name        string
+		invokeType  string
+		expectedURL string
+	}{
+		{
+			name:        "pins container path URL",
+			invokeType:  InvokeUrlTypePath,
+			expectedURL: "http://app.example.com/sandbox/container/e9c29586-c465-4a67-9c9b-25293d1ce77b/sandbox-e9c29586-c465-4a67-9c9b-25293d1ce77b-abc12345/8765",
+		},
+		{
+			name:        "keeps host URL shape and pins container",
+			invokeType:  InvokeUrlTypeHost,
+			expectedURL: "http://sandbox-e9c29586-c465-4a67-9c9b-25293d1ce77b-abc12345-8765.app.example.com",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := BuildSandboxURL(
+				"http://app.example.com",
+				test.invokeType,
+				stub,
+				containerID,
+				8765,
+			)
+
+			assert.Equal(t, test.expectedURL, got)
+		})
+	}
+}

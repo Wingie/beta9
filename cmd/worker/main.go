@@ -2,42 +2,45 @@ package main
 
 import (
 	"os"
+	"runtime"
+	"strconv"
 
-	"time"
-
+	"github.com/beam-cloud/beta9/cmd/internal/fsentry"
 	"github.com/beam-cloud/beta9/pkg/common"
 	"github.com/beam-cloud/beta9/pkg/metrics"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/beam-cloud/beta9/pkg/worker"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-
-	"github.com/getsentry/sentry-go"
 )
 
 func main() {
-	// Initialize Sentry
-	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
-		err := sentry.Init(sentry.ClientOptions{
-			Dsn: dsn,
-		})
-		if err != nil {
-			log.Error().Err(err).Msg("sentry.Init failed")
-		} else {
-			defer sentry.Flush(2 * time.Second)
-		}
-	}
+	configureGOMAXPROCS()
+
+	defer fsentry.Init()()
+
 	configManager, err := common.NewConfigManager[types.AppConfig]()
 	if err != nil {
 		log.Fatal().Err(err).Msg("error creating config manager")
 	}
 	config := configManager.GetConfig()
+	if config.DebugMode {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	} else {
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	}
 	if config.PrettyLogs {
-		log.Logger = log.Logger.Level(zerolog.DebugLevel)
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
 	}
 
 	metrics.InitializeMetricsRepository(config.Monitoring.VictoriaMetrics)
+
+	if enabled, _ := strconv.ParseBool(os.Getenv("CACHE_SERVER_ONLY")); enabled {
+		if err := worker.RunCacheServer(); err != nil {
+			log.Fatal().Err(err).Msg("cache server failed")
+		}
+		return
+	}
 
 	notFoundErr := &types.ErrWorkerNotFound{}
 	s, err := worker.NewWorker()
@@ -59,4 +62,19 @@ func main() {
 
 		log.Fatal().Err(err).Msg("worker failed to run")
 	}
+}
+
+func configureGOMAXPROCS() {
+	if os.Getenv("GOMAXPROCS") != "" {
+		return
+	}
+
+	cpuMillis, err := strconv.ParseInt(os.Getenv(types.WorkerCPUEnv), 10, 64)
+	if err != nil || cpuMillis <= 0 {
+		return
+	}
+
+	// Go 1.23 does not derive GOMAXPROCS from cgroup CPU quotas.
+	maxProcs := int((cpuMillis + 999) / 1000)
+	runtime.GOMAXPROCS(maxProcs)
 }

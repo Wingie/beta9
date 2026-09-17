@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1.7-labs
 ARG BASE_STAGE=dev
 
-FROM golang:1.23-bookworm AS golang
-
+FROM golang:1.25-bookworm AS golang
 
 RUN apt-get update && apt-get install -y curl git
 
@@ -25,6 +24,9 @@ FROM golang:1.23-bookworm AS runc
 
 WORKDIR /workspace
 
+COPY docker/patches/runc/runc-criu-production-log-level.patch /tmp/runc-criu-production-log-level.patch
+COPY docker/patches/runc/runc-criu-cpu-compatibility.patch /tmp/runc-criu-cpu-compatibility.patch
+
 RUN apt-get update && apt-get install -y \
     make \
     btrfs-progs \
@@ -43,7 +45,11 @@ RUN <<EOT
 set -eux
 git clone -b dlm/force-compat-mode-on-restore https://github.com/beam-cloud/runc.git /workspace/runc \
   && cd /workspace/runc \
-  && git reset --hard d85a78033ba2905f5c57afdc81b73a12be72c03c
+  && git reset --hard d85a78033ba2905f5c57afdc81b73a12be72c03c \
+  && git apply --check /tmp/runc-criu-production-log-level.patch \
+  && git apply /tmp/runc-criu-production-log-level.patch \
+  && git apply --check /tmp/runc-criu-cpu-compatibility.patch \
+  && git apply /tmp/runc-criu-cpu-compatibility.patch
 
 cd /workspace/runc
 make
@@ -79,7 +85,10 @@ EOT
 FROM debian:bookworm AS gvisor
 
 ARG TARGETARCH
-ARG GVISOR_VERSION=20250407.0
+ARG GVISOR_VERSION=20260714.0
+# beam-cloud/gvisor@3d5aea8eefb1175e02baac73663553f83528095d
+ARG GVISOR_AMD64_RELEASE=release-20260714.0-beam.7
+ARG GVISOR_AMD64_SHA512=9843aa9f29ac6d714a37967b08db24ca7d8d191437c1bb58c391adc72888371ae67c417c7f501d3bdbd96ad04e4b46184f79bac48b587b91161c545135e8bc3c
 
 WORKDIR /tmp
 
@@ -91,15 +100,25 @@ set -eux
 # Determine the correct architecture for gVisor
 if [ "$TARGETARCH" = "amd64" ]; then
     GVISOR_ARCH="x86_64"
+    GVISOR_BASE_URL="https://github.com/beam-cloud/gvisor/releases/download/${GVISOR_AMD64_RELEASE}"
+    RUNSC_URL="${GVISOR_BASE_URL}/runsc.${GVISOR_ARCH}"
+    RUNSC_SHA512="$GVISOR_AMD64_SHA512"
 elif [ "$TARGETARCH" = "arm64" ]; then
     GVISOR_ARCH="aarch64"
+    GVISOR_BASE_URL="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_VERSION}/${GVISOR_ARCH}"
+    RUNSC_URL="${GVISOR_BASE_URL}/runsc"
+    RUNSC_SHA512_URL="${RUNSC_URL}.sha512"
 else
     echo "Unsupported architecture: $TARGETARCH" && exit 1
 fi
 
 # Download runsc and its checksum to /tmp
-curl -fsSL https://storage.googleapis.com/gvisor/releases/release/${GVISOR_VERSION}/${GVISOR_ARCH}/runsc -o /tmp/runsc
-curl -fsSL https://storage.googleapis.com/gvisor/releases/release/${GVISOR_VERSION}/${GVISOR_ARCH}/runsc.sha512 -o /tmp/runsc.sha512
+curl -fsSL "$RUNSC_URL" -o /tmp/runsc
+if [ -n "${RUNSC_SHA512:-}" ]; then
+    printf '%s  runsc\n' "$RUNSC_SHA512" > /tmp/runsc.sha512
+else
+    curl -fsSL "$RUNSC_SHA512_URL" -o /tmp/runsc.sha512
+fi
 
 # Verify checksum (cd to /tmp where both files are)
 cd /tmp && sha512sum -c runsc.sha512
@@ -113,63 +132,61 @@ chmod +x /usr/local/bin/runsc
 /usr/local/bin/runsc help 2>&1 | grep -i platform || { echo "Platform options unavailable" >&2; exit 1; }
 EOT
 
-# nvidia-container-toolkit - download pre-built binaries (FAST, no CGO cross-compile issues)
-# Note: beam-cloud fork has only trivial style changes, safe to use official NVIDIA binaries
-# WARNING: If GPU worker issues occur, may need to revert to building from beam-cloud fork
-#          (would require native QEMU builds, ~1hr build time)
+# qemu-storage-daemon
 # ========================
-FROM debian:bookworm-slim AS nvidia-container-toolkit
+# jammy's qemu-utils (6.2) predates qemu-storage-daemon being packaged, so
+# build the tools from source against the same ubuntu:22.04 userland as the
+# final image. Tools-only build: no system emulation, no user emulation.
+FROM ubuntu:22.04 AS qemu
+ARG QEMU_VERSION=8.2.10
 
-ARG TARGETARCH
-ENV NVIDIA_TOOLKIT_VERSION=1.18.1
-
-WORKDIR /workspace
-
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+RUN apt-get update && apt-get install -y \
+    curl xz-utils python3 python3-pip pkg-config ninja-build \
+    libglib2.0-dev zlib1g-dev flex bison && \
+    pip3 install meson==1.5.2
 
 RUN <<EOT
-set -ex
-
-# Download pre-built binaries from NVIDIA GitHub releases
-curl -fsSL "https://github.com/NVIDIA/nvidia-container-toolkit/releases/download/v${NVIDIA_TOOLKIT_VERSION}/nvidia-container-toolkit_${NVIDIA_TOOLKIT_VERSION}_deb_${TARGETARCH}.tar.gz" \
-    -o toolkit.tar.gz
-
-# Extract the tarball (contains .deb packages)
-tar -xzf toolkit.tar.gz
-
-# Extract binaries from .deb packages
-mkdir -p extracted
-for deb in *.deb; do
-    dpkg-deb -x "$deb" extracted/ 2>/dev/null || true
-done
-
-# Copy nvidia-container-runtime binaries to workspace root for COPY later
-cp -v extracted/usr/bin/nvidia-container-runtime* . 2>/dev/null || true
-cp -v extracted/usr/bin/nvidia-ctk . 2>/dev/null || true
-
-ls -la
+set -eux
+curl -fsSL https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz | tar -xJ -C /tmp
+cd /tmp/qemu-${QEMU_VERSION}
+./configure --disable-system --disable-user --disable-docs --disable-guest-agent --enable-tools
+ninja -C build storage-daemon/qemu-storage-daemon
+install -m 0755 build/storage-daemon/qemu-storage-daemon /usr/local/bin/qemu-storage-daemon
+/usr/local/bin/qemu-storage-daemon --version
 EOT
 
-# beta9 worker - cross-compile on native architecture (FAST)
+# nvidia-container-toolkit
 # ========================
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS worker
+FROM golang:1.23-bookworm AS nvidia-container-toolkit
 
-ARG TARGETOS
-ARG TARGETARCH
+ARG NVIDIA_CONTAINER_TOOLKIT_COMMIT=df7cc6c99980c04837a5ddb8ae34ce2211fc9126
 
 WORKDIR /workspace
 
+RUN apt-get update && apt-get install -y build-essential
+
+RUN <<EOT
+set -eux
+git clone https://github.com/beam-cloud/nvidia-container-toolkit.git .
+git reset --hard ${NVIDIA_CONTAINER_TOOLKIT_COMMIT}
+make build
+make binaries
+EOT
+
+# beta9 worker
+# ========================
+FROM golang AS worker
+
+WORKDIR /workspace
+ENV GONOSUMDB="github.com/beam-cloud/*"
+
 COPY go.mod go.sum ./
-# Allow Go toolchain to auto-download newer versions if needed
-ENV GOTOOLCHAIN=auto
 RUN go mod download
 COPY --exclude=sdk . .
 
-# Native cross-compilation - no QEMU needed!
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -gcflags "all=-N" -o /usr/local/bin/worker-debug ./cmd/worker/main.go
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -o /usr/local/bin/worker ./cmd/worker/main.go
+RUN go build -gcflags "all=-N" -o /usr/local/bin/worker-debug ./cmd/worker/main.go
+RUN go build -o /usr/local/bin/worker ./cmd/worker/main.go
+RUN go build -o /usr/local/bin/agent ./cmd/agent
 
 # uv
 # ========================
@@ -182,26 +199,79 @@ FROM nvidia/cuda:12.8.0-base-ubuntu22.04 AS release
 FROM release AS dev
 
 FROM ${BASE_STAGE} AS final
+ARG TARGETARCH
 ENV DEBIAN_FRONTEND="noninteractive"
 WORKDIR /workspace
 
 RUN apt-get update && \
     apt-get install -y curl gpg && \
-    curl -fsSL https://nvidia.github.io/nvidia-container-runtime/gpgkey | apt-key add - && \
-    curl -s -L https://nvidia.github.io/nvidia-docker/ubuntu22.04/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list \
-    curl -fsSL https://nvidia.github.io/nvidia-container-runtime/ubuntu22.04/nvidia-container-runtime.list | tee /etc/apt/sources.list.d/nvidia-container-runtime.list && \
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+        gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        tee /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
     apt-get update && \
-    apt-get install psmisc
+    apt-get install -y psmisc tini iproute2 iptables kmod \
+        # qcow durable disks: qemu-img + qemu-storage-daemon, kernel NBD client,
+        # and ext4 tooling for formatting freshly created volumes. libglib2.0-0
+        # is the runtime dependency of the qemu-storage-daemon built above.
+        qemu-utils nbd-client e2fsprogs libglib2.0-0
 
-# Download JuiceFS for the correct architecture
-ARG JUICEFS_VERSION=1.2.1
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
-    if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi && \
-    curl -L "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /usr/local/bin juicefs && \
-    chmod +x /usr/local/bin/juicefs
+RUN <<EOT
+set -eux
+case "$TARGETARCH" in
+    amd64)
+        curl -fsSL https://beam-runner-python-deps.s3.amazonaws.com/juicefs -o /usr/local/bin/juicefs
+        chmod +x /usr/local/bin/juicefs
+        ;;
+    arm64)
+        # Beam-pinned JuiceFS build is amd64-only; use the upstream community release for arm64 (local dev)
+        curl -fsSL https://github.com/juicedata/juicefs/releases/download/v1.3.1/juicefs-1.3.1-linux-arm64.tar.gz -o /tmp/juicefs.tar.gz
+        tar -xzf /tmp/juicefs.tar.gz -C /tmp juicefs
+        install /tmp/juicefs /usr/local/bin/juicefs
+        rm -f /tmp/juicefs.tar.gz /tmp/juicefs
+        ;;
+    *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;;
+esac
+EOT
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 RUN apt-get install -y --no-install-recommends nvidia-container-toolkit-base nvidia-container-toolkit
+RUN <<'EOT'
+set -eux
+mv /usr/bin/nvidia-container-cli /usr/bin/nvidia-container-cli.real
+cat >/usr/local/bin/nvidia-container-cli <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_cli="${NVIDIA_CONTAINER_CLI_REAL:-/usr/bin/nvidia-container-cli.real}"
+has_no_persistenced=0
+for arg in "$@"; do
+  if [ "$arg" = "--no-persistenced" ]; then
+    has_no_persistenced=1
+    break
+  fi
+done
+
+if [ "$has_no_persistenced" -eq 0 ]; then
+  args=()
+  inserted=0
+  for arg in "$@"; do
+    args+=("$arg")
+    if [ "$arg" = "configure" ]; then
+      args+=("--no-persistenced")
+      inserted=1
+    fi
+  done
+  if [ "$inserted" -eq 1 ]; then
+    exec "$real_cli" "${args[@]}"
+  fi
+fi
+
+exec "$real_cli" "$@"
+EOF
+chmod +x /usr/local/bin/nvidia-container-cli
+ln -s /usr/local/bin/nvidia-container-cli /usr/bin/nvidia-container-cli
+EOT
 RUN apt-get update && apt-get install -y fuse3 libfuse2 libfuse3-dev libfuse-dev bash-completion
 
 RUN apt-get install -y libbtrfs-dev libgpgme11-dev
@@ -210,9 +280,11 @@ RUN curl -L https://raw.githubusercontent.com/containers/shortnames/refs/heads/m
     -o /etc/containers/registries.conf.d/shortnames.conf
 RUN echo 'unqualified-search-registries = ["docker.io"]' > /etc/containers/registries.conf
 
-ARG CEDANA_VERSION=0.9.240
-ARG CEDANA_BASE_URL=""
-ARG CEDANA_TOKEN=""
+ARG CRIU_COMMIT=b47c692bb3a73ae45ee1c4ab215a8f6869d40efd
+COPY docker/patches/criu/criu-network-remap.patch /tmp/criu-network-remap.patch
+COPY docker/patches/criu/criu-skip-non-cuda-resume.patch /tmp/criu-skip-non-cuda-resume.patch
+COPY docker/patches/criu/criu-skip-fresh-zero-pages.patch /tmp/criu-skip-fresh-zero-pages.patch
+COPY docker/patches/criu/criu-ignore-erms-compat.patch /tmp/criu-ignore-erms-compat.patch
 
 RUN <<EOT
 set -eux
@@ -229,6 +301,7 @@ if [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "aarch64" ]; then
         uuid-dev \
         gnutls-dev \
         libnftables-dev \
+        liblz4-dev \
         pkg-config \
         protobuf-c-compiler \
         protobuf-compiler \
@@ -236,6 +309,16 @@ if [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "aarch64" ]; then
         git
     git clone https://github.com/checkpoint-restore/criu.git
     cd criu
+    git fetch origin ${CRIU_COMMIT}
+    git reset --hard ${CRIU_COMMIT}
+    git apply --check --unidiff-zero /tmp/criu-network-remap.patch
+    git apply --unidiff-zero /tmp/criu-network-remap.patch
+    git apply --check --unidiff-zero /tmp/criu-skip-non-cuda-resume.patch
+    git apply --unidiff-zero /tmp/criu-skip-non-cuda-resume.patch
+    git apply --check /tmp/criu-skip-fresh-zero-pages.patch
+    git apply /tmp/criu-skip-fresh-zero-pages.patch
+    git apply --check /tmp/criu-ignore-erms-compat.patch
+    git apply /tmp/criu-ignore-erms-compat.patch
 
     if [ "$(uname -m)" = "x86_64" ]; then
         make install-lib install-criu install-compel install-cuda_plugin PREFIX=/usr SKIP_PIP_INSTALL=1
@@ -244,18 +327,22 @@ if [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "aarch64" ]; then
         make install-lib install-criu install-compel PREFIX=/usr SKIP_PIP_INSTALL=1
     fi
     criu --version
+    ldd "$(command -v criu)" | grep -q liblz4
     cd .. && rm -rf criu
 fi
 EOT
 
+RUN mkdir -p /etc/criu && printf '%s\n' \
+    'compress-region 262144' \
+    'decompress-threads 32' \
+    > /etc/criu/runc.conf
+
 # Hard-disable any AMDGPU plugin that might exist from base layers or future package updates
 RUN mkdir -p /usr/lib/criu/plugins.disabled && \
     if [ -e /usr/lib/criu/amdgpu_plugin.so ]; then \
-    mv /usr/lib/criu/amdgpu_plugin.so /usr/lib/criu/plugins.disabled/ ; \
+        mv /usr/lib/criu/amdgpu_plugin.so /usr/lib/criu/plugins.disabled/ ; \
     fi && \
     true
-
-ARG TARGETARCH
 
 ENV MOUNT_S3_URL_ARM64="https://s3.amazonaws.com/mountpoint-s3-release/1.8.0/arm64/mount-s3-1.8.0-arm64.tar.gz"
 ENV MOUNT_S3_URL_AMD64="https://s3.amazonaws.com/mountpoint-s3-release/1.8.0/x86_64/mount-s3-1.8.0-x86_64.tar.gz"
@@ -268,16 +355,32 @@ RUN MOUNT_S3_URL=$(if [ "$TARGETARCH" = "arm64" ]; then echo $MOUNT_S3_URL_ARM64
     mv mount-s3/bin/mount-s3 /usr/local/bin/ms3 && chmod +x /usr/local/bin/ms3 && \
     rm -rf mount-s3 $TARBALL
 
-RUN curl -L https://github.com/NVIDIA/cuda-checkpoint/raw/refs/heads/main/bin/x86_64_Linux/cuda-checkpoint -o /usr/local/bin/cuda-checkpoint && \
-    chmod +x /usr/local/bin/cuda-checkpoint
+ARG CUDA_CHECKPOINT_COMMIT=00d5cce84c628088d6caa203fc4af40c1538b6f7
+ARG CUDA_CHECKPOINT_SHA256=707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474de363a06db
+
+RUN <<EOT
+set -eux
+case "$TARGETARCH" in
+    amd64)
+        curl -fsSL https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/${CUDA_CHECKPOINT_COMMIT}/bin/x86_64_Linux/cuda-checkpoint -o /usr/local/bin/cuda-checkpoint
+        echo "${CUDA_CHECKPOINT_SHA256}  /usr/local/bin/cuda-checkpoint" | sha256sum -c -
+        chmod +x /usr/local/bin/cuda-checkpoint
+        ;;
+    arm64)
+        echo "cuda-checkpoint is not available for linux/arm64; skipping optional helper"
+        ;;
+    *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;;
+esac
+EOT
 
 RUN apt-get install -y ripgrep wget
 
-
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
-    wget https://github.com/beam-cloud/goproc/releases/download/v0.1.5/goproc-0.1.5-linux-arm64 -O /usr/local/bin/goproc && chmod +x /usr/local/bin/goproc ; \
+      wget https://github.com/beam-cloud/goproc/releases/download/v0.1.12/goproc-0.1.12-linux-arm64 -O /usr/local/bin/goproc && chmod +x /usr/local/bin/goproc ; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
-    wget https://github.com/beam-cloud/goproc/releases/download/v0.1.5/goproc-0.1.5-linux-amd64 -O /usr/local/bin/goproc && chmod +x /usr/local/bin/goproc ; \
+      wget https://github.com/beam-cloud/goproc/releases/download/v0.1.12/goproc-0.1.12-linux-amd64 -O /usr/local/bin/goproc && chmod +x /usr/local/bin/goproc ; \
+    else \
+      echo "Unsupported architecture: $TARGETARCH" && exit 1 ; \
     fi
 
 RUN apt-get remove -y curl && \
@@ -288,7 +391,7 @@ RUN apt-get remove -y curl && \
 ENV BUILDAH_RUNTIME=/usr/local/sbin/runc
 
 RUN mkdir -p /workspace/etc
-RUN echo "nameserver 8.8.8.8" > /workspace/etc/resolv.conf
+RUN printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\noptions timeout:2 attempts:2\n' > /workspace/etc/resolv.conf
 RUN echo '127.0.0.1 localhost' > /workspace/etc/hosts
 RUN echo 'hosts: files dns' > /workspace/etc/nsswitch.conf
 COPY ./bin/beta9-cli /usr/local/bin/beta9
@@ -301,6 +404,7 @@ COPY --from=runc /usr/local/bin/buildah /usr/local/bin/buildah
 COPY --from=runc /usr/local/bin/skopeo /usr/local/bin/skopeo
 COPY --from=runc /workspace/skopeo/default-policy.json /etc/containers/policy.json
 COPY --from=gvisor /usr/local/bin/runsc /usr/local/bin/runsc
+COPY --from=qemu /usr/local/bin/qemu-storage-daemon /usr/bin/qemu-storage-daemon
 COPY --from=nvidia-container-toolkit /workspace/nvidia-container-runtime* /usr/bin/
 
 # LD_PRELOAD libraries
@@ -309,18 +413,17 @@ COPY ./bin/volume_cache_arm.so /usr/local/lib/volume_cache_arm.so
 
 RUN if [ "$(uname -m)" = "x86_64" ]; then \
     cp /usr/local/lib/volume_cache_x86.so /usr/local/lib/volume_cache.so; \
-    else \
+else \
     cp /usr/local/lib/volume_cache_arm.so /usr/local/lib/volume_cache.so; \
-    fi
+fi
 
 COPY --from=worker /usr/local/bin/worker /usr/local/bin/worker
 COPY --from=worker /usr/local/bin/worker-debug /usr/local/bin/worker-debug
+COPY --from=worker /usr/local/bin/agent /usr/local/bin/agent
+COPY --from=worker /usr/local/bin/agent /usr/local/bin/beam-agent
 COPY ./sdk/src/beta9 /workspace/sdk
 COPY --from=uv /root/.local/bin/uv /usr/local/bin/uv
 COPY --from=dropbear /usr/local/bin/dropbear /usr/local/bin/dropbear
-
-VOLUME "/usr/lib/x86_64-linux-gnu"
-VOLUME "/usr/lib/aarch64-linux-gnu"
 
 RUN mkdir -p /etc/criu
 RUN touch /etc/criu/default.conf

@@ -1,19 +1,24 @@
 package storage
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 
+	"github.com/beam-cloud/beta9/pkg/cache"
 	"github.com/beam-cloud/beta9/pkg/types"
-	blobcache "github.com/beam-cloud/blobcache-v2/pkg"
-	"github.com/rs/zerolog/log"
-	"golang.org/x/sys/unix"
 )
 
 const (
-	StorageModeJuiceFS    string = "juicefs"
-	StorageModeMountPoint string = "mountpoint"
-	StorageModeGeese      string = "geese"
-	StorageModeAlluxio    string = "alluxio"
+	StorageModeJuiceFS    string = types.StorageModeJuiceFS
+	StorageModeMountPoint string = types.StorageModeMountPoint
+	StorageModeGeese      string = types.StorageModeGeese
+	StorageModeAlluxio    string = types.StorageModeAlluxio
+	StorageModeLocal      string = types.StorageModeLocal
 )
 
 type Storage interface {
@@ -23,19 +28,58 @@ type Storage interface {
 	Mode() string
 }
 
-// isMounted uses stat to check if the specified FUSE mount point is available
-func isMounted(mountPoint string) bool {
-	var statfs unix.Statfs_t
-	if err := unix.Statfs(mountPoint, &statfs); err != nil {
-		return false
-	}
-
-	// FUSE filesystems usually have a magic number 0x65735546 (FUSE_SUPER_MAGIC)
-	const FUSE_SUPER_MAGIC = 0x65735546
-	return statfs.Type == FUSE_SUPER_MAGIC
+// IsMounted reports whether mountPoint is present in mountinfo without touching
+// the mounted filesystem. FUSE calls like statfs can block if the daemon is wedged.
+func IsMounted(mountPoint string) bool {
+	return isMounted(mountPoint)
 }
 
-func NewStorage(config types.StorageConfig, cacheClient *blobcache.BlobCacheClient) (Storage, error) {
+func isMounted(mountPoint string) bool {
+	file, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	return mountInfoContains(file, mountPoint)
+}
+
+func mountInfoContains(reader io.Reader, mountPoint string) bool {
+	target := cleanMountInfoPath(mountPoint)
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+
+		if cleanMountInfoPath(unescapeMountInfoPath(fields[4])) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanMountInfoPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
+func unescapeMountInfoPath(path string) string {
+	replacer := strings.NewReplacer(
+		`\\`, `\`,
+		`\040`, " ",
+		`\011`, "\t",
+		`\012`, "\n",
+		`\134`, `\`,
+	)
+	return replacer.Replace(path)
+}
+
+// NewStorage mounts the configured filesystem and returns mount failures.
+func NewStorage(config types.StorageConfig, cacheClient *cache.Client) (Storage, error) {
 	switch config.Mode {
 	case StorageModeJuiceFS:
 		s, err := NewJuiceFsStorage(config.JuiceFS)
@@ -47,13 +91,13 @@ func NewStorage(config types.StorageConfig, cacheClient *blobcache.BlobCacheClie
 		// NOTE: this is a no-op if already formatted
 		err = s.Format(config.FilesystemName)
 		if err != nil {
-			log.Fatal().Err(err).Msg("unable to format filesystem")
+			return nil, fmt.Errorf("unable to format filesystem: %w", err)
 		}
 
 		// Mount filesystem
 		err = s.Mount(config.FilesystemPath)
 		if err != nil {
-			log.Fatal().Err(err).Msg("unable to mount filesystem")
+			return nil, fmt.Errorf("unable to mount filesystem: %w", err)
 		}
 
 		return s, nil
@@ -66,7 +110,7 @@ func NewStorage(config types.StorageConfig, cacheClient *blobcache.BlobCacheClie
 		// Mount filesystem
 		err = s.Mount(config.FilesystemPath)
 		if err != nil {
-			log.Fatal().Err(err).Msg("unable to mount filesystem")
+			return nil, fmt.Errorf("unable to mount filesystem: %w", err)
 		}
 
 		return s, nil
@@ -79,7 +123,7 @@ func NewStorage(config types.StorageConfig, cacheClient *blobcache.BlobCacheClie
 		// Mount filesystem
 		err = s.Mount(config.FilesystemPath)
 		if err != nil {
-			log.Fatal().Err(err).Msg("unable to mount filesystem")
+			return nil, fmt.Errorf("unable to mount filesystem: %w", err)
 		}
 
 		return s, nil
@@ -92,7 +136,14 @@ func NewStorage(config types.StorageConfig, cacheClient *blobcache.BlobCacheClie
 		// Mount filesystem
 		err = s.Mount(config.FilesystemPath)
 		if err != nil {
-			log.Fatal().Err(err).Msg("unable to mount filesystem")
+			return nil, fmt.Errorf("unable to mount filesystem: %w", err)
+		}
+
+		return s, nil
+	case StorageModeLocal:
+		s := NewLocalStorage()
+		if err := s.Mount(config.FilesystemPath); err != nil {
+			return nil, err
 		}
 
 		return s, nil

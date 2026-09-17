@@ -32,6 +32,22 @@ type endpointInstance struct {
 	isASGI bool
 }
 
+func (i *endpointInstance) ensureReadyForTasklessRequest() error {
+	if err := i.Sync(); err != nil {
+		return err
+	}
+
+	state, err := i.State()
+	if err != nil {
+		return err
+	}
+
+	if state.RunningContainers+state.PendingContainers > 0 {
+		return nil
+	}
+	return i.HandleScalingEvent(1)
+}
+
 func (i *endpointInstance) startContainers(containersToRun int) error {
 	secrets, err := abstractions.ConfigureContainerRequestSecrets(i.Workspace, *i.buffer.stubConfig)
 	if err != nil {
@@ -73,14 +89,17 @@ func (i *endpointInstance) startContainers(containersToRun int) error {
 	}
 
 	for c := 0; c < containersToRun; c++ {
+		if err := i.CheckConcurrencyLimit(); err != nil {
+			return err
+		}
+
 		containerId := i.genContainerId()
 
 		mounts, err := abstractions.ConfigureContainerRequestMounts(
 			containerId,
-			i.Stub.Object.ExternalId,
+			i.Stub,
 			i.Workspace,
 			*i.buffer.stubConfig,
-			i.Stub.ExternalId,
 		)
 		if err != nil {
 			return err
@@ -102,7 +121,12 @@ func (i *endpointInstance) startContainers(containersToRun int) error {
 			Mounts:            mounts,
 			Stub:              *i.Stub,
 			CheckpointEnabled: checkpointEnabled,
+			CheckpointTrigger: i.StubConfig.CheckpointTrigger,
 			Preemptable:       true,
+			PoolSelector:      i.StubConfig.PoolSelector(),
+		}
+		if err := abstractions.ConfigureContainerRequestNetwork(runRequest, *i.StubConfig); err != nil {
+			return err
 		}
 
 		// Set initial keepwarm to prevent rapid spin-up/spin-down of containers
@@ -169,6 +193,17 @@ func (i *endpointInstance) stoppableContainers() ([]string, error) {
 		if !i.IsActive {
 			keys = append(keys, container.ContainerId)
 			continue
+		}
+
+		if i.buffer != nil {
+			availableTokens, err := i.buffer.requestTokens(container.ContainerId)
+			if err != nil {
+				log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting endpoint request tokens for container")
+				continue
+			}
+			if availableTokens < i.buffer.effectiveMaxTokens() {
+				continue
+			}
 		}
 
 		if i.Stub.Type.IsDeployment() {

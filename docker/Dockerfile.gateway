@@ -1,43 +1,40 @@
-# Beta9 Gateway - Multi-arch build with cross-compilation
+# syntax=docker/dockerfile:1.7-labs
+
 FROM golang:1.25-bookworm AS base
+ARG TARGETARCH
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends fuse3
 
-# JuiceFS - download pre-built binary with checksum verification
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then \
-    ARCH="amd64"; \
-    SHA256="025a1ccf407331aef16cb75bb9e1003102a2dba1b9188e0e101f4b84436bbbb8"; \
-    fi && \
-    if [ "$ARCH" = "aarch64" ]; then \
-    ARCH="arm64"; \
-    SHA256="b8d0ed12f232722f54e08ea1b60c4e50181b4e97247e7d62edf689cd9e477b5f"; \
-    fi && \
-    curl -L --http1.1 "https://github.com/juicedata/juicefs/releases/download/v1.2.1/juicefs-1.2.1-linux-${ARCH}.tar.gz" -o juicefs.tar.gz && \
-    echo "${SHA256}  juicefs.tar.gz" | sha256sum -c - && \
-    tar -xzf juicefs.tar.gz -C /usr/local/bin juicefs && \
-    rm juicefs.tar.gz && \
-    chmod +x /usr/local/bin/juicefs
+# FlowState fork: the Beam-pinned JuiceFS build is x86-64 only, so an arm64
+# gateway (OCI, built by build-agentosaurus.yml) got a binary it cannot exec.
+# Same arch switch and arm64 release upstream already uses in Dockerfile.worker.
+RUN <<EOT
+set -eux
+case "${TARGETARCH:-$(dpkg --print-architecture)}" in
+    amd64)
+        curl -fsSL https://beam-runner-python-deps.s3.amazonaws.com/juicefs -o /usr/local/bin/juicefs
+        chmod +x /usr/local/bin/juicefs
+        ;;
+    arm64)
+        curl -fsSL https://github.com/juicedata/juicefs/releases/download/v1.3.1/juicefs-1.3.1-linux-arm64.tar.gz -o /tmp/juicefs.tar.gz
+        tar -xzf /tmp/juicefs.tar.gz -C /tmp juicefs
+        install /tmp/juicefs /usr/local/bin/juicefs
+        rm -f /tmp/juicefs.tar.gz /tmp/juicefs
+        ;;
+    *) echo "Unsupported architecture: ${TARGETARCH:-unknown}" && exit 1 ;;
+esac
+EOT
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
 RUN apt-get install -y libfuse2 libfuse-dev bash-completion && \
     export ARCH="$(dpkg --print-architecture)" && \
     if [ "$ARCH" = "amd64" ]; then \
-    ARCH="x86_64"; \
+        ARCH="x86_64"; \
     fi && \
     curl -sSf -o mountpoint.deb https://s3.amazonaws.com/mountpoint-s3-release/1.5.0/${ARCH}/mount-s3-1.5.0-${ARCH}.deb && \
     dpkg -i mountpoint.deb && \
     rm -vf mountpoint.deb
-
-# GeeseFS - architecture-aware download
-RUN if [ "$(uname -m)" = "x86_64" ]; then \
-    curl -L https://github.com/yandex-cloud/geesefs/releases/download/v0.42.4/geesefs-linux-amd64 -o /usr/local/bin/geesefs && \
-    chmod +x /usr/local/bin/geesefs; \
-    elif [ "$(uname -m)" = "aarch64" ]; then \
-    curl -L https://github.com/yandex-cloud/geesefs/releases/download/v0.42.4/geesefs-linux-arm64 -o /usr/local/bin/geesefs && \
-    chmod +x /usr/local/bin/geesefs; \
-    fi
 
 # skopeo
 # ========================
@@ -58,43 +55,26 @@ make install
 /usr/local/bin/skopeo --version
 EOT
 
-# Cross-compile gateway binary on native architecture (FAST)
-# ========================
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS gateway-builder
-
-ARG TARGETOS
-ARG TARGETARCH
-
-WORKDIR /workspace
-
-COPY go.mod go.sum ./
-ENV GOTOOLCHAIN=auto
-RUN go mod download && go mod verify
-
-COPY . .
-
-# Native cross-compilation - no QEMU needed!
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -o /usr/local/bin/gateway /workspace/cmd/gateway/main.go
-
 # Target used in development environments
 FROM base AS build
 
 WORKDIR /workspace
+ENV GONOSUMDB="github.com/beam-cloud/*"
 
 RUN apt-get install -y libfuse3-dev libbtrfs-dev libgpgme-dev && \
     go install github.com/cosmtrek/air@v1.49.0
 
 COPY go.mod go.sum ./
-ENV GOTOOLCHAIN=auto
 RUN go mod download && go mod verify
 
 COPY --from=skopeo /usr/local/bin/skopeo /usr/local/bin/skopeo
 COPY --from=skopeo /workspace/default-policy.json /etc/containers/policy.json
 COPY . .
 
-# Use pre-built cross-compiled binary
-COPY --from=gateway-builder /usr/local/bin/gateway /usr/local/bin/gateway
+RUN go build -o /usr/local/bin/gateway /workspace/cmd/gateway/main.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /usr/local/bin/beam-agent-linux-amd64 /workspace/cmd/agent
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /usr/local/bin/beam-agent-linux-arm64 /workspace/cmd/agent
+RUN cp "/usr/local/bin/beam-agent-linux-$(go env GOARCH)" /usr/local/bin/beam-agent
 
 
 # Target used in production-like environments
@@ -104,8 +84,10 @@ WORKDIR /workspace
 
 RUN apt-get autoclean
 
-# Use cross-compiled binary directly (faster than going through build stage)
-COPY --from=gateway-builder /usr/local/bin/gateway /usr/local/bin/
+COPY --from=build /usr/local/bin/gateway /usr/local/bin/
+COPY --from=build /usr/local/bin/beam-agent /usr/local/bin/
+COPY --from=build /usr/local/bin/beam-agent-linux-amd64 /usr/local/bin/
+COPY --from=build /usr/local/bin/beam-agent-linux-arm64 /usr/local/bin/
 COPY --from=skopeo /usr/local/bin/skopeo /usr/local/bin/skopeo
 COPY --from=skopeo /workspace/default-policy.json /etc/containers/policy.json
 RUN /usr/local/bin/skopeo --version

@@ -12,68 +12,124 @@ import (
 
 	pb "github.com/beam-cloud/beta9/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+const (
+	containerClientSandboxExecTimeout   = 15 * time.Second
+	containerClientSandboxStatusTimeout = 5 * time.Second
+	containerClientSandboxOutputTimeout = 5 * time.Second
+	containerClientExistingConnTimeout  = 1 * time.Second
+	containerClientReconnectBaseDelay   = 20 * time.Millisecond
+	containerClientReconnectMaxDelay    = 100 * time.Millisecond
+	containerClientReconnectMinTimeout  = 2 * time.Second
+)
+
+type ContainerClientDialer func(context.Context, string) (net.Conn, error)
 
 type ContainerClient struct {
 	ServiceUrl   string
 	ServiceToken string
 	conn         *grpc.ClientConn
 	client       pb.ContainerServiceClient
-	existingConn net.Conn
 }
 
 func NewContainerClient(serviceUrl, serviceToken string, existingConn net.Conn) (*ContainerClient, error) {
+	dialCtx := context.Background()
+	cancel := func() {}
+	dialOptions := []grpc.DialOption{}
+	if existingConn != nil {
+		dialCtx, cancel = context.WithTimeout(dialCtx, containerClientExistingConnTimeout)
+		dialOptions = append(
+			dialOptions,
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return existingConn, nil
+			}),
+			grpc.WithBlock(),
+		)
+	}
+	defer cancel()
+
+	client, err := newContainerClient(dialCtx, serviceUrl, serviceToken, dialOptions...)
+	if err != nil && existingConn != nil {
+		_ = existingConn.Close()
+	}
+	return client, err
+}
+
+// NewContainerClientWithDialer creates a reconnectable cached gRPC channel.
+func NewContainerClientWithDialer(
+	ctx context.Context,
+	serviceUrl string,
+	serviceToken string,
+	dialer ContainerClientDialer,
+) (*ContainerClient, error) {
+	if dialer == nil {
+		return nil, errors.New("container client dialer is required")
+	}
+	return newContainerClient(
+		ctx,
+		serviceUrl,
+		serviceToken,
+		grpc.WithContextDialer(dialer),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  containerClientReconnectBaseDelay,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   containerClientReconnectMaxDelay,
+			},
+			MinConnectTimeout: containerClientReconnectMinTimeout,
+		}),
+	)
+}
+
+func newContainerClient(
+	ctx context.Context,
+	serviceUrl string,
+	serviceToken string,
+	additionalDialOptions ...grpc.DialOption,
+) (*ContainerClient, error) {
 	client := &ContainerClient{
 		ServiceUrl:   serviceUrl,
 		ServiceToken: serviceToken,
-		existingConn: existingConn,
 	}
 
-	err := client.connect()
-	if err != nil {
-		return nil, err
-	}
-
-	return client, nil
-}
-
-func (c *ContainerClient) connect() error {
 	grpcOption := grpc.WithTransportCredentials(insecure.NewCredentials())
 
-	isTLS := strings.HasSuffix(c.ServiceUrl, "443")
+	isTLS := containerClientUsesTLS(serviceUrl)
 	if isTLS {
 		h2creds := credentials.NewTLS(&tls.Config{NextProtos: []string{"h2"}})
 		grpcOption = grpc.WithTransportCredentials(h2creds)
 	}
 
-	var dialOpts = []grpc.DialOption{grpcOption}
-
-	// Use existingConn if provided
-	if c.existingConn != nil {
-		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			return c.existingConn, nil
-		}))
-	}
+	dialOptions := []grpc.DialOption{grpcOption}
 
 	maxMessageSize := 1 << 30 // 1Gi
-	if c.ServiceToken != "" {
-		dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(GRPCClientAuthInterceptor(c.ServiceToken)),
+	if serviceToken != "" {
+		dialOptions = append(dialOptions, grpc.WithUnaryInterceptor(GRPCClientAuthInterceptor(serviceToken)),
 			grpc.WithDefaultCallOptions(
 				grpc.MaxCallRecvMsgSize(maxMessageSize),
 				grpc.MaxCallSendMsgSize(maxMessageSize),
 			))
 	}
+	dialOptions = append(dialOptions, additionalDialOptions...)
 
-	conn, err := grpc.Dial(c.ServiceUrl, dialOpts...)
+	conn, err := grpc.DialContext(ctx, serviceUrl, dialOptions...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	c.conn = conn
-	c.client = pb.NewContainerServiceClient(conn)
-	return nil
+	client.conn = conn
+	client.client = pb.NewContainerServiceClient(conn)
+	return client, nil
+}
+
+func containerClientUsesTLS(serviceURL string) bool {
+	_, port, err := net.SplitHostPort(serviceURL)
+	return err == nil && port == "443"
 }
 
 func (c *ContainerClient) Close() error {
@@ -89,7 +145,11 @@ func (c *ContainerClient) Status(containerId string) (*pb.ContainerStatusRespons
 }
 
 func (c *ContainerClient) Exec(containerId, cmd string, env []string) (*pb.ContainerExecResponse, error) {
-	resp, err := c.client.ContainerExec(context.TODO(), &pb.ContainerExecRequest{ContainerId: containerId, Cmd: cmd, Env: env})
+	return c.ExecContext(context.Background(), containerId, cmd, env)
+}
+
+func (c *ContainerClient) ExecContext(ctx context.Context, containerId, cmd string, env []string) (*pb.ContainerExecResponse, error) {
+	resp, err := c.client.ContainerExec(ctx, &pb.ContainerExecRequest{ContainerId: containerId, Cmd: cmd, Env: env})
 	if err != nil {
 		return resp, err
 	}
@@ -97,7 +157,14 @@ func (c *ContainerClient) Exec(containerId, cmd string, env []string) (*pb.Conta
 }
 
 func (c *ContainerClient) SandboxExec(containerId, cmd string, env map[string]string, cwd string) (*pb.ContainerSandboxExecResponse, error) {
-	resp, err := c.client.ContainerSandboxExec(context.TODO(), &pb.ContainerSandboxExecRequest{ContainerId: containerId, Cmd: cmd, Env: env, Cwd: cwd})
+	return c.SandboxExecContext(context.Background(), containerId, cmd, env, cwd, false)
+}
+
+func (c *ContainerClient) SandboxExecContext(ctx context.Context, containerId, cmd string, env map[string]string, cwd string, wait bool) (*pb.ContainerSandboxExecResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, containerClientSandboxExecTimeout)
+	defer cancel()
+
+	resp, err := c.client.ContainerSandboxExec(ctx, &pb.ContainerSandboxExecRequest{ContainerId: containerId, Cmd: cmd, Env: env, Cwd: cwd, Wait: wait})
 	if err != nil {
 		return resp, err
 	}
@@ -121,7 +188,18 @@ func (c *ContainerClient) SandboxListProcesses(containerId string) (*pb.Containe
 }
 
 func (c *ContainerClient) SandboxStatus(containerId string, pid int32) (*pb.ContainerSandboxStatusResponse, error) {
-	resp, err := c.client.ContainerSandboxStatus(context.TODO(), &pb.ContainerSandboxStatusRequest{ContainerId: containerId, Pid: pid})
+	return c.SandboxStatusContext(context.Background(), containerId, pid)
+}
+
+func (c *ContainerClient) SandboxStatusContext(ctx context.Context, containerId string, pid int32) (*pb.ContainerSandboxStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, containerClientSandboxStatusTimeout)
+	defer cancel()
+
+	resp, err := c.client.ContainerSandboxStatus(
+		ctx,
+		&pb.ContainerSandboxStatusRequest{ContainerId: containerId, Pid: pid},
+		grpc.WaitForReady(true),
+	)
 	if err != nil {
 		return resp, err
 	}
@@ -129,7 +207,14 @@ func (c *ContainerClient) SandboxStatus(containerId string, pid int32) (*pb.Cont
 }
 
 func (c *ContainerClient) SandboxStdout(containerId string, pid int32) (*pb.ContainerSandboxStdoutResponse, error) {
-	resp, err := c.client.ContainerSandboxStdout(context.TODO(), &pb.ContainerSandboxStdoutRequest{ContainerId: containerId, Pid: pid})
+	return c.SandboxStdoutContext(context.Background(), containerId, pid)
+}
+
+func (c *ContainerClient) SandboxStdoutContext(ctx context.Context, containerId string, pid int32) (*pb.ContainerSandboxStdoutResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, containerClientSandboxOutputTimeout)
+	defer cancel()
+
+	resp, err := c.client.ContainerSandboxStdout(ctx, &pb.ContainerSandboxStdoutRequest{ContainerId: containerId, Pid: pid})
 	if err != nil {
 		return resp, err
 	}
@@ -137,7 +222,14 @@ func (c *ContainerClient) SandboxStdout(containerId string, pid int32) (*pb.Cont
 }
 
 func (c *ContainerClient) SandboxStderr(containerId string, pid int32) (*pb.ContainerSandboxStderrResponse, error) {
-	resp, err := c.client.ContainerSandboxStderr(context.TODO(), &pb.ContainerSandboxStderrRequest{ContainerId: containerId, Pid: pid})
+	return c.SandboxStderrContext(context.Background(), containerId, pid)
+}
+
+func (c *ContainerClient) SandboxStderrContext(ctx context.Context, containerId string, pid int32) (*pb.ContainerSandboxStderrResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, containerClientSandboxOutputTimeout)
+	defer cancel()
+
+	resp, err := c.client.ContainerSandboxStderr(ctx, &pb.ContainerSandboxStderrRequest{ContainerId: containerId, Pid: pid})
 	if err != nil {
 		return resp, err
 	}
@@ -226,7 +318,11 @@ func (c *ContainerClient) SandboxFindInFiles(containerId, containerPath, pattern
 }
 
 func (c *ContainerClient) SandboxExposePort(containerId string, port int32) (*pb.ContainerSandboxExposePortResponse, error) {
-	resp, err := c.client.ContainerSandboxExposePort(context.TODO(), &pb.ContainerSandboxExposePortRequest{ContainerId: containerId, Port: port})
+	return c.SandboxExposePortContext(context.Background(), containerId, port)
+}
+
+func (c *ContainerClient) SandboxExposePortContext(ctx context.Context, containerId string, port int32) (*pb.ContainerSandboxExposePortResponse, error) {
+	resp, err := c.client.ContainerSandboxExposePort(ctx, &pb.ContainerSandboxExposePortRequest{ContainerId: containerId, Port: port})
 	if err != nil {
 		return resp, err
 	}
@@ -254,9 +350,21 @@ func (c *ContainerClient) Kill(containerId string) (*pb.ContainerKillResponse, e
 }
 
 func (c *ContainerClient) StreamLogs(ctx context.Context, containerId string, outputChan chan OutputMsg) error {
+	return c.StreamLogsWithReady(ctx, containerId, outputChan, nil)
+}
+
+// StreamLogsWithReady reports when the stream attachment attempt completes.
+// Callers can use ready to keep exit handling from racing log backfill.
+func (c *ContainerClient) StreamLogsWithReady(ctx context.Context, containerId string, outputChan chan OutputMsg, ready func()) error {
 	stream, err := c.client.ContainerStreamLogs(ctx, &pb.ContainerStreamLogsRequest{ContainerId: containerId})
 	if err != nil {
 		return fmt.Errorf("error creating log stream: %w", err)
+	}
+	if _, err := stream.Header(); err != nil {
+		return fmt.Errorf("error attaching log stream: %w", err)
+	}
+	if ready != nil {
+		ready()
 	}
 
 	// Keepalive for streaming logs
@@ -316,12 +424,23 @@ func generateProgressBar(progress int, total int) string {
 	return fmt.Sprintf("%s\r%s %d%%\n", up, progressBar, (progress*100)/total)
 }
 
-func (c *ContainerClient) Checkpoint(ctx context.Context, containerId string) (*pb.ContainerCheckpointResponse, error) {
-	resp, err := c.client.ContainerCheckpoint(ctx, &pb.ContainerCheckpointRequest{ContainerId: containerId})
+type ContainerCheckpointOptions struct {
+	TerminateAfterCheckpoint bool
+}
+
+func (c *ContainerClient) Checkpoint(ctx context.Context, containerId string, opts ContainerCheckpointOptions) (*pb.ContainerCheckpointResponse, error) {
+	resp, err := c.client.ContainerCheckpoint(ctx, &pb.ContainerCheckpointRequest{
+		ContainerId:              containerId,
+		TerminateAfterCheckpoint: opts.TerminateAfterCheckpoint,
+	})
 	if err != nil {
 		return resp, err
 	}
 	return resp, nil
+}
+
+func (c *ContainerClient) SnapshotDisks(ctx context.Context, containerId string) (*pb.ContainerSnapshotDisksResponse, error) {
+	return c.client.ContainerSnapshotDisks(ctx, &pb.ContainerSnapshotDisksRequest{ContainerId: containerId})
 }
 
 func (c *ContainerClient) Archive(ctx context.Context, containerId, imageId string, outputChan chan OutputMsg) error {

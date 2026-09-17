@@ -151,6 +151,13 @@ service PodService {
       body : "*"
     };
   }
+  rpc SandboxSnapshotDisks(PodSandboxSnapshotDisksRequest)
+      returns (PodSandboxSnapshotDisksResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/snapshot-disks"
+      body : "*"
+    };
+  }
   rpc SandboxListUrls(PodSandboxListUrlsRequest)
       returns (PodSandboxListUrlsResponse) {
     option (google.api.http) = {
@@ -163,6 +170,7 @@ message CreatePodRequest {
   string stub_id = 1;
   optional string image_id = 2;
   optional string checkpoint_id = 3;
+  optional string machine_id = 4;
 }
 
 message CreatePodResponse {
@@ -170,6 +178,8 @@ message CreatePodResponse {
   string container_id = 2;
   string error_msg = 3;
   string stub_id = 4;
+  string task_id = 5;
+  string app_id = 6;
 }
 
 message PodSandboxExecRequest {
@@ -177,12 +187,19 @@ message PodSandboxExecRequest {
   string command = 2;
   string cwd = 3;
   map<string, string> env = 4;
+  bool wait = 5;
+  // Secret names to resolve in the authenticated workspace.
+  repeated string secrets = 6;
 }
 
 message PodSandboxExecResponse {
   bool ok = 1;
   string error_msg = 2;
   int32 pid = 3;
+  bool done = 4;
+  int32 exit_code = 5;
+  string stdout = 6;
+  string stderr = 7;
 }
 
 message PodSandboxStatusRequest {
@@ -396,12 +413,33 @@ message PodSandboxCreateImageFromFilesystemResponse {
 message PodSandboxSnapshotMemoryRequest {
   string stub_id = 1;
   string container_id = 2;
+  bool terminate_after_checkpoint = 3;
 }
 
 message PodSandboxSnapshotMemoryResponse {
   bool ok = 1;
   string error_msg = 2;
   string checkpoint_id = 3;
+  string runtime = 4;
+  // Durable disk snapshots captured at the same boundary as the memory image.
+  repeated PodSandboxDiskSnapshot disk_snapshots = 5;
+}
+
+message PodSandboxSnapshotDisksRequest {
+  string stub_id = 1;
+  string container_id = 2;
+}
+
+message PodSandboxDiskSnapshot {
+  string snapshot_id = 1;
+  string disk_name = 2;
+  int64 generation = 3;
+}
+
+message PodSandboxSnapshotDisksResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated PodSandboxDiskSnapshot snapshots = 3;
 }
 
 message PodSandboxListProcessesRequest { string container_id = 1; }

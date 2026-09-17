@@ -19,40 +19,83 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	GatewayService_Authorize_FullMethodName             = "/gateway.GatewayService/Authorize"
-	GatewayService_SignPayload_FullMethodName           = "/gateway.GatewayService/SignPayload"
-	GatewayService_HeadObject_FullMethodName            = "/gateway.GatewayService/HeadObject"
-	GatewayService_CreateObject_FullMethodName          = "/gateway.GatewayService/CreateObject"
-	GatewayService_PutObjectStream_FullMethodName       = "/gateway.GatewayService/PutObjectStream"
-	GatewayService_CheckpointContainer_FullMethodName   = "/gateway.GatewayService/CheckpointContainer"
-	GatewayService_ListContainers_FullMethodName        = "/gateway.GatewayService/ListContainers"
-	GatewayService_StopContainer_FullMethodName         = "/gateway.GatewayService/StopContainer"
-	GatewayService_AttachToContainer_FullMethodName     = "/gateway.GatewayService/AttachToContainer"
-	GatewayService_StartTask_FullMethodName             = "/gateway.GatewayService/StartTask"
-	GatewayService_EndTask_FullMethodName               = "/gateway.GatewayService/EndTask"
-	GatewayService_StopTasks_FullMethodName             = "/gateway.GatewayService/StopTasks"
-	GatewayService_ListTasks_FullMethodName             = "/gateway.GatewayService/ListTasks"
-	GatewayService_GetOrCreateStub_FullMethodName       = "/gateway.GatewayService/GetOrCreateStub"
-	GatewayService_DeployStub_FullMethodName            = "/gateway.GatewayService/DeployStub"
-	GatewayService_GetURL_FullMethodName                = "/gateway.GatewayService/GetURL"
-	GatewayService_ListDeployments_FullMethodName       = "/gateway.GatewayService/ListDeployments"
-	GatewayService_StopDeployment_FullMethodName        = "/gateway.GatewayService/StopDeployment"
-	GatewayService_StartDeployment_FullMethodName       = "/gateway.GatewayService/StartDeployment"
-	GatewayService_ScaleDeployment_FullMethodName       = "/gateway.GatewayService/ScaleDeployment"
-	GatewayService_DeleteDeployment_FullMethodName      = "/gateway.GatewayService/DeleteDeployment"
-	GatewayService_ListPools_FullMethodName             = "/gateway.GatewayService/ListPools"
-	GatewayService_ListMachines_FullMethodName          = "/gateway.GatewayService/ListMachines"
-	GatewayService_CreateMachine_FullMethodName         = "/gateway.GatewayService/CreateMachine"
-	GatewayService_DeleteMachine_FullMethodName         = "/gateway.GatewayService/DeleteMachine"
-	GatewayService_ListTokens_FullMethodName            = "/gateway.GatewayService/ListTokens"
-	GatewayService_CreateToken_FullMethodName           = "/gateway.GatewayService/CreateToken"
-	GatewayService_ToggleToken_FullMethodName           = "/gateway.GatewayService/ToggleToken"
-	GatewayService_DeleteToken_FullMethodName           = "/gateway.GatewayService/DeleteToken"
-	GatewayService_ListWorkers_FullMethodName           = "/gateway.GatewayService/ListWorkers"
-	GatewayService_CordonWorker_FullMethodName          = "/gateway.GatewayService/CordonWorker"
-	GatewayService_UncordonWorker_FullMethodName        = "/gateway.GatewayService/UncordonWorker"
-	GatewayService_DrainWorker_FullMethodName           = "/gateway.GatewayService/DrainWorker"
-	GatewayService_ExportWorkspaceConfig_FullMethodName = "/gateway.GatewayService/ExportWorkspaceConfig"
+	GatewayService_Authorize_FullMethodName                       = "/gateway.GatewayService/Authorize"
+	GatewayService_SignPayload_FullMethodName                     = "/gateway.GatewayService/SignPayload"
+	GatewayService_HeadObject_FullMethodName                      = "/gateway.GatewayService/HeadObject"
+	GatewayService_CreateObject_FullMethodName                    = "/gateway.GatewayService/CreateObject"
+	GatewayService_PutObjectStream_FullMethodName                 = "/gateway.GatewayService/PutObjectStream"
+	GatewayService_CompleteObjectUpload_FullMethodName            = "/gateway.GatewayService/CompleteObjectUpload"
+	GatewayService_CreateObjectDelta_FullMethodName               = "/gateway.GatewayService/CreateObjectDelta"
+	GatewayService_CommitObjectDelta_FullMethodName               = "/gateway.GatewayService/CommitObjectDelta"
+	GatewayService_CheckpointContainer_FullMethodName             = "/gateway.GatewayService/CheckpointContainer"
+	GatewayService_ListContainers_FullMethodName                  = "/gateway.GatewayService/ListContainers"
+	GatewayService_StopContainer_FullMethodName                   = "/gateway.GatewayService/StopContainer"
+	GatewayService_AttachToContainer_FullMethodName               = "/gateway.GatewayService/AttachToContainer"
+	GatewayService_StartTask_FullMethodName                       = "/gateway.GatewayService/StartTask"
+	GatewayService_EndTask_FullMethodName                         = "/gateway.GatewayService/EndTask"
+	GatewayService_StopTasks_FullMethodName                       = "/gateway.GatewayService/StopTasks"
+	GatewayService_ListTasks_FullMethodName                       = "/gateway.GatewayService/ListTasks"
+	GatewayService_GetOrCreateStub_FullMethodName                 = "/gateway.GatewayService/GetOrCreateStub"
+	GatewayService_DeployStub_FullMethodName                      = "/gateway.GatewayService/DeployStub"
+	GatewayService_GetURL_FullMethodName                          = "/gateway.GatewayService/GetURL"
+	GatewayService_ListDeployments_FullMethodName                 = "/gateway.GatewayService/ListDeployments"
+	GatewayService_StopDeployment_FullMethodName                  = "/gateway.GatewayService/StopDeployment"
+	GatewayService_StartDeployment_FullMethodName                 = "/gateway.GatewayService/StartDeployment"
+	GatewayService_ScaleDeployment_FullMethodName                 = "/gateway.GatewayService/ScaleDeployment"
+	GatewayService_DeleteDeployment_FullMethodName                = "/gateway.GatewayService/DeleteDeployment"
+	GatewayService_ListPools_FullMethodName                       = "/gateway.GatewayService/ListPools"
+	GatewayService_ListPoolOffers_FullMethodName                  = "/gateway.GatewayService/ListPoolOffers"
+	GatewayService_LaunchPoolCapacity_FullMethodName              = "/gateway.GatewayService/LaunchPoolCapacity"
+	GatewayService_ListPrivatePools_FullMethodName                = "/gateway.GatewayService/ListPrivatePools"
+	GatewayService_CreateBYOCPool_FullMethodName                  = "/gateway.GatewayService/CreateBYOCPool"
+	GatewayService_GetBYOCPool_FullMethodName                     = "/gateway.GatewayService/GetBYOCPool"
+	GatewayService_ScaleBYOCPool_FullMethodName                   = "/gateway.GatewayService/ScaleBYOCPool"
+	GatewayService_CreateMarketplaceListing_FullMethodName        = "/gateway.GatewayService/CreateMarketplaceListing"
+	GatewayService_UpdateMarketplaceListing_FullMethodName        = "/gateway.GatewayService/UpdateMarketplaceListing"
+	GatewayService_DeleteMarketplaceListing_FullMethodName        = "/gateway.GatewayService/DeleteMarketplaceListing"
+	GatewayService_ListMarketplaceListings_FullMethodName         = "/gateway.GatewayService/ListMarketplaceListings"
+	GatewayService_GetMarketplaceJoinCommand_FullMethodName       = "/gateway.GatewayService/GetMarketplaceJoinCommand"
+	GatewayService_ListMarketplaceOffers_FullMethodName           = "/gateway.GatewayService/ListMarketplaceOffers"
+	GatewayService_GetMarketplaceOffer_FullMethodName             = "/gateway.GatewayService/GetMarketplaceOffer"
+	GatewayService_CreateMarketplaceRental_FullMethodName         = "/gateway.GatewayService/CreateMarketplaceRental"
+	GatewayService_ListMarketplaceRentals_FullMethodName          = "/gateway.GatewayService/ListMarketplaceRentals"
+	GatewayService_DeleteMarketplaceRental_FullMethodName         = "/gateway.GatewayService/DeleteMarketplaceRental"
+	GatewayService_LaunchRentalWorkload_FullMethodName            = "/gateway.GatewayService/LaunchRentalWorkload"
+	GatewayService_ListMarketplaceMachines_FullMethodName         = "/gateway.GatewayService/ListMarketplaceMachines"
+	GatewayService_ListMachineContainers_FullMethodName           = "/gateway.GatewayService/ListMachineContainers"
+	GatewayService_CreatePool_FullMethodName                      = "/gateway.GatewayService/CreatePool"
+	GatewayService_DeletePool_FullMethodName                      = "/gateway.GatewayService/DeletePool"
+	GatewayService_ExtendPoolCapacity_FullMethodName              = "/gateway.GatewayService/ExtendPoolCapacity"
+	GatewayService_CreatePoolJoinToken_FullMethodName             = "/gateway.GatewayService/CreatePoolJoinToken"
+	GatewayService_RevokePoolJoinToken_FullMethodName             = "/gateway.GatewayService/RevokePoolJoinToken"
+	GatewayService_GetPoolJoinCommand_FullMethodName              = "/gateway.GatewayService/GetPoolJoinCommand"
+	GatewayService_ListPoolMachines_FullMethodName                = "/gateway.GatewayService/ListPoolMachines"
+	GatewayService_DownloadMachineSSHKey_FullMethodName           = "/gateway.GatewayService/DownloadMachineSSHKey"
+	GatewayService_RotateMachineSSHKey_FullMethodName             = "/gateway.GatewayService/RotateMachineSSHKey"
+	GatewayService_ActivateMachineSSHKey_FullMethodName           = "/gateway.GatewayService/ActivateMachineSSHKey"
+	GatewayService_JoinAgent_FullMethodName                       = "/gateway.GatewayService/JoinAgent"
+	GatewayService_RequestAgentTransportCredential_FullMethodName = "/gateway.GatewayService/RequestAgentTransportCredential"
+	GatewayService_GetAgentPoolVirtualization_FullMethodName      = "/gateway.GatewayService/GetAgentPoolVirtualization"
+	GatewayService_CreateNodeEnrollment_FullMethodName            = "/gateway.GatewayService/CreateNodeEnrollment"
+	GatewayService_DeleteNodeEnrollment_FullMethodName            = "/gateway.GatewayService/DeleteNodeEnrollment"
+	GatewayService_ListAgentRoutes_FullMethodName                 = "/gateway.GatewayService/ListAgentRoutes"
+	GatewayService_UpdateAgentRouteStatus_FullMethodName          = "/gateway.GatewayService/UpdateAgentRouteStatus"
+	GatewayService_UpdateAgentSSHStatus_FullMethodName            = "/gateway.GatewayService/UpdateAgentSSHStatus"
+	GatewayService_UpdateAgentAvailability_FullMethodName         = "/gateway.GatewayService/UpdateAgentAvailability"
+	GatewayService_StreamAgent_FullMethodName                     = "/gateway.GatewayService/StreamAgent"
+	GatewayService_StreamAgentTelemetry_FullMethodName            = "/gateway.GatewayService/StreamAgentTelemetry"
+	GatewayService_ListMachines_FullMethodName                    = "/gateway.GatewayService/ListMachines"
+	GatewayService_CreateMachine_FullMethodName                   = "/gateway.GatewayService/CreateMachine"
+	GatewayService_DeleteMachine_FullMethodName                   = "/gateway.GatewayService/DeleteMachine"
+	GatewayService_ListTokens_FullMethodName                      = "/gateway.GatewayService/ListTokens"
+	GatewayService_CreateToken_FullMethodName                     = "/gateway.GatewayService/CreateToken"
+	GatewayService_ToggleToken_FullMethodName                     = "/gateway.GatewayService/ToggleToken"
+	GatewayService_DeleteToken_FullMethodName                     = "/gateway.GatewayService/DeleteToken"
+	GatewayService_ListWorkers_FullMethodName                     = "/gateway.GatewayService/ListWorkers"
+	GatewayService_CordonWorker_FullMethodName                    = "/gateway.GatewayService/CordonWorker"
+	GatewayService_UncordonWorker_FullMethodName                  = "/gateway.GatewayService/UncordonWorker"
+	GatewayService_DrainWorker_FullMethodName                     = "/gateway.GatewayService/DrainWorker"
+	GatewayService_ExportWorkspaceConfig_FullMethodName           = "/gateway.GatewayService/ExportWorkspaceConfig"
 )
 
 // GatewayServiceClient is the client API for GatewayService service.
@@ -66,6 +109,9 @@ type GatewayServiceClient interface {
 	HeadObject(ctx context.Context, in *HeadObjectRequest, opts ...grpc.CallOption) (*HeadObjectResponse, error)
 	CreateObject(ctx context.Context, in *CreateObjectRequest, opts ...grpc.CallOption) (*CreateObjectResponse, error)
 	PutObjectStream(ctx context.Context, opts ...grpc.CallOption) (GatewayService_PutObjectStreamClient, error)
+	CompleteObjectUpload(ctx context.Context, in *CompleteObjectUploadRequest, opts ...grpc.CallOption) (*CompleteObjectUploadResponse, error)
+	CreateObjectDelta(ctx context.Context, in *CreateObjectDeltaRequest, opts ...grpc.CallOption) (*CreateObjectDeltaResponse, error)
+	CommitObjectDelta(ctx context.Context, in *CommitObjectDeltaRequest, opts ...grpc.CallOption) (*CommitObjectDeltaResponse, error)
 	// Containers
 	CheckpointContainer(ctx context.Context, in *CheckpointContainerRequest, opts ...grpc.CallOption) (*CheckpointContainerResponse, error)
 	ListContainers(ctx context.Context, in *ListContainersRequest, opts ...grpc.CallOption) (*ListContainersResponse, error)
@@ -88,6 +134,47 @@ type GatewayServiceClient interface {
 	DeleteDeployment(ctx context.Context, in *DeleteDeploymentRequest, opts ...grpc.CallOption) (*DeleteDeploymentResponse, error)
 	// Pools
 	ListPools(ctx context.Context, in *ListPoolsRequest, opts ...grpc.CallOption) (*ListPoolsResponse, error)
+	// Private compute pools
+	ListPoolOffers(ctx context.Context, in *ListPoolOffersRequest, opts ...grpc.CallOption) (*ListPoolOffersResponse, error)
+	LaunchPoolCapacity(ctx context.Context, in *LaunchPoolCapacityRequest, opts ...grpc.CallOption) (*LaunchPoolCapacityResponse, error)
+	ListPrivatePools(ctx context.Context, in *ListPrivatePoolsRequest, opts ...grpc.CallOption) (*ListPrivatePoolsResponse, error)
+	CreateBYOCPool(ctx context.Context, in *CreateBYOCPoolRequest, opts ...grpc.CallOption) (*CreateBYOCPoolResponse, error)
+	GetBYOCPool(ctx context.Context, in *GetBYOCPoolRequest, opts ...grpc.CallOption) (*GetBYOCPoolResponse, error)
+	ScaleBYOCPool(ctx context.Context, in *ScaleBYOCPoolRequest, opts ...grpc.CallOption) (*ScaleBYOCPoolResponse, error)
+	CreateMarketplaceListing(ctx context.Context, in *CreateMarketplaceListingRequest, opts ...grpc.CallOption) (*CreateMarketplaceListingResponse, error)
+	UpdateMarketplaceListing(ctx context.Context, in *UpdateMarketplaceListingRequest, opts ...grpc.CallOption) (*UpdateMarketplaceListingResponse, error)
+	DeleteMarketplaceListing(ctx context.Context, in *DeleteMarketplaceListingRequest, opts ...grpc.CallOption) (*DeleteMarketplaceListingResponse, error)
+	ListMarketplaceListings(ctx context.Context, in *ListMarketplaceListingsRequest, opts ...grpc.CallOption) (*ListMarketplaceListingsResponse, error)
+	GetMarketplaceJoinCommand(ctx context.Context, in *GetMarketplaceJoinCommandRequest, opts ...grpc.CallOption) (*GetMarketplaceJoinCommandResponse, error)
+	ListMarketplaceOffers(ctx context.Context, in *ListMarketplaceOffersRequest, opts ...grpc.CallOption) (*ListMarketplaceOffersResponse, error)
+	GetMarketplaceOffer(ctx context.Context, in *GetMarketplaceOfferRequest, opts ...grpc.CallOption) (*GetMarketplaceOfferResponse, error)
+	CreateMarketplaceRental(ctx context.Context, in *CreateMarketplaceRentalRequest, opts ...grpc.CallOption) (*CreateMarketplaceRentalResponse, error)
+	ListMarketplaceRentals(ctx context.Context, in *ListMarketplaceRentalsRequest, opts ...grpc.CallOption) (*ListMarketplaceRentalsResponse, error)
+	DeleteMarketplaceRental(ctx context.Context, in *DeleteMarketplaceRentalRequest, opts ...grpc.CallOption) (*DeleteMarketplaceRentalResponse, error)
+	LaunchRentalWorkload(ctx context.Context, in *LaunchRentalWorkloadRequest, opts ...grpc.CallOption) (*LaunchRentalWorkloadResponse, error)
+	ListMarketplaceMachines(ctx context.Context, in *ListMarketplaceMachinesRequest, opts ...grpc.CallOption) (*ListMarketplaceMachinesResponse, error)
+	ListMachineContainers(ctx context.Context, in *ListMachineContainersRequest, opts ...grpc.CallOption) (*ListMachineContainersResponse, error)
+	CreatePool(ctx context.Context, in *CreatePoolRequest, opts ...grpc.CallOption) (*CreatePoolResponse, error)
+	DeletePool(ctx context.Context, in *DeletePoolRequest, opts ...grpc.CallOption) (*DeletePoolResponse, error)
+	ExtendPoolCapacity(ctx context.Context, in *ExtendPoolCapacityRequest, opts ...grpc.CallOption) (*ExtendPoolCapacityResponse, error)
+	CreatePoolJoinToken(ctx context.Context, in *CreatePoolJoinTokenRequest, opts ...grpc.CallOption) (*CreatePoolJoinTokenResponse, error)
+	RevokePoolJoinToken(ctx context.Context, in *RevokePoolJoinTokenRequest, opts ...grpc.CallOption) (*RevokePoolJoinTokenResponse, error)
+	GetPoolJoinCommand(ctx context.Context, in *GetPoolJoinCommandRequest, opts ...grpc.CallOption) (*GetPoolJoinCommandResponse, error)
+	ListPoolMachines(ctx context.Context, in *ListPoolMachinesRequest, opts ...grpc.CallOption) (*ListPoolMachinesResponse, error)
+	DownloadMachineSSHKey(ctx context.Context, in *DownloadMachineSSHKeyRequest, opts ...grpc.CallOption) (*DownloadMachineSSHKeyResponse, error)
+	RotateMachineSSHKey(ctx context.Context, in *RotateMachineSSHKeyRequest, opts ...grpc.CallOption) (*RotateMachineSSHKeyResponse, error)
+	ActivateMachineSSHKey(ctx context.Context, in *ActivateMachineSSHKeyRequest, opts ...grpc.CallOption) (*ActivateMachineSSHKeyResponse, error)
+	JoinAgent(ctx context.Context, in *JoinAgentRequest, opts ...grpc.CallOption) (*JoinAgentResponse, error)
+	RequestAgentTransportCredential(ctx context.Context, in *RequestAgentTransportCredentialRequest, opts ...grpc.CallOption) (*RequestAgentTransportCredentialResponse, error)
+	GetAgentPoolVirtualization(ctx context.Context, in *GetAgentPoolVirtualizationRequest, opts ...grpc.CallOption) (*GetAgentPoolVirtualizationResponse, error)
+	CreateNodeEnrollment(ctx context.Context, in *CreateNodeEnrollmentRequest, opts ...grpc.CallOption) (*CreateNodeEnrollmentResponse, error)
+	DeleteNodeEnrollment(ctx context.Context, in *DeleteNodeEnrollmentRequest, opts ...grpc.CallOption) (*DeleteNodeEnrollmentResponse, error)
+	ListAgentRoutes(ctx context.Context, in *ListAgentRoutesRequest, opts ...grpc.CallOption) (*ListAgentRoutesResponse, error)
+	UpdateAgentRouteStatus(ctx context.Context, in *UpdateAgentRouteStatusRequest, opts ...grpc.CallOption) (*UpdateAgentRouteStatusResponse, error)
+	UpdateAgentSSHStatus(ctx context.Context, in *UpdateAgentSSHStatusRequest, opts ...grpc.CallOption) (*UpdateAgentSSHStatusResponse, error)
+	UpdateAgentAvailability(ctx context.Context, in *UpdateAgentAvailabilityRequest, opts ...grpc.CallOption) (*UpdateAgentAvailabilityResponse, error)
+	StreamAgent(ctx context.Context, in *StreamAgentRequest, opts ...grpc.CallOption) (GatewayService_StreamAgentClient, error)
+	StreamAgentTelemetry(ctx context.Context, opts ...grpc.CallOption) (GatewayService_StreamAgentTelemetryClient, error)
 	// Machines
 	ListMachines(ctx context.Context, in *ListMachinesRequest, opts ...grpc.CallOption) (*ListMachinesResponse, error)
 	CreateMachine(ctx context.Context, in *CreateMachineRequest, opts ...grpc.CallOption) (*CreateMachineResponse, error)
@@ -182,6 +269,33 @@ func (x *gatewayServicePutObjectStreamClient) CloseAndRecv() (*PutObjectResponse
 		return nil, err
 	}
 	return m, nil
+}
+
+func (c *gatewayServiceClient) CompleteObjectUpload(ctx context.Context, in *CompleteObjectUploadRequest, opts ...grpc.CallOption) (*CompleteObjectUploadResponse, error) {
+	out := new(CompleteObjectUploadResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CompleteObjectUpload_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CreateObjectDelta(ctx context.Context, in *CreateObjectDeltaRequest, opts ...grpc.CallOption) (*CreateObjectDeltaResponse, error) {
+	out := new(CreateObjectDeltaResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CreateObjectDelta_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CommitObjectDelta(ctx context.Context, in *CommitObjectDeltaRequest, opts ...grpc.CallOption) (*CommitObjectDeltaResponse, error) {
+	out := new(CommitObjectDeltaResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CommitObjectDelta_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *gatewayServiceClient) CheckpointContainer(ctx context.Context, in *CheckpointContainerRequest, opts ...grpc.CallOption) (*CheckpointContainerResponse, error) {
@@ -359,6 +473,414 @@ func (c *gatewayServiceClient) ListPools(ctx context.Context, in *ListPoolsReque
 	return out, nil
 }
 
+func (c *gatewayServiceClient) ListPoolOffers(ctx context.Context, in *ListPoolOffersRequest, opts ...grpc.CallOption) (*ListPoolOffersResponse, error) {
+	out := new(ListPoolOffersResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListPoolOffers_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) LaunchPoolCapacity(ctx context.Context, in *LaunchPoolCapacityRequest, opts ...grpc.CallOption) (*LaunchPoolCapacityResponse, error) {
+	out := new(LaunchPoolCapacityResponse)
+	err := c.cc.Invoke(ctx, GatewayService_LaunchPoolCapacity_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ListPrivatePools(ctx context.Context, in *ListPrivatePoolsRequest, opts ...grpc.CallOption) (*ListPrivatePoolsResponse, error) {
+	out := new(ListPrivatePoolsResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListPrivatePools_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CreateBYOCPool(ctx context.Context, in *CreateBYOCPoolRequest, opts ...grpc.CallOption) (*CreateBYOCPoolResponse, error) {
+	out := new(CreateBYOCPoolResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CreateBYOCPool_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) GetBYOCPool(ctx context.Context, in *GetBYOCPoolRequest, opts ...grpc.CallOption) (*GetBYOCPoolResponse, error) {
+	out := new(GetBYOCPoolResponse)
+	err := c.cc.Invoke(ctx, GatewayService_GetBYOCPool_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ScaleBYOCPool(ctx context.Context, in *ScaleBYOCPoolRequest, opts ...grpc.CallOption) (*ScaleBYOCPoolResponse, error) {
+	out := new(ScaleBYOCPoolResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ScaleBYOCPool_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CreateMarketplaceListing(ctx context.Context, in *CreateMarketplaceListingRequest, opts ...grpc.CallOption) (*CreateMarketplaceListingResponse, error) {
+	out := new(CreateMarketplaceListingResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CreateMarketplaceListing_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) UpdateMarketplaceListing(ctx context.Context, in *UpdateMarketplaceListingRequest, opts ...grpc.CallOption) (*UpdateMarketplaceListingResponse, error) {
+	out := new(UpdateMarketplaceListingResponse)
+	err := c.cc.Invoke(ctx, GatewayService_UpdateMarketplaceListing_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) DeleteMarketplaceListing(ctx context.Context, in *DeleteMarketplaceListingRequest, opts ...grpc.CallOption) (*DeleteMarketplaceListingResponse, error) {
+	out := new(DeleteMarketplaceListingResponse)
+	err := c.cc.Invoke(ctx, GatewayService_DeleteMarketplaceListing_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ListMarketplaceListings(ctx context.Context, in *ListMarketplaceListingsRequest, opts ...grpc.CallOption) (*ListMarketplaceListingsResponse, error) {
+	out := new(ListMarketplaceListingsResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListMarketplaceListings_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) GetMarketplaceJoinCommand(ctx context.Context, in *GetMarketplaceJoinCommandRequest, opts ...grpc.CallOption) (*GetMarketplaceJoinCommandResponse, error) {
+	out := new(GetMarketplaceJoinCommandResponse)
+	err := c.cc.Invoke(ctx, GatewayService_GetMarketplaceJoinCommand_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ListMarketplaceOffers(ctx context.Context, in *ListMarketplaceOffersRequest, opts ...grpc.CallOption) (*ListMarketplaceOffersResponse, error) {
+	out := new(ListMarketplaceOffersResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListMarketplaceOffers_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) GetMarketplaceOffer(ctx context.Context, in *GetMarketplaceOfferRequest, opts ...grpc.CallOption) (*GetMarketplaceOfferResponse, error) {
+	out := new(GetMarketplaceOfferResponse)
+	err := c.cc.Invoke(ctx, GatewayService_GetMarketplaceOffer_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CreateMarketplaceRental(ctx context.Context, in *CreateMarketplaceRentalRequest, opts ...grpc.CallOption) (*CreateMarketplaceRentalResponse, error) {
+	out := new(CreateMarketplaceRentalResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CreateMarketplaceRental_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ListMarketplaceRentals(ctx context.Context, in *ListMarketplaceRentalsRequest, opts ...grpc.CallOption) (*ListMarketplaceRentalsResponse, error) {
+	out := new(ListMarketplaceRentalsResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListMarketplaceRentals_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) DeleteMarketplaceRental(ctx context.Context, in *DeleteMarketplaceRentalRequest, opts ...grpc.CallOption) (*DeleteMarketplaceRentalResponse, error) {
+	out := new(DeleteMarketplaceRentalResponse)
+	err := c.cc.Invoke(ctx, GatewayService_DeleteMarketplaceRental_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) LaunchRentalWorkload(ctx context.Context, in *LaunchRentalWorkloadRequest, opts ...grpc.CallOption) (*LaunchRentalWorkloadResponse, error) {
+	out := new(LaunchRentalWorkloadResponse)
+	err := c.cc.Invoke(ctx, GatewayService_LaunchRentalWorkload_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ListMarketplaceMachines(ctx context.Context, in *ListMarketplaceMachinesRequest, opts ...grpc.CallOption) (*ListMarketplaceMachinesResponse, error) {
+	out := new(ListMarketplaceMachinesResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListMarketplaceMachines_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ListMachineContainers(ctx context.Context, in *ListMachineContainersRequest, opts ...grpc.CallOption) (*ListMachineContainersResponse, error) {
+	out := new(ListMachineContainersResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListMachineContainers_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CreatePool(ctx context.Context, in *CreatePoolRequest, opts ...grpc.CallOption) (*CreatePoolResponse, error) {
+	out := new(CreatePoolResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CreatePool_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) DeletePool(ctx context.Context, in *DeletePoolRequest, opts ...grpc.CallOption) (*DeletePoolResponse, error) {
+	out := new(DeletePoolResponse)
+	err := c.cc.Invoke(ctx, GatewayService_DeletePool_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ExtendPoolCapacity(ctx context.Context, in *ExtendPoolCapacityRequest, opts ...grpc.CallOption) (*ExtendPoolCapacityResponse, error) {
+	out := new(ExtendPoolCapacityResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ExtendPoolCapacity_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CreatePoolJoinToken(ctx context.Context, in *CreatePoolJoinTokenRequest, opts ...grpc.CallOption) (*CreatePoolJoinTokenResponse, error) {
+	out := new(CreatePoolJoinTokenResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CreatePoolJoinToken_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) RevokePoolJoinToken(ctx context.Context, in *RevokePoolJoinTokenRequest, opts ...grpc.CallOption) (*RevokePoolJoinTokenResponse, error) {
+	out := new(RevokePoolJoinTokenResponse)
+	err := c.cc.Invoke(ctx, GatewayService_RevokePoolJoinToken_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) GetPoolJoinCommand(ctx context.Context, in *GetPoolJoinCommandRequest, opts ...grpc.CallOption) (*GetPoolJoinCommandResponse, error) {
+	out := new(GetPoolJoinCommandResponse)
+	err := c.cc.Invoke(ctx, GatewayService_GetPoolJoinCommand_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ListPoolMachines(ctx context.Context, in *ListPoolMachinesRequest, opts ...grpc.CallOption) (*ListPoolMachinesResponse, error) {
+	out := new(ListPoolMachinesResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListPoolMachines_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) DownloadMachineSSHKey(ctx context.Context, in *DownloadMachineSSHKeyRequest, opts ...grpc.CallOption) (*DownloadMachineSSHKeyResponse, error) {
+	out := new(DownloadMachineSSHKeyResponse)
+	err := c.cc.Invoke(ctx, GatewayService_DownloadMachineSSHKey_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) RotateMachineSSHKey(ctx context.Context, in *RotateMachineSSHKeyRequest, opts ...grpc.CallOption) (*RotateMachineSSHKeyResponse, error) {
+	out := new(RotateMachineSSHKeyResponse)
+	err := c.cc.Invoke(ctx, GatewayService_RotateMachineSSHKey_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ActivateMachineSSHKey(ctx context.Context, in *ActivateMachineSSHKeyRequest, opts ...grpc.CallOption) (*ActivateMachineSSHKeyResponse, error) {
+	out := new(ActivateMachineSSHKeyResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ActivateMachineSSHKey_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) JoinAgent(ctx context.Context, in *JoinAgentRequest, opts ...grpc.CallOption) (*JoinAgentResponse, error) {
+	out := new(JoinAgentResponse)
+	err := c.cc.Invoke(ctx, GatewayService_JoinAgent_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) RequestAgentTransportCredential(ctx context.Context, in *RequestAgentTransportCredentialRequest, opts ...grpc.CallOption) (*RequestAgentTransportCredentialResponse, error) {
+	out := new(RequestAgentTransportCredentialResponse)
+	err := c.cc.Invoke(ctx, GatewayService_RequestAgentTransportCredential_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) GetAgentPoolVirtualization(ctx context.Context, in *GetAgentPoolVirtualizationRequest, opts ...grpc.CallOption) (*GetAgentPoolVirtualizationResponse, error) {
+	out := new(GetAgentPoolVirtualizationResponse)
+	err := c.cc.Invoke(ctx, GatewayService_GetAgentPoolVirtualization_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) CreateNodeEnrollment(ctx context.Context, in *CreateNodeEnrollmentRequest, opts ...grpc.CallOption) (*CreateNodeEnrollmentResponse, error) {
+	out := new(CreateNodeEnrollmentResponse)
+	err := c.cc.Invoke(ctx, GatewayService_CreateNodeEnrollment_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) DeleteNodeEnrollment(ctx context.Context, in *DeleteNodeEnrollmentRequest, opts ...grpc.CallOption) (*DeleteNodeEnrollmentResponse, error) {
+	out := new(DeleteNodeEnrollmentResponse)
+	err := c.cc.Invoke(ctx, GatewayService_DeleteNodeEnrollment_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) ListAgentRoutes(ctx context.Context, in *ListAgentRoutesRequest, opts ...grpc.CallOption) (*ListAgentRoutesResponse, error) {
+	out := new(ListAgentRoutesResponse)
+	err := c.cc.Invoke(ctx, GatewayService_ListAgentRoutes_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) UpdateAgentRouteStatus(ctx context.Context, in *UpdateAgentRouteStatusRequest, opts ...grpc.CallOption) (*UpdateAgentRouteStatusResponse, error) {
+	out := new(UpdateAgentRouteStatusResponse)
+	err := c.cc.Invoke(ctx, GatewayService_UpdateAgentRouteStatus_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) UpdateAgentSSHStatus(ctx context.Context, in *UpdateAgentSSHStatusRequest, opts ...grpc.CallOption) (*UpdateAgentSSHStatusResponse, error) {
+	out := new(UpdateAgentSSHStatusResponse)
+	err := c.cc.Invoke(ctx, GatewayService_UpdateAgentSSHStatus_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) UpdateAgentAvailability(ctx context.Context, in *UpdateAgentAvailabilityRequest, opts ...grpc.CallOption) (*UpdateAgentAvailabilityResponse, error) {
+	out := new(UpdateAgentAvailabilityResponse)
+	err := c.cc.Invoke(ctx, GatewayService_UpdateAgentAvailability_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gatewayServiceClient) StreamAgent(ctx context.Context, in *StreamAgentRequest, opts ...grpc.CallOption) (GatewayService_StreamAgentClient, error) {
+	stream, err := c.cc.NewStream(ctx, &GatewayService_ServiceDesc.Streams[2], GatewayService_StreamAgent_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &gatewayServiceStreamAgentClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type GatewayService_StreamAgentClient interface {
+	Recv() (*StreamAgentResponse, error)
+	grpc.ClientStream
+}
+
+type gatewayServiceStreamAgentClient struct {
+	grpc.ClientStream
+}
+
+func (x *gatewayServiceStreamAgentClient) Recv() (*StreamAgentResponse, error) {
+	m := new(StreamAgentResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *gatewayServiceClient) StreamAgentTelemetry(ctx context.Context, opts ...grpc.CallOption) (GatewayService_StreamAgentTelemetryClient, error) {
+	stream, err := c.cc.NewStream(ctx, &GatewayService_ServiceDesc.Streams[3], GatewayService_StreamAgentTelemetry_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &gatewayServiceStreamAgentTelemetryClient{stream}
+	return x, nil
+}
+
+type GatewayService_StreamAgentTelemetryClient interface {
+	Send(*AgentTelemetryRequest) error
+	CloseAndRecv() (*AgentTelemetryResponse, error)
+	grpc.ClientStream
+}
+
+type gatewayServiceStreamAgentTelemetryClient struct {
+	grpc.ClientStream
+}
+
+func (x *gatewayServiceStreamAgentTelemetryClient) Send(m *AgentTelemetryRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *gatewayServiceStreamAgentTelemetryClient) CloseAndRecv() (*AgentTelemetryResponse, error) {
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	m := new(AgentTelemetryResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func (c *gatewayServiceClient) ListMachines(ctx context.Context, in *ListMachinesRequest, opts ...grpc.CallOption) (*ListMachinesResponse, error) {
 	out := new(ListMachinesResponse)
 	err := c.cc.Invoke(ctx, GatewayService_ListMachines_FullMethodName, in, out, opts...)
@@ -478,6 +1000,9 @@ type GatewayServiceServer interface {
 	HeadObject(context.Context, *HeadObjectRequest) (*HeadObjectResponse, error)
 	CreateObject(context.Context, *CreateObjectRequest) (*CreateObjectResponse, error)
 	PutObjectStream(GatewayService_PutObjectStreamServer) error
+	CompleteObjectUpload(context.Context, *CompleteObjectUploadRequest) (*CompleteObjectUploadResponse, error)
+	CreateObjectDelta(context.Context, *CreateObjectDeltaRequest) (*CreateObjectDeltaResponse, error)
+	CommitObjectDelta(context.Context, *CommitObjectDeltaRequest) (*CommitObjectDeltaResponse, error)
 	// Containers
 	CheckpointContainer(context.Context, *CheckpointContainerRequest) (*CheckpointContainerResponse, error)
 	ListContainers(context.Context, *ListContainersRequest) (*ListContainersResponse, error)
@@ -500,6 +1025,47 @@ type GatewayServiceServer interface {
 	DeleteDeployment(context.Context, *DeleteDeploymentRequest) (*DeleteDeploymentResponse, error)
 	// Pools
 	ListPools(context.Context, *ListPoolsRequest) (*ListPoolsResponse, error)
+	// Private compute pools
+	ListPoolOffers(context.Context, *ListPoolOffersRequest) (*ListPoolOffersResponse, error)
+	LaunchPoolCapacity(context.Context, *LaunchPoolCapacityRequest) (*LaunchPoolCapacityResponse, error)
+	ListPrivatePools(context.Context, *ListPrivatePoolsRequest) (*ListPrivatePoolsResponse, error)
+	CreateBYOCPool(context.Context, *CreateBYOCPoolRequest) (*CreateBYOCPoolResponse, error)
+	GetBYOCPool(context.Context, *GetBYOCPoolRequest) (*GetBYOCPoolResponse, error)
+	ScaleBYOCPool(context.Context, *ScaleBYOCPoolRequest) (*ScaleBYOCPoolResponse, error)
+	CreateMarketplaceListing(context.Context, *CreateMarketplaceListingRequest) (*CreateMarketplaceListingResponse, error)
+	UpdateMarketplaceListing(context.Context, *UpdateMarketplaceListingRequest) (*UpdateMarketplaceListingResponse, error)
+	DeleteMarketplaceListing(context.Context, *DeleteMarketplaceListingRequest) (*DeleteMarketplaceListingResponse, error)
+	ListMarketplaceListings(context.Context, *ListMarketplaceListingsRequest) (*ListMarketplaceListingsResponse, error)
+	GetMarketplaceJoinCommand(context.Context, *GetMarketplaceJoinCommandRequest) (*GetMarketplaceJoinCommandResponse, error)
+	ListMarketplaceOffers(context.Context, *ListMarketplaceOffersRequest) (*ListMarketplaceOffersResponse, error)
+	GetMarketplaceOffer(context.Context, *GetMarketplaceOfferRequest) (*GetMarketplaceOfferResponse, error)
+	CreateMarketplaceRental(context.Context, *CreateMarketplaceRentalRequest) (*CreateMarketplaceRentalResponse, error)
+	ListMarketplaceRentals(context.Context, *ListMarketplaceRentalsRequest) (*ListMarketplaceRentalsResponse, error)
+	DeleteMarketplaceRental(context.Context, *DeleteMarketplaceRentalRequest) (*DeleteMarketplaceRentalResponse, error)
+	LaunchRentalWorkload(context.Context, *LaunchRentalWorkloadRequest) (*LaunchRentalWorkloadResponse, error)
+	ListMarketplaceMachines(context.Context, *ListMarketplaceMachinesRequest) (*ListMarketplaceMachinesResponse, error)
+	ListMachineContainers(context.Context, *ListMachineContainersRequest) (*ListMachineContainersResponse, error)
+	CreatePool(context.Context, *CreatePoolRequest) (*CreatePoolResponse, error)
+	DeletePool(context.Context, *DeletePoolRequest) (*DeletePoolResponse, error)
+	ExtendPoolCapacity(context.Context, *ExtendPoolCapacityRequest) (*ExtendPoolCapacityResponse, error)
+	CreatePoolJoinToken(context.Context, *CreatePoolJoinTokenRequest) (*CreatePoolJoinTokenResponse, error)
+	RevokePoolJoinToken(context.Context, *RevokePoolJoinTokenRequest) (*RevokePoolJoinTokenResponse, error)
+	GetPoolJoinCommand(context.Context, *GetPoolJoinCommandRequest) (*GetPoolJoinCommandResponse, error)
+	ListPoolMachines(context.Context, *ListPoolMachinesRequest) (*ListPoolMachinesResponse, error)
+	DownloadMachineSSHKey(context.Context, *DownloadMachineSSHKeyRequest) (*DownloadMachineSSHKeyResponse, error)
+	RotateMachineSSHKey(context.Context, *RotateMachineSSHKeyRequest) (*RotateMachineSSHKeyResponse, error)
+	ActivateMachineSSHKey(context.Context, *ActivateMachineSSHKeyRequest) (*ActivateMachineSSHKeyResponse, error)
+	JoinAgent(context.Context, *JoinAgentRequest) (*JoinAgentResponse, error)
+	RequestAgentTransportCredential(context.Context, *RequestAgentTransportCredentialRequest) (*RequestAgentTransportCredentialResponse, error)
+	GetAgentPoolVirtualization(context.Context, *GetAgentPoolVirtualizationRequest) (*GetAgentPoolVirtualizationResponse, error)
+	CreateNodeEnrollment(context.Context, *CreateNodeEnrollmentRequest) (*CreateNodeEnrollmentResponse, error)
+	DeleteNodeEnrollment(context.Context, *DeleteNodeEnrollmentRequest) (*DeleteNodeEnrollmentResponse, error)
+	ListAgentRoutes(context.Context, *ListAgentRoutesRequest) (*ListAgentRoutesResponse, error)
+	UpdateAgentRouteStatus(context.Context, *UpdateAgentRouteStatusRequest) (*UpdateAgentRouteStatusResponse, error)
+	UpdateAgentSSHStatus(context.Context, *UpdateAgentSSHStatusRequest) (*UpdateAgentSSHStatusResponse, error)
+	UpdateAgentAvailability(context.Context, *UpdateAgentAvailabilityRequest) (*UpdateAgentAvailabilityResponse, error)
+	StreamAgent(*StreamAgentRequest, GatewayService_StreamAgentServer) error
+	StreamAgentTelemetry(GatewayService_StreamAgentTelemetryServer) error
 	// Machines
 	ListMachines(context.Context, *ListMachinesRequest) (*ListMachinesResponse, error)
 	CreateMachine(context.Context, *CreateMachineRequest) (*CreateMachineResponse, error)
@@ -537,6 +1103,15 @@ func (UnimplementedGatewayServiceServer) CreateObject(context.Context, *CreateOb
 }
 func (UnimplementedGatewayServiceServer) PutObjectStream(GatewayService_PutObjectStreamServer) error {
 	return status.Errorf(codes.Unimplemented, "method PutObjectStream not implemented")
+}
+func (UnimplementedGatewayServiceServer) CompleteObjectUpload(context.Context, *CompleteObjectUploadRequest) (*CompleteObjectUploadResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CompleteObjectUpload not implemented")
+}
+func (UnimplementedGatewayServiceServer) CreateObjectDelta(context.Context, *CreateObjectDeltaRequest) (*CreateObjectDeltaResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateObjectDelta not implemented")
+}
+func (UnimplementedGatewayServiceServer) CommitObjectDelta(context.Context, *CommitObjectDeltaRequest) (*CommitObjectDeltaResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CommitObjectDelta not implemented")
 }
 func (UnimplementedGatewayServiceServer) CheckpointContainer(context.Context, *CheckpointContainerRequest) (*CheckpointContainerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CheckpointContainer not implemented")
@@ -588,6 +1163,126 @@ func (UnimplementedGatewayServiceServer) DeleteDeployment(context.Context, *Dele
 }
 func (UnimplementedGatewayServiceServer) ListPools(context.Context, *ListPoolsRequest) (*ListPoolsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListPools not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListPoolOffers(context.Context, *ListPoolOffersRequest) (*ListPoolOffersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListPoolOffers not implemented")
+}
+func (UnimplementedGatewayServiceServer) LaunchPoolCapacity(context.Context, *LaunchPoolCapacityRequest) (*LaunchPoolCapacityResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method LaunchPoolCapacity not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListPrivatePools(context.Context, *ListPrivatePoolsRequest) (*ListPrivatePoolsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListPrivatePools not implemented")
+}
+func (UnimplementedGatewayServiceServer) CreateBYOCPool(context.Context, *CreateBYOCPoolRequest) (*CreateBYOCPoolResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateBYOCPool not implemented")
+}
+func (UnimplementedGatewayServiceServer) GetBYOCPool(context.Context, *GetBYOCPoolRequest) (*GetBYOCPoolResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetBYOCPool not implemented")
+}
+func (UnimplementedGatewayServiceServer) ScaleBYOCPool(context.Context, *ScaleBYOCPoolRequest) (*ScaleBYOCPoolResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ScaleBYOCPool not implemented")
+}
+func (UnimplementedGatewayServiceServer) CreateMarketplaceListing(context.Context, *CreateMarketplaceListingRequest) (*CreateMarketplaceListingResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateMarketplaceListing not implemented")
+}
+func (UnimplementedGatewayServiceServer) UpdateMarketplaceListing(context.Context, *UpdateMarketplaceListingRequest) (*UpdateMarketplaceListingResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateMarketplaceListing not implemented")
+}
+func (UnimplementedGatewayServiceServer) DeleteMarketplaceListing(context.Context, *DeleteMarketplaceListingRequest) (*DeleteMarketplaceListingResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteMarketplaceListing not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListMarketplaceListings(context.Context, *ListMarketplaceListingsRequest) (*ListMarketplaceListingsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListMarketplaceListings not implemented")
+}
+func (UnimplementedGatewayServiceServer) GetMarketplaceJoinCommand(context.Context, *GetMarketplaceJoinCommandRequest) (*GetMarketplaceJoinCommandResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetMarketplaceJoinCommand not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListMarketplaceOffers(context.Context, *ListMarketplaceOffersRequest) (*ListMarketplaceOffersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListMarketplaceOffers not implemented")
+}
+func (UnimplementedGatewayServiceServer) GetMarketplaceOffer(context.Context, *GetMarketplaceOfferRequest) (*GetMarketplaceOfferResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetMarketplaceOffer not implemented")
+}
+func (UnimplementedGatewayServiceServer) CreateMarketplaceRental(context.Context, *CreateMarketplaceRentalRequest) (*CreateMarketplaceRentalResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateMarketplaceRental not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListMarketplaceRentals(context.Context, *ListMarketplaceRentalsRequest) (*ListMarketplaceRentalsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListMarketplaceRentals not implemented")
+}
+func (UnimplementedGatewayServiceServer) DeleteMarketplaceRental(context.Context, *DeleteMarketplaceRentalRequest) (*DeleteMarketplaceRentalResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteMarketplaceRental not implemented")
+}
+func (UnimplementedGatewayServiceServer) LaunchRentalWorkload(context.Context, *LaunchRentalWorkloadRequest) (*LaunchRentalWorkloadResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method LaunchRentalWorkload not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListMarketplaceMachines(context.Context, *ListMarketplaceMachinesRequest) (*ListMarketplaceMachinesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListMarketplaceMachines not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListMachineContainers(context.Context, *ListMachineContainersRequest) (*ListMachineContainersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListMachineContainers not implemented")
+}
+func (UnimplementedGatewayServiceServer) CreatePool(context.Context, *CreatePoolRequest) (*CreatePoolResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreatePool not implemented")
+}
+func (UnimplementedGatewayServiceServer) DeletePool(context.Context, *DeletePoolRequest) (*DeletePoolResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeletePool not implemented")
+}
+func (UnimplementedGatewayServiceServer) ExtendPoolCapacity(context.Context, *ExtendPoolCapacityRequest) (*ExtendPoolCapacityResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ExtendPoolCapacity not implemented")
+}
+func (UnimplementedGatewayServiceServer) CreatePoolJoinToken(context.Context, *CreatePoolJoinTokenRequest) (*CreatePoolJoinTokenResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreatePoolJoinToken not implemented")
+}
+func (UnimplementedGatewayServiceServer) RevokePoolJoinToken(context.Context, *RevokePoolJoinTokenRequest) (*RevokePoolJoinTokenResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RevokePoolJoinToken not implemented")
+}
+func (UnimplementedGatewayServiceServer) GetPoolJoinCommand(context.Context, *GetPoolJoinCommandRequest) (*GetPoolJoinCommandResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPoolJoinCommand not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListPoolMachines(context.Context, *ListPoolMachinesRequest) (*ListPoolMachinesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListPoolMachines not implemented")
+}
+func (UnimplementedGatewayServiceServer) DownloadMachineSSHKey(context.Context, *DownloadMachineSSHKeyRequest) (*DownloadMachineSSHKeyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DownloadMachineSSHKey not implemented")
+}
+func (UnimplementedGatewayServiceServer) RotateMachineSSHKey(context.Context, *RotateMachineSSHKeyRequest) (*RotateMachineSSHKeyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RotateMachineSSHKey not implemented")
+}
+func (UnimplementedGatewayServiceServer) ActivateMachineSSHKey(context.Context, *ActivateMachineSSHKeyRequest) (*ActivateMachineSSHKeyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ActivateMachineSSHKey not implemented")
+}
+func (UnimplementedGatewayServiceServer) JoinAgent(context.Context, *JoinAgentRequest) (*JoinAgentResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method JoinAgent not implemented")
+}
+func (UnimplementedGatewayServiceServer) RequestAgentTransportCredential(context.Context, *RequestAgentTransportCredentialRequest) (*RequestAgentTransportCredentialResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RequestAgentTransportCredential not implemented")
+}
+func (UnimplementedGatewayServiceServer) GetAgentPoolVirtualization(context.Context, *GetAgentPoolVirtualizationRequest) (*GetAgentPoolVirtualizationResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetAgentPoolVirtualization not implemented")
+}
+func (UnimplementedGatewayServiceServer) CreateNodeEnrollment(context.Context, *CreateNodeEnrollmentRequest) (*CreateNodeEnrollmentResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateNodeEnrollment not implemented")
+}
+func (UnimplementedGatewayServiceServer) DeleteNodeEnrollment(context.Context, *DeleteNodeEnrollmentRequest) (*DeleteNodeEnrollmentResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteNodeEnrollment not implemented")
+}
+func (UnimplementedGatewayServiceServer) ListAgentRoutes(context.Context, *ListAgentRoutesRequest) (*ListAgentRoutesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListAgentRoutes not implemented")
+}
+func (UnimplementedGatewayServiceServer) UpdateAgentRouteStatus(context.Context, *UpdateAgentRouteStatusRequest) (*UpdateAgentRouteStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateAgentRouteStatus not implemented")
+}
+func (UnimplementedGatewayServiceServer) UpdateAgentSSHStatus(context.Context, *UpdateAgentSSHStatusRequest) (*UpdateAgentSSHStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateAgentSSHStatus not implemented")
+}
+func (UnimplementedGatewayServiceServer) UpdateAgentAvailability(context.Context, *UpdateAgentAvailabilityRequest) (*UpdateAgentAvailabilityResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateAgentAvailability not implemented")
+}
+func (UnimplementedGatewayServiceServer) StreamAgent(*StreamAgentRequest, GatewayService_StreamAgentServer) error {
+	return status.Errorf(codes.Unimplemented, "method StreamAgent not implemented")
+}
+func (UnimplementedGatewayServiceServer) StreamAgentTelemetry(GatewayService_StreamAgentTelemetryServer) error {
+	return status.Errorf(codes.Unimplemented, "method StreamAgentTelemetry not implemented")
 }
 func (UnimplementedGatewayServiceServer) ListMachines(context.Context, *ListMachinesRequest) (*ListMachinesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListMachines not implemented")
@@ -734,6 +1429,60 @@ func (x *gatewayServicePutObjectStreamServer) Recv() (*PutObjectRequest, error) 
 		return nil, err
 	}
 	return m, nil
+}
+
+func _GatewayService_CompleteObjectUpload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteObjectUploadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CompleteObjectUpload(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CompleteObjectUpload_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CompleteObjectUpload(ctx, req.(*CompleteObjectUploadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CreateObjectDelta_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateObjectDeltaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CreateObjectDelta(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CreateObjectDelta_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CreateObjectDelta(ctx, req.(*CreateObjectDeltaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CommitObjectDelta_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitObjectDeltaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CommitObjectDelta(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CommitObjectDelta_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CommitObjectDelta(ctx, req.(*CommitObjectDeltaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _GatewayService_CheckpointContainer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -1050,6 +1799,737 @@ func _GatewayService_ListPools_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GatewayService_ListPoolOffers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListPoolOffersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListPoolOffers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListPoolOffers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListPoolOffers(ctx, req.(*ListPoolOffersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_LaunchPoolCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LaunchPoolCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).LaunchPoolCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_LaunchPoolCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).LaunchPoolCapacity(ctx, req.(*LaunchPoolCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ListPrivatePools_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListPrivatePoolsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListPrivatePools(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListPrivatePools_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListPrivatePools(ctx, req.(*ListPrivatePoolsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CreateBYOCPool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateBYOCPoolRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CreateBYOCPool(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CreateBYOCPool_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CreateBYOCPool(ctx, req.(*CreateBYOCPoolRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_GetBYOCPool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetBYOCPoolRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).GetBYOCPool(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_GetBYOCPool_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).GetBYOCPool(ctx, req.(*GetBYOCPoolRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ScaleBYOCPool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ScaleBYOCPoolRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ScaleBYOCPool(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ScaleBYOCPool_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ScaleBYOCPool(ctx, req.(*ScaleBYOCPoolRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CreateMarketplaceListing_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateMarketplaceListingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CreateMarketplaceListing(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CreateMarketplaceListing_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CreateMarketplaceListing(ctx, req.(*CreateMarketplaceListingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_UpdateMarketplaceListing_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateMarketplaceListingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).UpdateMarketplaceListing(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_UpdateMarketplaceListing_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).UpdateMarketplaceListing(ctx, req.(*UpdateMarketplaceListingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_DeleteMarketplaceListing_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteMarketplaceListingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).DeleteMarketplaceListing(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_DeleteMarketplaceListing_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).DeleteMarketplaceListing(ctx, req.(*DeleteMarketplaceListingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ListMarketplaceListings_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMarketplaceListingsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListMarketplaceListings(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListMarketplaceListings_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListMarketplaceListings(ctx, req.(*ListMarketplaceListingsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_GetMarketplaceJoinCommand_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMarketplaceJoinCommandRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).GetMarketplaceJoinCommand(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_GetMarketplaceJoinCommand_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).GetMarketplaceJoinCommand(ctx, req.(*GetMarketplaceJoinCommandRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ListMarketplaceOffers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMarketplaceOffersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListMarketplaceOffers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListMarketplaceOffers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListMarketplaceOffers(ctx, req.(*ListMarketplaceOffersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_GetMarketplaceOffer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMarketplaceOfferRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).GetMarketplaceOffer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_GetMarketplaceOffer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).GetMarketplaceOffer(ctx, req.(*GetMarketplaceOfferRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CreateMarketplaceRental_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateMarketplaceRentalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CreateMarketplaceRental(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CreateMarketplaceRental_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CreateMarketplaceRental(ctx, req.(*CreateMarketplaceRentalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ListMarketplaceRentals_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMarketplaceRentalsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListMarketplaceRentals(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListMarketplaceRentals_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListMarketplaceRentals(ctx, req.(*ListMarketplaceRentalsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_DeleteMarketplaceRental_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteMarketplaceRentalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).DeleteMarketplaceRental(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_DeleteMarketplaceRental_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).DeleteMarketplaceRental(ctx, req.(*DeleteMarketplaceRentalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_LaunchRentalWorkload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LaunchRentalWorkloadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).LaunchRentalWorkload(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_LaunchRentalWorkload_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).LaunchRentalWorkload(ctx, req.(*LaunchRentalWorkloadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ListMarketplaceMachines_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMarketplaceMachinesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListMarketplaceMachines(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListMarketplaceMachines_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListMarketplaceMachines(ctx, req.(*ListMarketplaceMachinesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ListMachineContainers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMachineContainersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListMachineContainers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListMachineContainers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListMachineContainers(ctx, req.(*ListMachineContainersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CreatePool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreatePoolRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CreatePool(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CreatePool_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CreatePool(ctx, req.(*CreatePoolRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_DeletePool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeletePoolRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).DeletePool(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_DeletePool_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).DeletePool(ctx, req.(*DeletePoolRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ExtendPoolCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExtendPoolCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ExtendPoolCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ExtendPoolCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ExtendPoolCapacity(ctx, req.(*ExtendPoolCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CreatePoolJoinToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreatePoolJoinTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CreatePoolJoinToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CreatePoolJoinToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CreatePoolJoinToken(ctx, req.(*CreatePoolJoinTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_RevokePoolJoinToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RevokePoolJoinTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).RevokePoolJoinToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_RevokePoolJoinToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).RevokePoolJoinToken(ctx, req.(*RevokePoolJoinTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_GetPoolJoinCommand_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPoolJoinCommandRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).GetPoolJoinCommand(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_GetPoolJoinCommand_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).GetPoolJoinCommand(ctx, req.(*GetPoolJoinCommandRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ListPoolMachines_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListPoolMachinesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListPoolMachines(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListPoolMachines_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListPoolMachines(ctx, req.(*ListPoolMachinesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_DownloadMachineSSHKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DownloadMachineSSHKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).DownloadMachineSSHKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_DownloadMachineSSHKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).DownloadMachineSSHKey(ctx, req.(*DownloadMachineSSHKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_RotateMachineSSHKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RotateMachineSSHKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).RotateMachineSSHKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_RotateMachineSSHKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).RotateMachineSSHKey(ctx, req.(*RotateMachineSSHKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ActivateMachineSSHKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ActivateMachineSSHKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ActivateMachineSSHKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ActivateMachineSSHKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ActivateMachineSSHKey(ctx, req.(*ActivateMachineSSHKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_JoinAgent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(JoinAgentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).JoinAgent(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_JoinAgent_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).JoinAgent(ctx, req.(*JoinAgentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_RequestAgentTransportCredential_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RequestAgentTransportCredentialRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).RequestAgentTransportCredential(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_RequestAgentTransportCredential_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).RequestAgentTransportCredential(ctx, req.(*RequestAgentTransportCredentialRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_GetAgentPoolVirtualization_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAgentPoolVirtualizationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).GetAgentPoolVirtualization(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_GetAgentPoolVirtualization_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).GetAgentPoolVirtualization(ctx, req.(*GetAgentPoolVirtualizationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_CreateNodeEnrollment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateNodeEnrollmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).CreateNodeEnrollment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_CreateNodeEnrollment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).CreateNodeEnrollment(ctx, req.(*CreateNodeEnrollmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_DeleteNodeEnrollment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteNodeEnrollmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).DeleteNodeEnrollment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_DeleteNodeEnrollment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).DeleteNodeEnrollment(ctx, req.(*DeleteNodeEnrollmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_ListAgentRoutes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListAgentRoutesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).ListAgentRoutes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_ListAgentRoutes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).ListAgentRoutes(ctx, req.(*ListAgentRoutesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_UpdateAgentRouteStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateAgentRouteStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).UpdateAgentRouteStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_UpdateAgentRouteStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).UpdateAgentRouteStatus(ctx, req.(*UpdateAgentRouteStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_UpdateAgentSSHStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateAgentSSHStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).UpdateAgentSSHStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_UpdateAgentSSHStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).UpdateAgentSSHStatus(ctx, req.(*UpdateAgentSSHStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_UpdateAgentAvailability_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateAgentAvailabilityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GatewayServiceServer).UpdateAgentAvailability(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GatewayService_UpdateAgentAvailability_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GatewayServiceServer).UpdateAgentAvailability(ctx, req.(*UpdateAgentAvailabilityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GatewayService_StreamAgent_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamAgentRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(GatewayServiceServer).StreamAgent(m, &gatewayServiceStreamAgentServer{stream})
+}
+
+type GatewayService_StreamAgentServer interface {
+	Send(*StreamAgentResponse) error
+	grpc.ServerStream
+}
+
+type gatewayServiceStreamAgentServer struct {
+	grpc.ServerStream
+}
+
+func (x *gatewayServiceStreamAgentServer) Send(m *StreamAgentResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func _GatewayService_StreamAgentTelemetry_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(GatewayServiceServer).StreamAgentTelemetry(&gatewayServiceStreamAgentTelemetryServer{stream})
+}
+
+type GatewayService_StreamAgentTelemetryServer interface {
+	SendAndClose(*AgentTelemetryResponse) error
+	Recv() (*AgentTelemetryRequest, error)
+	grpc.ServerStream
+}
+
+type gatewayServiceStreamAgentTelemetryServer struct {
+	grpc.ServerStream
+}
+
+func (x *gatewayServiceStreamAgentTelemetryServer) SendAndClose(m *AgentTelemetryResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *gatewayServiceStreamAgentTelemetryServer) Recv() (*AgentTelemetryRequest, error) {
+	m := new(AgentTelemetryRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func _GatewayService_ListMachines_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListMachinesRequest)
 	if err := dec(in); err != nil {
@@ -1290,6 +2770,18 @@ var GatewayService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _GatewayService_CreateObject_Handler,
 		},
 		{
+			MethodName: "CompleteObjectUpload",
+			Handler:    _GatewayService_CompleteObjectUpload_Handler,
+		},
+		{
+			MethodName: "CreateObjectDelta",
+			Handler:    _GatewayService_CreateObjectDelta_Handler,
+		},
+		{
+			MethodName: "CommitObjectDelta",
+			Handler:    _GatewayService_CommitObjectDelta_Handler,
+		},
+		{
 			MethodName: "CheckpointContainer",
 			Handler:    _GatewayService_CheckpointContainer_Handler,
 		},
@@ -1354,6 +2846,158 @@ var GatewayService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _GatewayService_ListPools_Handler,
 		},
 		{
+			MethodName: "ListPoolOffers",
+			Handler:    _GatewayService_ListPoolOffers_Handler,
+		},
+		{
+			MethodName: "LaunchPoolCapacity",
+			Handler:    _GatewayService_LaunchPoolCapacity_Handler,
+		},
+		{
+			MethodName: "ListPrivatePools",
+			Handler:    _GatewayService_ListPrivatePools_Handler,
+		},
+		{
+			MethodName: "CreateBYOCPool",
+			Handler:    _GatewayService_CreateBYOCPool_Handler,
+		},
+		{
+			MethodName: "GetBYOCPool",
+			Handler:    _GatewayService_GetBYOCPool_Handler,
+		},
+		{
+			MethodName: "ScaleBYOCPool",
+			Handler:    _GatewayService_ScaleBYOCPool_Handler,
+		},
+		{
+			MethodName: "CreateMarketplaceListing",
+			Handler:    _GatewayService_CreateMarketplaceListing_Handler,
+		},
+		{
+			MethodName: "UpdateMarketplaceListing",
+			Handler:    _GatewayService_UpdateMarketplaceListing_Handler,
+		},
+		{
+			MethodName: "DeleteMarketplaceListing",
+			Handler:    _GatewayService_DeleteMarketplaceListing_Handler,
+		},
+		{
+			MethodName: "ListMarketplaceListings",
+			Handler:    _GatewayService_ListMarketplaceListings_Handler,
+		},
+		{
+			MethodName: "GetMarketplaceJoinCommand",
+			Handler:    _GatewayService_GetMarketplaceJoinCommand_Handler,
+		},
+		{
+			MethodName: "ListMarketplaceOffers",
+			Handler:    _GatewayService_ListMarketplaceOffers_Handler,
+		},
+		{
+			MethodName: "GetMarketplaceOffer",
+			Handler:    _GatewayService_GetMarketplaceOffer_Handler,
+		},
+		{
+			MethodName: "CreateMarketplaceRental",
+			Handler:    _GatewayService_CreateMarketplaceRental_Handler,
+		},
+		{
+			MethodName: "ListMarketplaceRentals",
+			Handler:    _GatewayService_ListMarketplaceRentals_Handler,
+		},
+		{
+			MethodName: "DeleteMarketplaceRental",
+			Handler:    _GatewayService_DeleteMarketplaceRental_Handler,
+		},
+		{
+			MethodName: "LaunchRentalWorkload",
+			Handler:    _GatewayService_LaunchRentalWorkload_Handler,
+		},
+		{
+			MethodName: "ListMarketplaceMachines",
+			Handler:    _GatewayService_ListMarketplaceMachines_Handler,
+		},
+		{
+			MethodName: "ListMachineContainers",
+			Handler:    _GatewayService_ListMachineContainers_Handler,
+		},
+		{
+			MethodName: "CreatePool",
+			Handler:    _GatewayService_CreatePool_Handler,
+		},
+		{
+			MethodName: "DeletePool",
+			Handler:    _GatewayService_DeletePool_Handler,
+		},
+		{
+			MethodName: "ExtendPoolCapacity",
+			Handler:    _GatewayService_ExtendPoolCapacity_Handler,
+		},
+		{
+			MethodName: "CreatePoolJoinToken",
+			Handler:    _GatewayService_CreatePoolJoinToken_Handler,
+		},
+		{
+			MethodName: "RevokePoolJoinToken",
+			Handler:    _GatewayService_RevokePoolJoinToken_Handler,
+		},
+		{
+			MethodName: "GetPoolJoinCommand",
+			Handler:    _GatewayService_GetPoolJoinCommand_Handler,
+		},
+		{
+			MethodName: "ListPoolMachines",
+			Handler:    _GatewayService_ListPoolMachines_Handler,
+		},
+		{
+			MethodName: "DownloadMachineSSHKey",
+			Handler:    _GatewayService_DownloadMachineSSHKey_Handler,
+		},
+		{
+			MethodName: "RotateMachineSSHKey",
+			Handler:    _GatewayService_RotateMachineSSHKey_Handler,
+		},
+		{
+			MethodName: "ActivateMachineSSHKey",
+			Handler:    _GatewayService_ActivateMachineSSHKey_Handler,
+		},
+		{
+			MethodName: "JoinAgent",
+			Handler:    _GatewayService_JoinAgent_Handler,
+		},
+		{
+			MethodName: "RequestAgentTransportCredential",
+			Handler:    _GatewayService_RequestAgentTransportCredential_Handler,
+		},
+		{
+			MethodName: "GetAgentPoolVirtualization",
+			Handler:    _GatewayService_GetAgentPoolVirtualization_Handler,
+		},
+		{
+			MethodName: "CreateNodeEnrollment",
+			Handler:    _GatewayService_CreateNodeEnrollment_Handler,
+		},
+		{
+			MethodName: "DeleteNodeEnrollment",
+			Handler:    _GatewayService_DeleteNodeEnrollment_Handler,
+		},
+		{
+			MethodName: "ListAgentRoutes",
+			Handler:    _GatewayService_ListAgentRoutes_Handler,
+		},
+		{
+			MethodName: "UpdateAgentRouteStatus",
+			Handler:    _GatewayService_UpdateAgentRouteStatus_Handler,
+		},
+		{
+			MethodName: "UpdateAgentSSHStatus",
+			Handler:    _GatewayService_UpdateAgentSSHStatus_Handler,
+		},
+		{
+			MethodName: "UpdateAgentAvailability",
+			Handler:    _GatewayService_UpdateAgentAvailability_Handler,
+		},
+		{
 			MethodName: "ListMachines",
 			Handler:    _GatewayService_ListMachines_Handler,
 		},
@@ -1412,6 +3056,16 @@ var GatewayService_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "AttachToContainer",
 			Handler:       _GatewayService_AttachToContainer_Handler,
 			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "StreamAgent",
+			Handler:       _GatewayService_StreamAgent_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamAgentTelemetry",
+			Handler:       _GatewayService_StreamAgentTelemetry_Handler,
 			ClientStreams: true,
 		},
 	},

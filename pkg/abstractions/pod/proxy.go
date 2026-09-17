@@ -3,6 +3,7 @@ package pod
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -12,59 +13,125 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
 
 	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
 	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/metrics"
 	"github.com/beam-cloud/beta9/pkg/network"
 	"github.com/beam-cloud/beta9/pkg/repository"
 	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
-	"github.com/redis/go-redis/v9"
 )
 
 const (
-	bufferProcessingInterval      time.Duration = time.Millisecond * 100
-	containerDiscoveryInterval    time.Duration = time.Millisecond * 500
-	containerDialTimeoutDurationS time.Duration = time.Second * 30
-	connectionKeepAliveInterval   time.Duration = time.Second * 1
-	connectionReadTimeout         time.Duration = time.Minute * 5
-	containerAvailableTimeout     time.Duration = time.Second * 2
+	containerDiscoveryInterval       time.Duration = time.Millisecond * 250
+	queuedContainerDiscoveryInterval time.Duration = time.Millisecond * 50
+	containerDialTimeoutDurationS    time.Duration = time.Second * 30
+	// Covers a dropped SYN (kernel retransmits at 1s) and relayed tunnel dials
+	// that routinely exceed 900ms under concurrency.
+	containerPinnedDialTimeout  time.Duration = time.Second * 3
+	containerAvailableTimeout   time.Duration = time.Second * 2
+	containerPrimeTimeout       time.Duration = time.Second * 3
+	connectionKeepAliveInterval time.Duration = time.Second * 1
+	connectionReadTimeout       time.Duration = time.Minute * 5
+	backendDialRetryLimit                     = 1
 )
 
 type container struct {
-	id          string
-	addressMap  map[int32]string
-	connections int
+	id              string
+	addressMap      map[int32]string
+	readyAddressMap map[int32]string
+	connections     int
 }
 
 type connection struct {
-	ctx  echo.Context
-	tc   *tcpConnection
-	done chan struct{}
+	ctx              echo.Context
+	tc               *tcpConnection
+	done             chan struct{}
+	finishOnce       sync.Once
+	enqueuedAt       time.Time
+	dialTimeout      time.Duration
+	llm              *llmRequestInfo
+	retryBackendDial bool
+	pinned           bool
+	retryCount       int
+	state            atomic.Int32
+}
+
+const (
+	connectionQueued int32 = iota
+	connectionActive
+	connectionFinished
+)
+
+type backendTransportKey struct {
+	targetHost  string
+	dialTimeout time.Duration
+}
+
+// backendDialError identifies failures that happened before a connection was
+// established, so the request body has not been delivered to a backend.
+type backendDialError struct {
+	err error
+}
+
+func (e *backendDialError) Error() string { return e.err.Error() }
+func (e *backendDialError) Unwrap() error { return e.err }
+
+type preservedRequestBody struct {
+	io.ReadCloser
+}
+
+func (preservedRequestBody) Close() error { return nil }
+
+func (c *connection) backendDialTimeout() time.Duration {
+	if c != nil && c.dialTimeout > 0 {
+		return c.dialTimeout
+	}
+	return containerDialTimeoutDurationS
 }
 
 type PodProxyBuffer struct {
 	ctx                     context.Context
+	drainCtx                context.Context
 	rdb                     *common.RedisClient
 	workspace               *types.Workspace
 	stubId                  string
+	proxyId                 string
 	size                    int
 	containerRepo           repository.ContainerRepository
 	keyEventManager         *common.KeyEventManager
 	stubConfig              *types.StubConfigV1
+	stubType                string
+	appID                   string
+	eventRepo               llmRouteEventPusher
 	httpClient              *http.Client
+	backendTransports       sync.Map
 	tailscale               *network.Tailscale
 	tsConfig                types.TailscaleConfig
 	availableContainers     []container
 	availableContainersLock sync.RWMutex
+	retiringContainers      map[string]struct{}
+	totalConnections        atomic.Int64
+	containerConnections    sync.Map
+	pendingKeepWarmLocks    sync.Map
+	llmMetricsRefreshAfter  sync.Map
+	llmRouteCounter         atomic.Uint64
+	idleSnapshotUntil       atomic.Int64
+	proxyIndexRefreshAfter  atomic.Int64
 	buffer                  *abstractions.RingBuffer[*connection]
+	workReady               chan struct{}
+	discoverReady           chan struct{}
+	onBackendUnavailable    func() error
 }
 
-func NewPodProxyBuffer(ctx context.Context,
+func NewPodProxyBuffer(ctx, drainCtx context.Context,
 	rdb *common.RedisClient,
 	workspace *types.Workspace,
 	stubId string,
@@ -72,28 +139,43 @@ func NewPodProxyBuffer(ctx context.Context,
 	containerRepo repository.ContainerRepository,
 	keyEventManager *common.KeyEventManager,
 	stubConfig *types.StubConfigV1,
+	stubType string,
+	appID string,
+	eventRepo llmRouteEventPusher,
 	tailscale *network.Tailscale,
 	tsConfig types.TailscaleConfig,
 ) *PodProxyBuffer {
+	if drainCtx == nil {
+		drainCtx = context.Background()
+	}
+
 	pb := &PodProxyBuffer{
 		ctx:                     ctx,
+		drainCtx:                drainCtx,
 		rdb:                     rdb,
 		workspace:               workspace,
 		stubId:                  stubId,
+		proxyId:                 uuid.NewString(),
 		size:                    size,
 		containerRepo:           containerRepo,
 		keyEventManager:         keyEventManager,
 		httpClient:              &http.Client{},
 		stubConfig:              stubConfig,
+		stubType:                stubType,
+		appID:                   appID,
+		eventRepo:               eventRepo,
 		tailscale:               tailscale,
 		tsConfig:                tsConfig,
 		availableContainers:     []container{},
 		availableContainersLock: sync.RWMutex{},
 		buffer:                  abstractions.NewRingBuffer[*connection](size),
+		workReady:               make(chan struct{}, 1),
+		discoverReady:           make(chan struct{}, 1),
 	}
 
 	go pb.discoverContainers()
 	go pb.processBuffer()
+	go pb.syncConnectionState()
 
 	return pb
 }
@@ -101,94 +183,468 @@ func NewPodProxyBuffer(ctx context.Context,
 func (pb *PodProxyBuffer) ForwardRequest(ctx echo.Context) error {
 	ctx.Set("stubId", pb.stubId)
 
-	pb.incrementTotalConnections()
+	if pb.isDraining() {
+		return pb.failDrainingRequest(ctx)
+	}
+
+	if _, err := pb.incrementTotalConnections(); err != nil {
+		return ctx.String(http.StatusServiceUnavailable, "Failed to connect to service")
+	}
 	defer pb.decrementTotalConnections()
+
+	port, err := strconv.Atoi(ctx.Param("port"))
+	if err != nil {
+		return ctx.String(http.StatusBadRequest, "Invalid port")
+	}
+
+	llmInfo, err := pb.inspectLLMRequest(ctx)
+	if err != nil {
+		return ctx.String(http.StatusBadRequest, "Failed to inspect LLM request")
+	}
+	if denied, reason := pb.llmAdmissionDenied(llmInfo); denied {
+		ctx.Response().Header().Set(echo.HeaderRetryAfter, "1")
+		pb.pushRejectedLLMRouteEvent(llmInfo, http.StatusTooManyRequests, reason)
+		return ctx.String(http.StatusTooManyRequests, reason)
+	}
 
 	done := make(chan struct{})
 	conn := &connection{
-		ctx:  ctx,
-		done: done,
+		ctx:              ctx,
+		done:             done,
+		llm:              llmInfo,
+		retryBackendDial: true,
 	}
 
-	pb.buffer.Push(conn, false)
+	if ctx.Request().Context().Err() != nil {
+		return nil
+	}
 
+	container, ok, hasContainers, hasPort := pb.reserveContainerForRequest(int32(port), llmInfo)
+	if ok {
+		conn.claim()
+		if pb.handleConnection(conn, container, int32(port)) {
+			return pb.waitForConnection(conn, ctx.Request().Context().Done())
+		}
+		return nil
+	}
+	if hasContainers && !hasPort {
+		return ctx.String(http.StatusServiceUnavailable, "Port not available")
+	}
+
+	conn.enqueuedAt = time.Now()
+	pb.enqueueConnection(conn, false)
+	pb.signalDiscovery()
+	pb.signalWork()
+	return pb.waitForConnection(conn, ctx.Request().Context().Done())
+}
+
+func (pb *PodProxyBuffer) ForwardContainerRequest(ctx echo.Context, containerId string) error {
+	ctx.Set("stubId", pb.stubId)
+
+	if pb.isDraining() {
+		return pb.failDrainingRequest(ctx)
+	}
+
+	if _, err := pb.incrementTotalConnections(); err != nil {
+		return ctx.String(http.StatusServiceUnavailable, "Failed to connect to service")
+	}
+	defer pb.decrementTotalConnections()
+
+	port, err := strconv.Atoi(ctx.Param("port"))
+	if err != nil {
+		return ctx.String(http.StatusBadRequest, "Invalid port")
+	}
+
+	addressMap, err := pb.containerRepo.GetContainerAddressMap(containerId)
+	if err != nil {
+		return ctx.String(http.StatusServiceUnavailable, "Failed to connect to service")
+	}
+	if _, ok := addressMap[int32(port)]; !ok {
+		return ctx.String(http.StatusServiceUnavailable, "Port not available")
+	}
+
+	if err := pb.incrementContainerConnections(containerId); err != nil {
+		return ctx.String(http.StatusServiceUnavailable, "Failed to connect to service")
+	}
+
+	done := make(chan struct{})
+	conn := &connection{
+		ctx:              ctx,
+		done:             done,
+		dialTimeout:      containerPinnedDialTimeout,
+		retryBackendDial: true,
+		pinned:           true,
+	}
+	conn.claim()
+	pb.handleConnection(conn, container{
+		id:         containerId,
+		addressMap: addressMap,
+	}, int32(port))
+
+	return nil
+}
+
+func (pb *PodProxyBuffer) waitForConnection(conn *connection, requestDone <-chan struct{}) error {
+	instanceDone := pb.ctx.Done()
+	drainDone := pb.drainDone()
 	for {
 		select {
-		case <-pb.ctx.Done():
-			return ctx.String(http.StatusServiceUnavailable, "Failed to connect to service")
+		case <-instanceDone:
+			if pb.failQueuedConnection(conn, http.StatusServiceUnavailable, "Failed to connect to service") {
+				return nil
+			}
+			instanceDone = nil
+		case <-drainDone:
+			if pb.failQueuedConnection(conn, http.StatusServiceUnavailable, "Service is draining") {
+				return nil
+			}
+			drainDone = nil
 		case <-conn.done:
 			return nil
-		case <-ctx.Request().Context().Done():
-			return nil
+		case <-requestDone:
+			if conn.cancelQueued() {
+				return nil
+			}
+			// An active proxy goroutine owns the response writer. Wait for it
+			// to observe request cancellation before net/http finalizes headers.
+			requestDone = nil
 		}
 	}
 }
 
 func (pb *PodProxyBuffer) ForwardTCPRequest(tc *tcpConnection) error {
-	pb.incrementTotalConnections()
+	if pb.isDraining() {
+		tc.Conn.Close()
+		return nil
+	}
+
+	if _, err := pb.incrementTotalConnections(); err != nil {
+		tc.Conn.Close()
+		return err
+	}
 	defer pb.decrementTotalConnections()
 
 	done := make(chan struct{})
 	conn := &connection{
-		ctx:  nil,
-		done: done,
-		tc:   tc,
+		ctx:        nil,
+		done:       done,
+		tc:         tc,
+		enqueuedAt: time.Now(),
 	}
 
-	pb.buffer.Push(conn, false)
+	pb.enqueueConnection(conn, false)
+	pb.signalDiscovery()
+	pb.signalWork()
 
-	for {
-		select {
-		case <-conn.done:
-			return nil
-		}
-	}
+	return pb.waitForConnection(conn, nil)
 }
 
 func (pb *PodProxyBuffer) processBuffer() {
 	for {
 		select {
 		case <-pb.ctx.Done():
+			pb.failQueuedConnections(http.StatusServiceUnavailable, "Failed to connect to service")
 			return
-		default:
-			if len(pb.availableContainers) == 0 {
-				time.Sleep(bufferProcessingInterval)
-				continue
-			}
-
-			conn, ok := pb.buffer.Pop()
-			if !ok {
-				time.Sleep(bufferProcessingInterval)
-				continue
-			}
-
-			if conn.tc != nil {
-				go pb.handleTCPConnection(conn)
-			} else {
-				if conn.ctx.Request().Context().Err() != nil {
+		case <-pb.drainDone():
+			pb.failQueuedConnections(http.StatusServiceUnavailable, "Service is draining")
+			return
+		case <-pb.workReady:
+			for {
+				conn, ok := pb.buffer.Pop()
+				if !ok {
+					break
+				}
+				pb.recordBufferOccupancy()
+				if !conn.claim() {
 					continue
 				}
 
-				go pb.handleConnection(conn)
+				if conn.tc != nil {
+					if pb.isDraining() {
+						pb.failConnection(conn, http.StatusServiceUnavailable, "Service is draining")
+						continue
+					}
+					port := int32(conn.tc.Fields.Port)
+					container, ok, hasContainers, hasPort := pb.reserveContainerForPort(port)
+					if !ok {
+						if !hasContainers || hasPort {
+							pb.requeueConnection(conn)
+							break
+						} else {
+							conn.finish()
+							conn.tc.Conn.Close()
+						}
+						continue
+					}
+
+					go pb.handleTCPConnection(conn, container)
+					continue
+				}
+
+				if conn.ctx.Request().Context().Err() != nil {
+					conn.finish()
+					continue
+				}
+				if pb.isDraining() {
+					pb.failConnection(conn, http.StatusServiceUnavailable, "Service is draining")
+					continue
+				}
+
+				port, err := strconv.Atoi(conn.ctx.Param("port"))
+				if err != nil {
+					conn.ctx.String(http.StatusBadRequest, "Invalid port")
+					conn.finish()
+					continue
+				}
+
+				container, ok, hasContainers, hasPort := pb.reserveContainerForRequest(int32(port), conn.llm)
+				if !ok {
+					if !hasContainers || hasPort {
+						pb.requeueConnection(conn)
+						break
+					} else {
+						conn.ctx.String(http.StatusServiceUnavailable, "Port not available")
+						conn.finish()
+					}
+					continue
+				}
+
+				go pb.handleConnection(conn, container, int32(port))
 			}
 		}
 	}
 }
 
-func (pb *PodProxyBuffer) handleTCPConnection(conn *connection) {
-	pb.availableContainersLock.RLock()
-
-	if len(pb.availableContainers) == 0 {
-		pb.buffer.Push(conn, true)
-		pb.availableContainersLock.RUnlock()
+func (pb *PodProxyBuffer) signalWork() {
+	if pb.workReady == nil {
 		return
 	}
+	select {
+	case pb.workReady <- struct{}{}:
+	default:
+	}
+}
+
+func (pb *PodProxyBuffer) signalDiscovery() {
+	if pb.discoverReady == nil {
+		return
+	}
+	select {
+	case pb.discoverReady <- struct{}{}:
+	default:
+	}
+}
+
+func (pb *PodProxyBuffer) enqueueConnection(conn *connection, priority bool) {
+	if overwritten, ok := pb.buffer.PushWithOverwrite(conn, priority); ok {
+		metrics.RecordRingBufferOverwrite("pod", pb.workspaceName(), pb.stubId)
+		pb.failQueuedConnection(overwritten, http.StatusServiceUnavailable, "Request queue full")
+	}
+	pb.recordBufferOccupancy()
+}
+
+func (pb *PodProxyBuffer) failQueuedConnection(conn *connection, status int, message string) bool {
+	if conn == nil || !conn.claim() {
+		return false
+	}
+	pb.failConnection(conn, status, message)
+	return true
+}
+
+func (pb *PodProxyBuffer) failConnection(conn *connection, status int, message string) {
+	if conn.tc != nil {
+		conn.tc.Conn.Close()
+	} else if conn.ctx != nil && !conn.ctx.Response().Committed {
+		conn.ctx.Response().Header().Set(echo.HeaderConnection, "close")
+		_ = conn.ctx.String(status, message)
+	}
+	pb.recordFailedQueuedLLMRoute(conn, status, message)
+	conn.finish()
+}
+
+func (pb *PodProxyBuffer) failQueuedConnections(status int, message string) {
+	for {
+		conn, ok := pb.buffer.Pop()
+		if !ok {
+			break
+		}
+		pb.failQueuedConnection(conn, status, message)
+	}
+	pb.recordBufferOccupancy()
+}
+
+func (pb *PodProxyBuffer) failDrainingRequest(ctx echo.Context) error {
+	ctx.Response().Header().Set(echo.HeaderConnection, "close")
+	return ctx.String(http.StatusServiceUnavailable, "Service is draining")
+}
+
+func (pb *PodProxyBuffer) isDraining() bool {
+	select {
+	case <-pb.drainDone():
+		return true
+	default:
+		return false
+	}
+}
+
+func (pb *PodProxyBuffer) drainDone() <-chan struct{} {
+	if pb == nil || pb.drainCtx == nil {
+		return nil
+	}
+	return pb.drainCtx.Done()
+}
+
+func (c *connection) finish() {
+	if c == nil || c.done == nil {
+		return
+	}
+	c.state.Store(connectionFinished)
+	c.finishOnce.Do(func() {
+		close(c.done)
+	})
+}
+
+func (c *connection) claim() bool {
+	return c != nil && c.state.CompareAndSwap(connectionQueued, connectionActive)
+}
+
+func (c *connection) cancelQueued() bool {
+	if c == nil || !c.state.CompareAndSwap(connectionQueued, connectionFinished) {
+		return false
+	}
+	c.finishOnce.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
+	})
+	return true
+}
+
+func (pb *PodProxyBuffer) availableContainerSnapshot() []container {
+	pb.availableContainersLock.RLock()
+	defer pb.availableContainersLock.RUnlock()
+
+	containers := make([]container, len(pb.availableContainers))
+	copy(containers, pb.availableContainers)
+	return containers
+}
+
+func (pb *PodProxyBuffer) hasAvailableContainers() bool {
+	pb.availableContainersLock.RLock()
+	defer pb.availableContainersLock.RUnlock()
+
+	return len(pb.availableContainers) > 0
+}
+
+func (pb *PodProxyBuffer) reserveContainerForPort(port int32) (container, bool, bool, bool) {
+	pb.availableContainersLock.RLock()
+	defer pb.availableContainersLock.RUnlock()
+
+	if len(pb.availableContainers) == 0 {
+		return container{}, false, false, false
+	}
+
+	hasPort := false
+	for _, c := range pb.availableContainers {
+		if _, ok := c.addressMap[port]; !ok {
+			continue
+		}
+
+		hasPort = true
+		if _, ready := c.readyAddressMap[port]; !ready {
+			continue
+		}
+		if err := pb.incrementContainerConnections(c.id); err == nil {
+			return c, true, true, true
+		}
+	}
+
+	return container{}, false, true, hasPort
+}
+
+func (pb *PodProxyBuffer) reserveContainerForRequest(port int32, llmInfo *llmRequestInfo) (container, bool, bool, bool) {
+	if llmInfo != nil && llmInfo.Enabled {
+		return pb.reserveLLMContainerForPort(port, llmInfo)
+	}
+	return pb.reserveContainerForPort(port)
+}
+
+func (pb *PodProxyBuffer) primeContainerPort(containerID string, port int32, timeout time.Duration) bool {
+	if pb == nil || pb.containerRepo == nil || containerID == "" || port <= 0 {
+		return false
+	}
+
+	addressMap, err := pb.containerRepo.GetContainerAddressMap(containerID)
+	if err != nil || len(addressMap) == 0 {
+		return false
+	}
+
+	address, ok := addressMap[port]
+	if !ok || strings.TrimSpace(address) == "" {
+		return false
+	}
+	if !pb.checkContainerAvailableWithTimeout(address, timeout) {
+		return false
+	}
+
+	connections := int(pb.containerConnectionCount(containerID))
+	if sharedConnections, err := pb.sharedContainerConnectionCount(containerID); err == nil && sharedConnections > connections {
+		connections = sharedConnections
+	}
+
+	pb.availableContainersLock.Lock()
+	next := make([]container, 0, len(pb.availableContainers)+1)
+	updated := false
+	for _, c := range pb.availableContainers {
+		if c.id != containerID {
+			next = append(next, c)
+			continue
+		}
+
+		readyAddressMap := make(map[int32]string, len(c.readyAddressMap)+1)
+		for readyPort, readyAddress := range c.readyAddressMap {
+			readyAddressMap[readyPort] = readyAddress
+		}
+		readyAddressMap[port] = address
+
+		c.addressMap = addressMap
+		c.readyAddressMap = readyAddressMap
+		c.connections = connections
+		next = append(next, c)
+		updated = true
+	}
+	if !updated {
+		next = append(next, container{
+			id:              containerID,
+			addressMap:      addressMap,
+			readyAddressMap: map[int32]string{port: address},
+			connections:     connections,
+		})
+	}
+	sort.Slice(next, func(i, j int) bool {
+		return next[i].connections < next[j].connections
+	})
+	pb.availableContainers = next
+	pb.availableContainersLock.Unlock()
+
+	pb.signalWork()
+	return true
+}
+
+func (pb *PodProxyBuffer) requeueConnection(conn *connection) bool {
+	if conn == nil || !conn.state.CompareAndSwap(connectionActive, connectionQueued) {
+		return false
+	}
+	pb.enqueueConnection(conn, true)
+	return true
+}
+
+func (pb *PodProxyBuffer) handleTCPConnection(conn *connection, container container) {
+	defer conn.finish()
+	defer pb.decrementContainerConnections(container.id)
 
 	tc := conn.tc
-
-	container := pb.availableContainers[0]
-	pb.availableContainersLock.RUnlock()
-	defer close(conn.done)
+	pb.recordQueuedRequestWait(conn, "tcp")
 
 	port := tc.Fields.Port
 	targetHost, ok := container.addressMap[int32(port)]
@@ -198,16 +654,25 @@ func (pb *PodProxyBuffer) handleTCPConnection(conn *connection) {
 		return
 	}
 
-	podConn, err := network.ConnectToHost(context.TODO(), targetHost, containerDialTimeoutDurationS, pb.tailscale, pb.tsConfig)
+	dialStart := time.Now()
+	podConn, err := network.ConnectToBackend(pb.baseContext(), targetHost, conn.backendDialTimeout(), pb.tailscale, pb.tsConfig, pb.containerRepo)
+	metrics.RecordProxyBackendDialLatency("pod", pb.workspaceName(), pb.stubId, "tcp", err == nil, time.Since(dialStart))
 	if err == nil {
-		abstractions.SetConnOptions(podConn, true, connectionKeepAliveInterval, connectionReadTimeout)
+		abstractions.SetConnOptions(podConn, true, connectionKeepAliveInterval, -1)
+		abstractions.SetConnOptions(tc.Conn, true, connectionKeepAliveInterval, -1)
 	} else if err != nil {
 		tc.Conn.Close()
 		return
 	}
+	idleDeadline := abstractions.NewConnIdleDeadline(connectionReadTimeout, tc.Conn, podConn)
+	defer idleDeadline.Clear()
 
 	isExpectedError := func(err error) bool {
 		if err == nil || err == io.EOF {
+			return true
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
 			return true
 		}
 
@@ -223,7 +688,7 @@ func (pb *PodProxyBuffer) handleTCPConnection(conn *connection) {
 
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(podConn, tc.Conn) // Client -> Pod
+		_, err := abstractions.CopyWithProxyBufferActivity(podConn, tc.Conn, idleDeadline.Refresh) // Client -> Pod
 		if err != nil && !isExpectedError(err) {
 			log.Warn().Err(err).Msg("error copying from client to pod")
 		}
@@ -236,7 +701,7 @@ func (pb *PodProxyBuffer) handleTCPConnection(conn *connection) {
 	go func() {
 		defer wg.Done()
 
-		_, err := io.Copy(tc.Conn, podConn) // Pod -> Client
+		_, err := abstractions.CopyWithProxyBufferActivity(tc.Conn, podConn, idleDeadline.Refresh) // Pod -> Client
 		if err != nil && !isExpectedError(err) {
 			log.Warn().Err(err).Msg("error copying from pod to client")
 		}
@@ -252,88 +717,342 @@ func (pb *PodProxyBuffer) handleTCPConnection(conn *connection) {
 	tc.Conn.Close()
 }
 
-func (pb *PodProxyBuffer) handleConnection(conn *connection) {
-	pb.availableContainersLock.RLock()
-
-	if len(pb.availableContainers) == 0 {
-		pb.buffer.Push(conn, true)
-		pb.availableContainersLock.RUnlock()
-		return
+func (pb *PodProxyBuffer) handleConnection(conn *connection, container container, port int32) (requeued bool) {
+	defer func() {
+		if !requeued {
+			conn.finish()
+		}
+	}()
+	var llmTracker *llmRequestTracker
+	attemptReleased := false
+	releaseAttempt := func() {
+		if attemptReleased {
+			return
+		}
+		attemptReleased = true
+		if llmTracker != nil {
+			llmTracker.finish()
+		}
+		_ = pb.decrementContainerConnections(container.id)
 	}
-
-	container := pb.availableContainers[0]
-	pb.availableContainersLock.RUnlock()
-	defer close(conn.done)
+	defer releaseAttempt()
+	pb.recordQueuedRequestWait(conn, "http")
 
 	request := conn.ctx.Request()
-	response := conn.ctx.Response()
 
-	portStr := conn.ctx.Param("port")
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		conn.ctx.String(http.StatusBadRequest, "Invalid port")
-		return
-	}
-
-	targetHost, ok := container.addressMap[int32(port)]
+	targetHost, ok := container.addressMap[port]
 	if !ok {
 		conn.ctx.String(http.StatusServiceUnavailable, "Port not available")
-		return
+		return false
 	}
+	llmTracker = pb.startLLMRequest(conn.llm, container.id, targetHost)
 
 	subPath := conn.ctx.Param("subPath")
 	if subPath != "" && subPath[0] != '/' {
 		subPath = "/" + subPath
+	} else if subPath == "" {
+		subPath = "/"
 	}
 
 	request.URL.Scheme = "http"
-	request.URL.Host = targetHost
+	request.URL.Host = podBackendHost(targetHost)
 	request.URL.Path = subPath
-
-	// Increment container connections
-	err = pb.incrementContainerConnections(container.id)
-	if err != nil {
-		pb.buffer.Push(conn, true)
-		return
-	}
-	defer pb.decrementContainerConnections(container.id)
 
 	// If it's a websocket request, upgrade the connection
 	if websocket.IsWebSocketUpgrade(request) {
 		pb.proxyWebSocket(conn, container, targetHost, subPath)
-		return
-	}
-
-	// Otherwise, use regular HTTP proxying
-	targetURL, err := url.Parse("http://" + targetHost)
-	if err != nil {
-		conn.ctx.String(http.StatusInternalServerError, "Invalid target URL")
-		return
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = &http.Transport{
-		DialContext: func(ctx context.Context, networkType, addr string) (net.Conn, error) {
-			conn, err := network.ConnectToHost(ctx, addr, containerDialTimeoutDurationS, pb.tailscale, pb.tsConfig)
-			if err == nil {
-				abstractions.SetConnOptions(conn, true, connectionKeepAliveInterval, connectionReadTimeout)
-			}
-			return conn, err
-		},
+		return false
 	}
 
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error().Err(err).Str("stubId", pb.stubId).Str("workspace", pb.workspace.Name).Msg("handled abort in pod proxy")
+			log.Error().Interface("recover", r).Str("stubId", pb.stubId).Str("workspace", pb.workspace.Name).Msg("handled abort in pod proxy")
 		}
 	}()
 
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {}
-	proxy.ServeHTTP(response, request)
+	proxy, err := pb.backendProxy(targetHost, conn.backendDialTimeout())
+	if err != nil {
+		conn.ctx.String(http.StatusInternalServerError, "Invalid target URL")
+		return false
+	}
+
+	var retryErr error
+	if llmTracker != nil {
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			llmTracker.markFirstResponse(resp.StatusCode)
+			return nil
+		}
+	}
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		var dialErr *backendDialError
+		if conn.retryBackendDial &&
+			conn.retryCount < backendDialRetryLimit &&
+			errors.As(err, &dialErr) &&
+			req.Context().Err() == nil &&
+			!conn.ctx.Response().Committed {
+			retryErr = err
+			return
+		}
+		if llmTracker != nil {
+			llmTracker.markError(err.Error())
+		}
+		http.Error(rw, "Backend route unavailable", http.StatusBadGateway)
+	}
+
+	// The transport closes its outbound request body even when dialing fails.
+	// Keep the inbound body open until the one safe pre-connect retry is decided.
+	requestBody := request.Body
+	serve := func() {
+		if conn.retryBackendDial && conn.retryCount < backendDialRetryLimit && requestBody != nil {
+			request.Body = preservedRequestBody{ReadCloser: requestBody}
+			defer func() { request.Body = requestBody }()
+		}
+		proxy.ServeHTTP(conn.ctx.Response(), request)
+	}
+	serve()
+
+	// A pinned request names one container, so there is nowhere to requeue it: dial again.
+	if retryErr != nil && conn.pinned {
+		conn.retryCount++
+		retryErr = nil
+		serve()
+	}
+
+	if retryErr == nil {
+		return false
+	}
+	if llmTracker != nil {
+		llmTracker.markError(retryErr.Error())
+	}
+	releaseAttempt()
+	if pb.retryBackendConnection(conn, container, retryErr) {
+		return true
+	}
+	if !conn.ctx.Response().Committed {
+		http.Error(conn.ctx.Response(), "Backend route unavailable", http.StatusBadGateway)
+	}
+	return false
+}
+
+func (pb *PodProxyBuffer) retryBackendConnection(conn *connection, failed container, err error) bool {
+	if conn == nil || conn.ctx == nil || !conn.retryBackendDial || conn.retryCount >= backendDialRetryLimit || conn.ctx.Request().Context().Err() != nil {
+		return false
+	}
+
+	pb.removeAvailableContainer(failed.id)
+	conn.retryCount++
+	if conn.enqueuedAt.IsZero() {
+		conn.enqueuedAt = time.Now()
+	}
+	if !pb.requeueConnection(conn) {
+		return false
+	}
+
+	log.Warn().
+		Err(err).
+		Str("container_id", failed.id).
+		Str("stub_id", pb.stubId).
+		Msg("backend unavailable before request delivery; requeueing request")
+	pb.signalDiscovery()
+	if pb.onBackendUnavailable != nil {
+		if scaleErr := pb.onBackendUnavailable(); scaleErr != nil {
+			log.Warn().Err(scaleErr).Str("stub_id", pb.stubId).Msg("failed to start replacement after backend became unavailable")
+		}
+	}
+	pb.signalWork()
+	return true
+}
+
+func (pb *PodProxyBuffer) removeAvailableContainer(containerID string) {
+	if containerID == "" {
+		return
+	}
+
+	pb.availableContainersLock.Lock()
+	available := make([]container, 0, len(pb.availableContainers))
+	removed := false
+	for _, candidate := range pb.availableContainers {
+		if candidate.id == containerID {
+			removed = true
+			continue
+		}
+		available = append(available, candidate)
+	}
+	if removed {
+		pb.availableContainers = available
+	}
+	pb.availableContainersLock.Unlock()
+
+	if removed {
+		pb.pruneBackendTransports(available)
+	}
+}
+
+func (pb *PodProxyBuffer) retireAvailableContainer(containerID string) {
+	if containerID == "" {
+		return
+	}
+
+	pb.availableContainersLock.Lock()
+	if pb.retiringContainers == nil {
+		pb.retiringContainers = make(map[string]struct{})
+	}
+	pb.retiringContainers[containerID] = struct{}{}
+	available := make([]container, 0, len(pb.availableContainers))
+	for _, candidate := range pb.availableContainers {
+		if candidate.id != containerID {
+			available = append(available, candidate)
+		}
+	}
+	pb.availableContainers = available
+	pb.availableContainersLock.Unlock()
+
+	pb.pruneBackendTransports(available)
+}
+
+func (pb *PodProxyBuffer) cancelContainerRetirement(containerID string) {
+	if containerID == "" {
+		return
+	}
+
+	pb.availableContainersLock.Lock()
+	delete(pb.retiringContainers, containerID)
+	pb.availableContainersLock.Unlock()
+	pb.signalDiscovery()
+}
+
+func (pb *PodProxyBuffer) recordQueuedRequestWait(conn *connection, protocol string) {
+	if conn.enqueuedAt.IsZero() {
+		return
+	}
+	wait := time.Since(conn.enqueuedAt)
+	if conn.llm != nil {
+		conn.llm.QueueWait = wait
+	}
+	metrics.RecordProxyQueuedRequestWait("pod", pb.workspaceName(), pb.stubId, protocol, wait)
+}
+
+func podBackendHost(address string) string {
+	if _, isRoute := types.ParseBackendRouteAddress(address); isRoute {
+		return "backend.route"
+	}
+	return address
+}
+
+func (pb *PodProxyBuffer) backendProxy(targetHost string, dialTimeout time.Duration) (*httputil.ReverseProxy, error) {
+	targetURL, err := url.Parse(podBackendURL("http", targetHost, "", ""))
+	if err != nil {
+		return nil, err
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy.Transport = pb.backendTransport(targetHost, dialTimeout)
+	proxy.BufferPool = abstractions.ProxyBufferPool{}
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		http.Error(rw, "Backend route unavailable", http.StatusBadGateway)
+	}
+	return proxy, nil
+}
+
+func (pb *PodProxyBuffer) backendTransport(targetHost string, dialTimeout time.Duration) *http.Transport {
+	if dialTimeout <= 0 {
+		dialTimeout = containerDialTimeoutDurationS
+	}
+	key := backendTransportKey{targetHost: targetHost, dialTimeout: dialTimeout}
+	if transport, ok := pb.backendTransports.Load(key); ok {
+		return transport.(*http.Transport)
+	}
+
+	transport := &http.Transport{
+		MaxIdleConns:        1024,
+		MaxIdleConnsPerHost: 128,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			dialAddress := addr
+			if _, isRoute := types.ParseBackendRouteAddress(targetHost); isRoute {
+				dialAddress = targetHost
+			}
+			start := time.Now()
+			conn, err := network.ConnectToBackend(ctx, dialAddress, dialTimeout, pb.tailscale, pb.tsConfig, pb.containerRepo)
+			metrics.RecordProxyBackendDialLatency("pod", pb.workspaceName(), pb.stubId, "http", err == nil, time.Since(start))
+			if err == nil {
+				abstractions.SetConnOptions(conn, true, connectionKeepAliveInterval, connectionReadTimeout)
+			} else {
+				return nil, &backendDialError{err: err}
+			}
+			return conn, nil
+		},
+	}
+
+	actual, loaded := pb.backendTransports.LoadOrStore(key, transport)
+	if loaded {
+		transport.CloseIdleConnections()
+		return actual.(*http.Transport)
+	}
+	return transport
+}
+
+func (pb *PodProxyBuffer) pruneBackendTransports(containers []container) {
+	active := map[string]struct{}{}
+	for _, c := range containers {
+		for _, address := range c.readyAddressMap {
+			active[address] = struct{}{}
+		}
+	}
+
+	pb.backendTransports.Range(func(key, value any) bool {
+		cacheKey, ok := key.(backendTransportKey)
+		if !ok {
+			pb.backendTransports.Delete(key)
+			return true
+		}
+		if _, ok := active[cacheKey.targetHost]; ok {
+			return true
+		}
+		value.(*http.Transport).CloseIdleConnections()
+		pb.backendTransports.Delete(key)
+		return true
+	})
 }
 
 func (pb *PodProxyBuffer) proxyWebSocket(conn *connection, container container, addr string, path string) error {
 	subprotocols := websocket.Subprotocols(conn.ctx.Request())
+
+	wsURL, err := url.Parse(podBackendURL("ws", addr, path, conn.ctx.Request().URL.RawQuery))
+	if err != nil {
+		return err
+	}
+	dstDialer := websocket.Dialer{
+		NetDialContext: func(ctx context.Context, _, dialAddr string) (net.Conn, error) {
+			dialAddress := dialAddr
+			if _, isRoute := types.ParseBackendRouteAddress(addr); isRoute {
+				dialAddress = addr
+			}
+			return network.ConnectToBackend(ctx, dialAddress, conn.backendDialTimeout(), pb.tailscale, pb.tsConfig, pb.containerRepo)
+		},
+		Subprotocols: subprotocols,
+	}
+
+	// The backend is dialed before the client is upgraded: once the upgrade
+	// has happened this handler can only answer a dead backend by slamming the
+	// fresh socket shut, which the browser reports as a connection that never
+	// worked. Before the upgrade a failure is still an ordinary HTTP error,
+	// and a cold route gets the same single redial the HTTP path has.
+	var serverConn *websocket.Conn
+	for attempt := 0; ; attempt++ {
+		var err error
+		serverConn, _, err = dstDialer.Dial(wsURL.String(), forwardedWebSocketHeaders(conn.ctx.Request()))
+		if err == nil {
+			break
+		}
+		if attempt < backendDialRetryLimit && conn.ctx.Request().Context().Err() == nil {
+			log.Warn().Err(err).Str("container_id", container.id).Str("stub_id", pb.stubId).Msg("websocket backend dial failed; dialing again")
+			continue
+		}
+		return conn.ctx.String(http.StatusBadGateway, "Backend route unavailable")
+	}
+	defer serverConn.Close()
 
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
@@ -348,23 +1067,14 @@ func (pb *PodProxyBuffer) proxyWebSocket(conn *connection, container container, 
 	}
 	defer clientConn.Close()
 
-	wsURL := url.URL{Scheme: "ws", Host: addr, Path: path, RawQuery: conn.ctx.Request().URL.RawQuery}
-	dstDialer := websocket.Dialer{
-		NetDialContext: network.GetDialer(addr, pb.tailscale, pb.tsConfig),
-		Subprotocols:   subprotocols,
-	}
-
-	serverConn, _, err := dstDialer.Dial(wsURL.String(), nil)
-	if err != nil {
-		return err
-	}
-	defer serverConn.Close()
-
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 
+	// Close both sockets: ReadMessage consumes keepalive pings and can otherwise block forever.
 	proxyMessages := func(src, dst *websocket.Conn) {
 		defer wg.Done()
+		defer src.Close()
+		defer dst.Close()
 
 		for {
 			messageType, message, err := src.ReadMessage()
@@ -384,21 +1094,60 @@ func (pb *PodProxyBuffer) proxyWebSocket(conn *connection, container container, 
 	return nil
 }
 
+var webSocketHandshakeHeaders = []string{
+	"Upgrade",
+	"Connection",
+	"Sec-Websocket-Key",
+	"Sec-Websocket-Version",
+	"Sec-Websocket-Extensions",
+	"Sec-Websocket-Protocol",
+}
+
+func forwardedWebSocketHeaders(request *http.Request) http.Header {
+	forwarded := request.Header.Clone()
+	// Preserve the public host for backend origin checks.
+	forwarded.Set("Host", request.Host)
+
+	for _, header := range webSocketHandshakeHeaders {
+		forwarded.Del(header)
+	}
+	return forwarded
+}
+
+func podBackendURL(scheme, address, path, rawQuery string) string {
+	host := address
+	if _, isRoute := types.ParseBackendRouteAddress(address); isRoute {
+		host = "backend.route"
+	}
+
+	u := url.URL{
+		Scheme:   scheme,
+		Host:     host,
+		Path:     "/" + strings.TrimPrefix(path, "/"),
+		RawQuery: rawQuery,
+	}
+	return u.String()
+}
+
 func (pb *PodProxyBuffer) discoverContainers() {
 	for {
 		select {
 		case <-pb.ctx.Done():
 			return
+		case <-pb.drainDone():
+			return
 		default:
-			containerStates, err := pb.containerRepo.GetActiveContainersByStubId(pb.stubId)
-			if err != nil {
-				continue
-			}
+		}
 
+		containerStates, err := pb.containerRepo.GetActiveContainersByStubId(pb.stubId)
+		if err == nil {
+
+			activeContainerIDs := make(map[string]struct{}, len(containerStates))
 			var wg sync.WaitGroup
 			availableContainersChan := make(chan container, len(containerStates))
 
 			for _, containerState := range containerStates {
+				activeContainerIDs[containerState.ContainerId] = struct{}{}
 				wg.Add(1)
 
 				go func(cs types.ContainerState) {
@@ -412,24 +1161,22 @@ func (pb *PodProxyBuffer) discoverContainers() {
 						return
 					}
 
-					currentConnections, err := pb.containerConnections(cs.ContainerId)
+					readyAddressMap := pb.readyAddressMap(addressMap)
+					if len(readyAddressMap) == 0 {
+						return
+					}
+
+					connections, err := pb.sharedContainerConnectionCount(cs.ContainerId)
 					if err != nil {
 						return
 					}
 
-					connections := currentConnections
-
-					for _, address := range addressMap {
-						if pb.checkContainerAvailable(address) {
-							availableContainersChan <- container{
-								id:          cs.ContainerId,
-								addressMap:  addressMap,
-								connections: connections,
-							}
-							return
-						}
+					availableContainersChan <- container{
+						id:              cs.ContainerId,
+						addressMap:      addressMap,
+						readyAddressMap: readyAddressMap,
+						connections:     connections,
 					}
-
 				}(containerState)
 			}
 
@@ -447,121 +1194,128 @@ func (pb *PodProxyBuffer) discoverContainers() {
 				return availableContainers[i].connections < availableContainers[j].connections
 			})
 
-			pb.availableContainersLock.Lock()
-			pb.availableContainers = availableContainers
-			pb.availableContainersLock.Unlock()
+			pb.updateDiscoveredContainers(availableContainers, activeContainerIDs)
+		}
 
-			time.Sleep(containerDiscoveryInterval)
+		interval := containerDiscoveryInterval
+		if pb.buffer != nil && pb.buffer.Len() > 0 {
+			interval = queuedContainerDiscoveryInterval
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-pb.ctx.Done():
+			timer.Stop()
+			return
+		case <-pb.drainDone():
+			timer.Stop()
+			return
+		case <-pb.discoverReady:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
 		}
 	}
+}
+
+func (pb *PodProxyBuffer) updateDiscoveredContainers(discovered []container, activeContainerIDs map[string]struct{}) {
+	pb.availableContainersLock.Lock()
+	for containerID := range pb.retiringContainers {
+		if _, active := activeContainerIDs[containerID]; !active {
+			delete(pb.retiringContainers, containerID)
+		}
+	}
+
+	available := discovered[:0]
+	for _, candidate := range discovered {
+		if _, retiring := pb.retiringContainers[candidate.id]; !retiring {
+			available = append(available, candidate)
+		}
+	}
+	pb.availableContainers = available
+	pb.availableContainersLock.Unlock()
+
+	pb.pruneBackendTransports(available)
+	pb.signalWork()
+}
+
+func (pb *PodProxyBuffer) readyAddressMap(addressMap map[int32]string) map[int32]string {
+	addressMap = pb.configuredAddressMap(addressMap)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	readyAddressMap := map[int32]string{}
+
+	for port, address := range addressMap {
+		wg.Add(1)
+		go func(port int32, address string) {
+			defer wg.Done()
+			if !pb.checkContainerReady(address, containerAvailableTimeout) {
+				return
+			}
+
+			mu.Lock()
+			readyAddressMap[port] = address
+			mu.Unlock()
+		}(port, address)
+	}
+
+	wg.Wait()
+	return readyAddressMap
+}
+
+func (pb *PodProxyBuffer) configuredAddressMap(addressMap map[int32]string) map[int32]string {
+	if pb.stubConfig == nil || len(pb.stubConfig.Ports) == 0 {
+		return addressMap
+	}
+
+	configured := make(map[int32]string, len(pb.stubConfig.Ports))
+	for _, port := range pb.stubConfig.Ports {
+		if address, ok := addressMap[int32(port)]; ok {
+			configured[int32(port)] = address
+		}
+	}
+	return configured
 }
 
 // checkContainerAvailable checks if a container is available (meaning you can connect to it via a TCP dial)
 func (pb *PodProxyBuffer) checkContainerAvailable(containerAddress string) bool {
-	conn, err := network.ConnectToHost(pb.ctx, containerAddress, containerAvailableTimeout, pb.tailscale, pb.tsConfig)
+	return pb.checkContainerAvailableWithTimeout(containerAddress, containerAvailableTimeout)
+}
+
+func (pb *PodProxyBuffer) checkContainerAvailableWithTimeout(containerAddress string, timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = containerAvailableTimeout
+	}
+	start := time.Now()
+	conn, err := network.ConnectToBackend(pb.baseContext(), containerAddress, timeout, pb.tailscale, pb.tsConfig, pb.containerRepo)
 	if err != nil {
+		metrics.RecordProxyBackendDialLatency("pod", pb.workspaceName(), pb.stubId, "discovery", false, time.Since(start))
 		return false
 	}
 	defer conn.Close()
+	metrics.RecordProxyBackendDialLatency("pod", pb.workspaceName(), pb.stubId, "discovery", true, time.Since(start))
 	return conn != nil
 }
 
-// containerConnections returns the number of connections currently established with a container
-func (pb *PodProxyBuffer) containerConnections(containerId string) (int, error) {
-	tokenKey := Keys.podContainerConnections(pb.workspace.Name, pb.stubId, containerId)
-
-	val, err := pb.rdb.Get(pb.ctx, tokenKey).Int()
-	if err != nil && err != redis.Nil {
-		return 0, err
-	} else if err == redis.Nil {
-		created, err := pb.rdb.SetNX(pb.ctx, tokenKey, 0, 0).Result()
-		if err != nil {
-			return 0, err
-		}
-
-		if created {
-			return 0, nil
-		}
-
-		connections, err := pb.rdb.Get(pb.ctx, tokenKey).Int()
-		if err != nil {
-			return 0, err
-		}
-
-		return connections, nil
+func (pb *PodProxyBuffer) baseContext() context.Context {
+	if pb != nil && pb.ctx != nil {
+		return pb.ctx
 	}
-
-	return val, nil
+	return context.Background()
 }
 
-func (pb *PodProxyBuffer) incrementTotalConnections() (int64, error) {
-	key := Keys.podTotalConnections(pb.workspace.Name, pb.stubId)
-	val, err := pb.rdb.Incr(context.Background(), key).Result()
-	if err != nil {
-		return 0, err
+func (pb *PodProxyBuffer) workspaceName() string {
+	if pb.workspace == nil {
+		return ""
 	}
-
-	err = pb.rdb.Expire(context.Background(), key, podContainerConnectionTimeout).Err()
-	if err != nil {
-		return 0, err
-	}
-
-	return val, nil
+	return pb.workspace.Name
 }
 
-func (pb *PodProxyBuffer) decrementTotalConnections() error {
-	key := Keys.podTotalConnections(pb.workspace.Name, pb.stubId)
-	_, err := pb.rdb.Decr(context.Background(), key).Result()
-	if err != nil {
-		return err
+func (pb *PodProxyBuffer) recordBufferOccupancy() {
+	if pb.buffer == nil {
+		return
 	}
-
-	err = pb.rdb.Expire(context.Background(), key, podContainerConnectionTimeout).Err()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (pb *PodProxyBuffer) incrementContainerConnections(containerId string) error {
-	key := Keys.podContainerConnections(pb.workspace.Name, pb.stubId, containerId)
-	_, err := pb.rdb.Incr(context.Background(), key).Result()
-	if err != nil {
-		return err
-	}
-
-	err = pb.rdb.Expire(context.Background(), key, podContainerConnectionTimeout).Err()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (pb *PodProxyBuffer) decrementContainerConnections(containerId string) error {
-	key := Keys.podContainerConnections(pb.workspace.Name, pb.stubId, containerId)
-
-	connections, err := pb.rdb.Decr(context.Background(), key).Result()
-	if err != nil {
-		return err
-	}
-
-	if connections < 0 {
-		pb.rdb.Incr(context.Background(), key)
-	}
-
-	err = pb.rdb.Expire(context.Background(), key, podContainerConnectionTimeout).Err()
-	if err != nil {
-		return err
-	}
-
-	pb.rdb.SetEx(
-		context.Background(),
-		Keys.podKeepWarmLock(pb.workspace.Name, pb.stubId, containerId),
-		1,
-		time.Duration(pb.stubConfig.KeepWarmSeconds)*time.Second,
-	)
-
-	return nil
+	metrics.RecordRingBufferOccupancy("pod", pb.workspaceName(), pb.stubId, pb.buffer.Len(), pb.buffer.Capacity())
 }

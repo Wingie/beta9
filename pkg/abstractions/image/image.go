@@ -4,8 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
+	"sort"
 
+	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
 	"github.com/beam-cloud/beta9/pkg/auth"
 	"github.com/beam-cloud/beta9/pkg/common"
 	"github.com/beam-cloud/beta9/pkg/network"
@@ -26,12 +27,10 @@ type ImageService interface {
 
 type ContainerImageService struct {
 	pb.UnimplementedImageServiceServer
-	builder         *Builder
-	config          types.AppConfig
-	backendRepo     repository.BackendRepository
-	containerRepo   repository.ContainerRepository
-	keyEventChan    chan common.KeyEvent
-	keyEventManager *common.KeyEventManager
+	builder          *Builder
+	config           types.AppConfig
+	backendRepo      repository.BackendRepository
+	baseImageDigests baseImageDigestCache
 }
 
 type ImageServiceOpts struct {
@@ -60,50 +59,38 @@ func NewContainerImageService(
 		return nil, err
 	}
 
-	keyEventManager, err := common.NewKeyEventManager(opts.RedisClient)
-	if err != nil {
-		return nil, err
-	}
-
 	is := ContainerImageService{
-		builder:         builder,
-		config:          opts.Config,
-		backendRepo:     opts.BackendRepo,
-		containerRepo:   opts.ContainerRepo,
-		keyEventChan:    make(chan common.KeyEvent),
-		keyEventManager: keyEventManager,
+		builder:          builder,
+		config:           opts.Config,
+		backendRepo:      opts.BackendRepo,
+		baseImageDigests: newBaseImageDigestCache(opts.RedisClient),
 	}
 
-	go is.monitorImageContainers(ctx)
-	go is.keyEventManager.ListenForPattern(ctx, common.RedisKeys.ImageBuildContainerTTL("*"), is.keyEventChan)
-	go is.keyEventManager.ListenForPattern(ctx, common.RedisKeys.SchedulerContainerState(types.BuildContainerPrefix+"*"), is.keyEventChan)
+	leases := abstractions.NewContainerLeaseManager(
+		opts.RedisClient,
+		opts.Scheduler,
+		types.BuildContainerPrefix,
+		common.RedisKeys.ImageBuildContainerTTL,
+	)
+	go func() {
+		if err := leases.Run(ctx); err != nil {
+			log.Error().Err(err).Msg("image container lease manager stopped")
+		}
+	}()
 
 	return &is, nil
 }
 
 func (is *ContainerImageService) VerifyImageBuild(ctx context.Context, in *pb.VerifyImageBuildRequest) (*pb.VerifyImageBuildResponse, error) {
-	if in.ImageId != nil && *in.ImageId != "" {
-		exists, err := is.builder.Exists(ctx, *in.ImageId)
-		if err != nil {
-			return nil, err
-		}
-
-		return &pb.VerifyImageBuildResponse{
-			ImageId: *in.ImageId,
-			Exists:  exists,
-			Valid:   true,
-		}, nil
-	}
-
-	imageId, exists, validResult, _, err := is.verifyImage(ctx, in)
+	result, err := is.verifyImage(ctx, in)
 	if err != nil {
 		return nil, err
 	}
 
 	return &pb.VerifyImageBuildResponse{
-		ImageId: imageId,
-		Exists:  exists,
-		Valid:   validResult,
+		ImageId: result.imageID,
+		Exists:  result.exists,
+		Valid:   result.valid,
 	}, nil
 }
 
@@ -124,20 +111,25 @@ func (is *ContainerImageService) BuildImage(in *pb.BuildImageRequest, stream pb.
 		IgnorePython:     in.IgnorePython,
 	}
 
-	imageId, exists, _, buildOptions, err := is.verifyImage(stream.Context(), verifyReq)
+	verifyResult, err := is.verifyImage(stream.Context(), verifyReq)
 	if err != nil {
 		return err
 	}
 
-	if exists {
-		_ = stream.Send(&pb.BuildImageResponse{Msg: "Image already exists\n", Done: false, Success: true, ImageId: imageId})
-		_ = stream.Send(&pb.BuildImageResponse{Msg: "Build completed successfully\n", Done: true, Success: true, ImageId: imageId})
+	if verifyResult.exists {
+		_ = stream.Send(&pb.BuildImageResponse{Msg: "Image already exists\n", Done: false, Success: true, ImageId: verifyResult.imageID})
+		_ = stream.Send(&pb.BuildImageResponse{Msg: "Build completed successfully\n", Done: true, Success: true, ImageId: verifyResult.imageID})
 		return nil
 	}
 
 	clipVersion := is.config.ImageService.ClipVersion
 
 	// Set ExistingImageCreds for credential processing
+	buildOptions := verifyResult.opts
+	if buildOptions == nil {
+		return errors.New("missing image build options")
+	}
+
 	buildOptions.ExistingImageCreds = in.ExistingImageCreds
 	buildOptions.ClipVersion = clipVersion
 
@@ -145,7 +137,7 @@ func (is *ContainerImageService) BuildImage(in *pb.BuildImageRequest, stream pb.
 	if buildOptions.ExistingImageUri != "" && len(buildOptions.ExistingImageCreds) > 0 {
 		baseImageCreds, err := reg.GetRegistryTokenForImage(buildOptions.ExistingImageUri, buildOptions.ExistingImageCreds)
 		if err != nil {
-			log.Error().Err(err).Str("image_id", imageId).Msg("failed to convert credentials to skopeo format")
+			log.Error().Err(err).Str("image_id", verifyResult.imageID).Msg("failed to convert credentials to skopeo format")
 			return err
 		}
 		buildOptions.BaseImageCreds = baseImageCreds
@@ -153,21 +145,17 @@ func (is *ContainerImageService) BuildImage(in *pb.BuildImageRequest, stream pb.
 
 	ctx := stream.Context()
 	outputChan := make(chan common.OutputMsg)
+	buildErrChan := make(chan error, 1)
 
-	go is.builder.Build(ctx, buildOptions, outputChan)
+	go func() {
+		buildErrChan <- is.builder.Build(ctx, buildOptions, outputChan)
+	}()
 
-	var lastMessage common.OutputMsg
-	for o := range outputChan {
-		if err := stream.Send(&pb.BuildImageResponse{Msg: o.Msg, Done: o.Done, Success: o.Success, ImageId: o.ImageId, PythonVersion: o.PythonVersion, Warning: o.Warning}); err != nil {
-			log.Error().Err(err).Msg("failed to complete build")
-			lastMessage = o
-			break
-		}
-
-		if o.Done {
-			lastMessage = o
-			break
-		}
+	lastMessage, err := streamImageBuildOutput(ctx, outputChan, buildErrChan, func(o common.OutputMsg) error {
+		return stream.Send(&pb.BuildImageResponse{Msg: o.Msg, Done: o.Done, Success: o.Success, ImageId: o.ImageId, PythonVersion: o.PythonVersion, Warning: o.Warning})
+	})
+	if err != nil && !lastMessage.Success {
+		return err
 	}
 
 	if !lastMessage.Success {
@@ -190,123 +178,59 @@ func (is *ContainerImageService) BuildImage(in *pb.BuildImageRequest, stream pb.
 	return nil
 }
 
-func (is *ContainerImageService) verifyImage(ctx context.Context, in *pb.VerifyImageBuildRequest) (string, bool, bool, *BuildOpts, error) {
-	var valid bool = true
+func streamImageBuildOutput(ctx context.Context, outputChan <-chan common.OutputMsg, buildErrChan <-chan error, send func(common.OutputMsg) error) (common.OutputMsg, error) {
+	var lastMessage common.OutputMsg
 
-	if in.ImageId != nil && *in.ImageId != "" {
-		exists, err := is.builder.Exists(ctx, *in.ImageId)
+	sendTerminalFailure := func(err error) (common.OutputMsg, error) {
+		msg := "Build failed\n"
 		if err != nil {
-			return "", false, false, nil, err
+			msg = err.Error() + "\n"
 		}
-		return *in.ImageId, exists, true, nil, nil
-	}
 
-	tag := in.PythonVersion
-	if in.PythonVersion == types.Python3.String() {
-		tag = is.config.ImageService.PythonVersion
-	}
+		lastMessage = common.OutputMsg{
+			Msg:     msg,
+			Done:    true,
+			Success: false,
+		}
+		if sendErr := send(lastMessage); sendErr != nil {
+			log.Error().Err(sendErr).Msg("failed to complete build")
+			return lastMessage, sendErr
+		}
 
-	baseImageTag, ok := is.config.ImageService.Runner.Tags[tag]
-	if !ok {
-		return "", false, false, nil, errors.Errorf("Python version not supported: %s", in.PythonVersion)
-	}
-
-	authInfo, _ := auth.AuthInfoFromContext(ctx)
-	buildSecrets, err := is.retrieveBuildSecrets(ctx, in.Secrets, authInfo)
-	if err != nil {
-		return "", false, false, nil, err
-	}
-
-	opts := &BuildOpts{
-		PythonVersion:  in.PythonVersion,
-		PythonPackages: in.PythonPackages,
-		Commands:       in.Commands,
-		BuildSteps:     convertBuildSteps(in.BuildSteps),
-		EnvVars:        in.EnvVars,
-		Dockerfile:     in.Dockerfile,
-		BuildCtxObject: in.BuildCtxObject,
-		BuildSecrets:   buildSecrets,
-		Gpu:            in.Gpu,
-		ClipVersion:    is.config.ImageService.ClipVersion,
-	}
-
-	// Only set default beta9 base image if not using a custom Dockerfile
-	// Custom Dockerfiles specify their own base image in the FROM instruction
-	if in.Dockerfile == "" {
-		opts.BaseImageTag = baseImageTag
-		opts.BaseImageName = is.config.ImageService.Runner.BaseImageName
-		opts.BaseImageRegistry = is.config.ImageService.Runner.BaseImageRegistry
-	}
-
-	if in.IgnorePython {
-		opts.IgnorePython = true
-	}
-
-	// Handle custom base image (from Image.from_registry or base_image parameter)
-	// Parse and set base image fields for image ID calculation
-	// but DON'T process credentials yet (not available in VerifyImageBuildRequest)
-	if in.ExistingImageUri != "" {
-		opts.ExistingImageUri = in.ExistingImageUri
-
-		// Extract and set base image fields needed for image ID calculation
-		baseImage, err := ExtractImageNameAndTag(opts.ExistingImageUri)
 		if err != nil {
-			return "", false, false, nil, err
+			return lastMessage, err
 		}
-		opts.BaseImageRegistry = baseImage.Registry
-		opts.BaseImageName = baseImage.Repo
-		opts.BaseImageTag = baseImage.Tag
-		opts.BaseImageDigest = baseImage.Digest
+		return lastMessage, errors.New("build failed")
 	}
 
-	// Add base Python requirements to PythonPackages list
-	// These are merged with user-specified packages in the build process
-	if in.Dockerfile != "" {
-		opts.addPythonRequirements()
-	}
+	for {
+		select {
+		case o := <-outputChan:
+			lastMessage = o
+			if err := send(o); err != nil {
+				log.Error().Err(err).Msg("failed to complete build")
+				return lastMessage, err
+			}
 
-	// For V2 builds, render or augment Dockerfile BEFORE calculating image ID
-	// This ensures the image ID matches what will actually be built
-	isV2 := is.config.ImageService.ClipVersion == uint32(types.ClipVersion2)
-	if isV2 {
-		if opts.Dockerfile == "" {
-			// No custom Dockerfile: generate one from build options
-			if is.builder.hasWorkToDo(opts) {
-				opts.Dockerfile, err = is.builder.RenderV2Dockerfile(opts)
-				if err != nil {
-					return "", false, false, nil, err
+			if o.Done {
+				select {
+				case err := <-buildErrChan:
+					return lastMessage, err
+				case <-ctx.Done():
+					return lastMessage, ctx.Err()
 				}
 			}
-		} else if is.builder.hasWorkToDo(opts) {
-			// Custom Dockerfile with additional steps: append them
-			opts.Dockerfile = is.builder.appendToDockerfile(opts)
+
+		case err := <-buildErrChan:
+			if lastMessage.Done {
+				return lastMessage, err
+			}
+			return sendTerminalFailure(err)
+
+		case <-ctx.Done():
+			return lastMessage, ctx.Err()
 		}
 	}
-
-	imageId, err := getImageID(opts)
-	if err != nil {
-		valid = false
-	}
-
-	// Check registry for physical existence
-	exists, err := is.builder.Exists(ctx, imageId)
-	if err != nil {
-		return "", false, false, nil, err
-	}
-
-	// Also check database to ensure image metadata is persisted
-	// This prevents duplicate builds when registry has the file but DB record is missing
-	_, err = is.backendRepo.GetImageClipVersion(ctx, imageId)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			// Image not in database - needs to be built/recorded
-			exists = false
-		} else {
-			return "", false, false, nil, err
-		}
-	}
-
-	return imageId, exists, valid, opts, nil
 }
 
 func (is *ContainerImageService) retrieveBuildSecrets(ctx context.Context, secrets []string, authInfo *auth.AuthInfo) ([]string, error) {
@@ -317,44 +241,17 @@ func (is *ContainerImageService) retrieveBuildSecrets(ctx context.Context, secre
 			return nil, err
 		}
 
+		// The repository query does not guarantee row order. Canonicalize it so
+		// repeated builds render the same Dockerfile and resolve to the same image.
+		sort.Slice(secrets, func(i, j int) bool {
+			return secrets[i].Name < secrets[j].Name
+		})
+
 		for _, secret := range secrets {
 			buildSecrets = append(buildSecrets, fmt.Sprintf("%s=%s", secret.Name, secret.Value))
 		}
 	}
 	return buildSecrets, nil
-}
-
-func (is *ContainerImageService) monitorImageContainers(ctx context.Context) {
-	for {
-		select {
-		case event := <-is.keyEventChan:
-			switch event.Operation {
-			case common.KeyOperationSet:
-				if strings.Contains(event.Key, common.RedisKeys.SchedulerContainerState("")) {
-					containerId := strings.TrimPrefix(is.keyEventManager.TrimKeyspacePrefix(event.Key), common.RedisKeys.SchedulerContainerState(""))
-
-					if !is.containerRepo.HasBuildContainerTTL(containerId) {
-						is.builder.scheduler.Stop(&types.StopContainerArgs{
-							ContainerId: containerId,
-							Force:       true,
-							Reason:      types.StopContainerReasonTtl,
-						})
-					}
-				}
-			case common.KeyOperationExpired:
-				if strings.Contains(event.Key, common.RedisKeys.ImageBuildContainerTTL("")) {
-					containerId := strings.TrimPrefix(is.keyEventManager.TrimKeyspacePrefix(event.Key), common.RedisKeys.ImageBuildContainerTTL(""))
-					is.builder.scheduler.Stop(&types.StopContainerArgs{
-						ContainerId: containerId,
-						Force:       true,
-						Reason:      types.StopContainerReasonTtl,
-					})
-				}
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
 }
 
 func convertBuildSteps(buildSteps []*pb.BuildStep) []BuildStep {

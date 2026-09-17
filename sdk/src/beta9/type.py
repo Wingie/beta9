@@ -1,6 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Literal, Type, Union
+from typing import Dict, List, Literal, Optional, Type, Union
 
 
 class LifeCycleMethod(str, Enum):
@@ -94,13 +94,33 @@ class GpuType(str, Enum):
     Any = "any"
     T4 = "T4"
     L4 = "L4"
+    L40 = "L40"
+    A10 = "A10"
     A10G = "A10G"
+    A100 = "A100"
     A100_40 = "A100-40"
     A100_80 = "A100-80"
+    A16 = "A16"
+    A30 = "A30"
+    A40 = "A40"
     H100 = "H100"
+    H200 = "H200"
+    GH200 = "GH200"
+    B200 = "B200"
+    B300 = "B300"
+    GAUDI2 = "GAUDI2"
+    A4000 = "A4000"
+    A5000 = "A5000"
     A6000 = "A6000"
+    RTX4000Ada = "RTX4000Ada"
     RTX4090 = "RTX4090"
+    RTX5090 = "RTX5090"
+    RTX6000 = "RTX6000"
+    RTX6000Ada = "RTX6000Ada"
+    RTXPro6000 = "RTXPro6000"
     L40S = "L40S"
+    V100 = "V100"
+    V100_32 = "V100-32"
 
 
 # Add GpuType str literals. Must copy/paste for now.
@@ -110,22 +130,167 @@ GpuTypeLiteral = Literal[
     "any",
     "T4",
     "L4",
+    "L40",
+    "A10",
     "A10G",
+    "A100",
     "A100-40",
     "A100-80",
+    "A16",
+    "A30",
+    "A40",
     "H100",
+    "H200",
+    "GH200",
+    "B200",
+    "B300",
+    "GAUDI2",
+    "A4000",
+    "A5000",
     "A6000",
+    "RTX4000Ada",
     "RTX4090",
+    "RTX5090",
+    "RTX6000",
+    "RTX6000Ada",
+    "RTXPro6000",
     "L40S",
+    "V100",
+    "V100-32",
 ]
 
 GpuTypeAlias = Union[GpuType, GpuTypeLiteral]
 
 
+def normalize_gpu_type(gpu: GpuTypeAlias) -> str:
+    if isinstance(gpu, GpuType):
+        return gpu.value
+
+    value = str(gpu).strip()
+    key = "".join(ch for ch in value.upper() if ch.isalnum())
+    for word in ["NVIDIA", "GEFORCE", "TESLA", "QUADRO"]:
+        key = key.replace(word, "")
+
+    if key in ["", "0"]:
+        return ""
+    if key == "ANY":
+        return GpuType.Any.value
+    if "A100" in key and "80G" in key:
+        return GpuType.A100_80.value
+    if "A100" in key and "40G" in key:
+        return GpuType.A100_40.value
+    for alias, canonical in _GPU_ALIASES:
+        if alias in key:
+            return canonical
+    return value
+
+
+_GPU_ALIASES = [
+    ("RTXPRO6000", GpuType.RTXPro6000.value),
+    ("RTX6000ADA", GpuType.RTX6000Ada.value),
+    ("RTX4000ADA", GpuType.RTX4000Ada.value),
+    ("RTX6000", GpuType.RTX6000.value),
+    ("RTX5090", GpuType.RTX5090.value),
+    ("RTX4090", GpuType.RTX4090.value),
+    ("V10032G", GpuType.V100_32.value),
+    ("V10032", GpuType.V100_32.value),
+    ("V100", GpuType.V100.value),
+    ("GAUDI2", GpuType.GAUDI2.value),
+    ("GH200", GpuType.GH200.value),
+    ("B300", GpuType.B300.value),
+    ("B200", GpuType.B200.value),
+    ("H200", GpuType.H200.value),
+    ("H100", GpuType.H100.value),
+    ("L40S", GpuType.L40S.value),
+    ("L40", GpuType.L40.value),
+    ("L4", GpuType.L4.value),
+    ("T4", GpuType.T4.value),
+    ("A10080G", GpuType.A100_80.value),
+    ("A10080", GpuType.A100_80.value),
+    ("A10040G", GpuType.A100_40.value),
+    ("A10040", GpuType.A100_40.value),
+    ("A100", GpuType.A100.value),
+    ("A6000", GpuType.A6000.value),
+    ("A5000", GpuType.A5000.value),
+    ("A4000", GpuType.A4000.value),
+    ("A40", GpuType.A40.value),
+    ("A30", GpuType.A30.value),
+    ("A16", GpuType.A16.value),
+    ("A10G", GpuType.A10G.value),
+    ("A10", GpuType.A10.value),
+]
+
+
+@dataclass
+class Pool:
+    name: Optional[str] = None
+    gpu: Optional[Union[GpuTypeAlias, List[GpuTypeAlias]]] = None
+    nodes: Optional[int] = None
+    ttl: Optional[str] = None
+    max_spend: Optional[float] = None
+    providers: Optional[List[str]] = None
+    regions: Optional[List[str]] = None
+    min_reliability: Optional[float] = None
+
+    def gpu_values(self) -> List[str]:
+        if self.gpu is None:
+            return []
+        if isinstance(self.gpu, list):
+            return [GpuType(normalize_gpu_type(g)).value for g in self.gpu]
+        if self.gpu == "":
+            return []
+        return [GpuType(normalize_gpu_type(self.gpu)).value]
+
+    def _requires_reservation(self) -> bool:
+        return any(
+            [
+                self.nodes is not None,
+                self.ttl is not None,
+                self.max_spend is not None,
+                bool(self.providers),
+                bool(self.regions),
+                self.min_reliability is not None,
+            ]
+        )
+
+    def validate(self) -> None:
+        if self.nodes is not None and self.nodes <= 0:
+            raise ValueError("Pool.nodes must be greater than 0")
+        if self._requires_reservation():
+            if not self.nodes:
+                raise ValueError("Reserved pools require nodes")
+            if not self.ttl:
+                raise ValueError("Reserved pools require ttl")
+            if not self.max_spend or self.max_spend <= 0:
+                raise ValueError("Reserved pools require max_spend")
+        if self.min_reliability is not None and not 0 <= self.min_reliability <= 1:
+            raise ValueError("Pool.min_reliability must be between 0 and 1")
+
+    def export(self, selector: str = ""):
+        from .clients.gateway import PoolConfig
+
+        self.validate()
+        name = self.name or ""
+        return PoolConfig(
+            name=name,
+            gpu=self.gpu_values(),
+            nodes=self.nodes or 0,
+            ttl=self.ttl or "",
+            max_spend=float(self.max_spend or 0),
+            providers=self.providers or [],
+            regions=self.regions or [],
+            min_reliability=float(self.min_reliability or 0),
+            selector=selector or name,
+        )
+
+
 QUEUE_DEPTH_AUTOSCALER_TYPE = "queue_depth"
+LLM_TOKEN_PRESSURE_AUTOSCALER_TYPE = "llm_token_pressure"
 DEFAULT_AUTOSCALER_MAX_CONTAINERS = 1
 DEFAULT_AUTOSCALER_TASKS_PER_CONTAINER = 1
 DEFAULT_AUTOSCALER_MIN_CONTAINERS = 0
+LLM_APP_KIND = "llm_model"
+OPENAI_SERVING_PROTOCOL = "openai"
 
 
 @dataclass
@@ -138,6 +303,108 @@ class Autoscaler:
 @dataclass
 class QueueDepthAutoscaler(Autoscaler):
     pass
+
+
+@dataclass
+class LLMTokenPressureAutoscaler(Autoscaler):
+    pass
+
+
+@dataclass
+class LLMConfig:
+    model_id: str = ""
+    engine: str = ""
+    served_model_name: str = ""
+    context_length: int = 0
+    tokenizer: str = ""
+    metrics_path: str = ""
+    slo_tier: str = ""
+
+
+@dataclass
+class DatabaseServingConfig:
+    kind: str
+    port: int
+    readiness_probe: str
+    connection_env_name: str
+    credential_secret_names: List[str] = field(default_factory=list)
+    durability_mode: str = "strict"
+    username_secret_name: str = ""
+    password_secret_name: str = ""
+    database_secret_name: str = ""
+    connection_url_secret_name: str = ""
+
+
+@dataclass
+class DurableDisk:
+    name: str
+    size: str
+    mount_path: str
+    filesystem: str = "ext4"
+    driver: str = ""
+    read_only: bool = False
+
+    def export(self):
+        from .clients.gateway import DurableDisk as DurableDiskProto
+
+        return DurableDiskProto(
+            name=self.name,
+            size=self.size,
+            mount_path=self.mount_path,
+            filesystem=self.filesystem,
+            driver=self.driver,
+            read_only=self.read_only,
+        )
+
+
+@dataclass
+class ServingConfig:
+    app_kind: str = ""
+    serving_protocol: str = ""
+    llm: Optional[LLMConfig] = None
+    database: Optional[DatabaseServingConfig] = None
+
+    @classmethod
+    def from_options(
+        cls,
+        *,
+        app_kind: str = "",
+        serving_protocol: str = "",
+        llm: Optional[LLMConfig] = None,
+        serving: Optional["ServingConfig"] = None,
+    ) -> "ServingConfig":
+        config = serving or cls(
+            app_kind=app_kind, serving_protocol=serving_protocol, llm=llm
+        )
+        return config.normalize()
+
+    def normalize(self) -> "ServingConfig":
+        self.app_kind = self.app_kind or ""
+        self.serving_protocol = self.serving_protocol or ""
+        if self.llm:
+            self.app_kind = self.app_kind or LLM_APP_KIND
+            self.serving_protocol = self.serving_protocol or OPENAI_SERVING_PROTOCOL
+        if self.database:
+            self.app_kind = self.app_kind or "database"
+            self.serving_protocol = self.serving_protocol or self.database.kind
+        return self
+
+    def is_empty(self) -> bool:
+        return not (self.app_kind or self.serving_protocol or self.llm or self.database)
+
+    def uses_token_pressure_autoscaling(self) -> bool:
+        return bool(self.llm and self.serving_protocol == OPENAI_SERVING_PROTOCOL)
+
+    def autoscaler_for_replicas(
+        self, *, min_containers: int, max_containers: int
+    ) -> Optional[Autoscaler]:
+        if not self.uses_token_pressure_autoscaling():
+            return None
+
+        return LLMTokenPressureAutoscaler(
+            min_containers=min_containers,
+            max_containers=max_containers,
+        )
 
 
 @dataclass
@@ -176,4 +443,5 @@ class PricingPolicy:
 
 _AUTOSCALER_TYPES: Dict[Type[Autoscaler], str] = {
     QueueDepthAutoscaler: QUEUE_DEPTH_AUTOSCALER_TYPE,
+    LLMTokenPressureAutoscaler: LLM_TOKEN_PRESSURE_AUTOSCALER_TYPE,
 }

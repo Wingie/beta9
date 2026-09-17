@@ -6,20 +6,33 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/beam-cloud/beta9/pkg/types"
 )
 
 const (
-	testObjectKey = "test-access-object"
+	testObjectKey                  = "test-access-object"
+	storageMultipartUploadPartSize = 64 * 1024 * 1024
+	storageMultipartUploadWorkers  = 8
+	storageStreamingUploadWorkers  = 1
 )
+
+type seekableReaderAt interface {
+	io.Reader
+	io.ReaderAt
+	io.Seeker
+}
 
 type StorageClient struct {
 	s3Client      *s3.Client
@@ -33,6 +46,19 @@ type WorkspaceStorageClient struct {
 }
 
 func NewWorkspaceStorageClient(ctx context.Context, workspaceName string, workspaceStorage *types.WorkspaceStorage) (*WorkspaceStorageClient, error) {
+	return NewWorkspaceStorageClientWithPresignEndpoint(ctx, workspaceName, workspaceStorage, "")
+}
+
+func NewWorkspaceStorageClientWithDefaultPresignEndpoint(ctx context.Context, workspaceName string, workspaceStorage *types.WorkspaceStorage, storageConfig types.WorkspaceStorageConfig) (*WorkspaceStorageClient, error) {
+	return NewWorkspaceStorageClientWithPresignEndpoint(
+		ctx,
+		workspaceName,
+		workspaceStorage,
+		WorkspacePresignEndpointForDefaultStorage(workspaceStorage, storageConfig),
+	)
+}
+
+func NewWorkspaceStorageClientWithPresignEndpoint(ctx context.Context, workspaceName string, workspaceStorage *types.WorkspaceStorage, presignEndpointUrl string) (*WorkspaceStorageClient, error) {
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(*workspaceStorage.Region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
@@ -45,13 +71,13 @@ func NewWorkspaceStorageClient(ctx context.Context, workspaceName string, worksp
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	// If a custom endpoint is provided, use it
+	endpointUrl := ""
 	if workspaceStorage.EndpointUrl != nil {
-		cfg.BaseEndpoint = aws.String(*workspaceStorage.EndpointUrl)
+		endpointUrl = *workspaceStorage.EndpointUrl
 	}
 
-	s3Client := s3.NewFromConfig(cfg)
-	presignClient := s3.NewPresignClient(s3Client)
+	s3Client := newS3Client(cfg, endpointUrl)
+	presignClient := s3.NewPresignClient(newS3Client(cfg, presignEndpointForStorage(endpointUrl, presignEndpointUrl)))
 
 	return &WorkspaceStorageClient{
 		WorkspaceName:    workspaceName,
@@ -77,10 +103,14 @@ func NewDefaultStorageClient(ctx context.Context, cfg types.AppConfig) (*Storage
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	s3Client := s3.NewFromConfig(s3Cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(cfg.Storage.WorkspaceStorage.DefaultEndpointUrl)
-	})
-	presignClient := s3.NewPresignClient(s3Client)
+	s3Client := newS3Client(s3Cfg, cfg.Storage.WorkspaceStorage.DefaultEndpointUrl)
+	presignClient := s3.NewPresignClient(newS3Client(
+		s3Cfg,
+		presignEndpointForStorage(
+			cfg.Storage.WorkspaceStorage.DefaultEndpointUrl,
+			cfg.Storage.WorkspaceStorage.DefaultPresignedEndpointUrl,
+		),
+	))
 
 	return &StorageClient{
 		s3Client:      s3Client,
@@ -88,11 +118,191 @@ func NewDefaultStorageClient(ctx context.Context, cfg types.AppConfig) (*Storage
 	}, nil
 }
 
+func newS3Client(cfg aws.Config, endpointUrl string) *s3.Client {
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if endpointUrl != "" {
+			o.BaseEndpoint = aws.String(endpointUrl)
+			o.UsePathStyle = true
+		}
+	})
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func presignEndpointForStorage(storageEndpointUrl, presignEndpointUrl string) string {
+	return firstNonEmpty(presignEndpointOverride(storageEndpointUrl, presignEndpointUrl), storageEndpointUrl)
+}
+
+func WorkspacePresignEndpointForDefaultStorage(workspaceStorage *types.WorkspaceStorage, storageConfig types.WorkspaceStorageConfig) string {
+	if workspaceStorage == nil || workspaceStorage.EndpointUrl == nil {
+		return ""
+	}
+
+	if storageConfig.DefaultPresignedEndpointUrl == "" {
+		return ""
+	}
+
+	if !sameStorageEndpoint(*workspaceStorage.EndpointUrl, storageConfig.DefaultEndpointUrl) {
+		return ""
+	}
+
+	return storageConfig.DefaultPresignedEndpointUrl
+}
+
+func sameStorageEndpoint(a, b string) bool {
+	a = strings.TrimRight(strings.TrimSpace(a), "/")
+	b = strings.TrimRight(strings.TrimSpace(b), "/")
+	if a == "" || b == "" {
+		return a == b
+	}
+	if a == b {
+		return true
+	}
+
+	aURL, aErr := url.Parse(a)
+	bURL, bErr := url.Parse(b)
+	if aErr != nil || bErr != nil {
+		return false
+	}
+
+	if !strings.EqualFold(aURL.Scheme, bURL.Scheme) {
+		return false
+	}
+
+	return strings.EqualFold(aURL.Hostname(), bURL.Hostname()) &&
+		effectiveURLPort(aURL) == effectiveURLPort(bURL)
+}
+
+func effectiveURLPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func presignEndpointOverride(storageEndpointUrl, presignEndpointUrl string) string {
+	presignEndpointUrl = strings.TrimSpace(presignEndpointUrl)
+	if presignEndpointUrl == "" {
+		return ""
+	}
+
+	// The default config is LocalStack-friendly, but production configs often
+	// overlay only the storage endpoint. Do not let that inherited loopback
+	// presign endpoint leak into remote buckets.
+	if isLoopbackEndpoint(presignEndpointUrl) && !isLocalS3DevEndpoint(storageEndpointUrl) {
+		return ""
+	}
+
+	return presignEndpointUrl
+}
+
+func isLocalS3DevEndpoint(endpoint string) bool {
+	host := endpointHostname(endpoint)
+	if host == "" {
+		return false
+	}
+
+	return isLoopbackHost(host) || isLocalstackHost(host)
+}
+
+func isLocalstackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "localstack" || strings.HasPrefix(host, "localstack.")
+}
+
+func isLoopbackEndpoint(endpoint string) bool {
+	return isLoopbackHost(endpointHostname(endpoint))
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func endpointHostname(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+
+	parsedURL, err := url.Parse(endpoint)
+	if err == nil && parsedURL.Hostname() != "" {
+		return strings.ToLower(parsedURL.Hostname())
+	}
+
+	if !strings.Contains(endpoint, "://") {
+		parsedURL, err = url.Parse("//" + endpoint)
+		if err == nil && parsedURL.Hostname() != "" {
+			return strings.ToLower(parsedURL.Hostname())
+		}
+	}
+
+	return ""
+}
+
 func (c *StorageClient) CreateBucket(ctx context.Context, bucket string) error {
 	_, err := c.s3Client.CreateBucket(ctx, &s3.CreateBucketInput{
 		Bucket: aws.String(bucket),
 	})
 	return err
+}
+
+func (c *StorageClient) EnsureBucket(ctx context.Context, bucket string) error {
+	bucket = strings.TrimSpace(bucket)
+	if bucket == "" {
+		return fmt.Errorf("bucket name is empty")
+	}
+
+	_, err := c.s3Client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(bucket),
+	})
+	if err == nil {
+		return nil
+	}
+
+	_, err = c.s3Client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+	})
+	if err == nil || isBucketAlreadyCreatedError(err) {
+		return nil
+	}
+
+	return err
+}
+
+func isBucketAlreadyCreatedError(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+
+	switch apiErr.ErrorCode() {
+	case "BucketAlreadyExists", "BucketAlreadyOwnedByYou":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *StorageClient) S3Client() *s3.Client {
@@ -113,12 +323,34 @@ func (c *StorageClient) UploadToBucket(ctx context.Context, key string, data []b
 }
 
 func (c *StorageClient) UploadToBucketWithReader(ctx context.Context, key string, data io.Reader, bucket string) error {
-	_, err := c.s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-		Body:   data,
+	return c.UploadToBucketWithReaderAndMetadata(ctx, key, data, bucket, nil)
+}
+
+// UploadToBucketWithReaderAndMetadata is UploadToBucketWithReader with user
+// metadata attached to the object.
+func (c *StorageClient) UploadToBucketWithReaderAndMetadata(ctx context.Context, key string, data io.Reader, bucket string, metadata map[string]string) error {
+	uploader := newStorageMultipartUploader(c.s3Client, data)
+	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket:   aws.String(bucket),
+		Key:      aws.String(key),
+		Body:     data,
+		Metadata: metadata,
 	})
 	return err
+}
+
+func newStorageMultipartUploader(client *s3.Client, body io.Reader) *manager.Uploader {
+	return manager.NewUploader(client, func(u *manager.Uploader) {
+		u.PartSize = storageMultipartUploadPartSize
+		u.Concurrency = storageMultipartConcurrency(body)
+	})
+}
+
+func storageMultipartConcurrency(body io.Reader) int {
+	if _, ok := body.(seekableReaderAt); ok {
+		return storageMultipartUploadWorkers
+	}
+	return storageStreamingUploadWorkers
 }
 
 func (c *StorageClient) Head(ctx context.Context, key string, bucket string) (bool, *s3.HeadObjectOutput, error) {
@@ -127,6 +359,9 @@ func (c *StorageClient) Head(ctx context.Context, key string, bucket string) (bo
 		Key:    aws.String(key),
 	})
 	if err != nil {
+		if errors.As(err, new(*s3types.NoSuchKey)) || errors.As(err, new(*s3types.NotFound)) {
+			return false, nil, nil
+		}
 		return false, nil, err
 	}
 
@@ -134,21 +369,8 @@ func (c *StorageClient) Head(ctx context.Context, key string, bucket string) (bo
 }
 
 func (c *StorageClient) Exists(ctx context.Context, key string, bucket string) (bool, error) {
-	_, err := c.s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-		Range:  aws.String("bytes=0-0"),
-	})
-
-	if err != nil {
-		if errors.As(err, new(*s3types.NoSuchKey)) || errors.As(err, new(*s3types.NotFound)) {
-			return false, nil
-		}
-
-		return false, err
-	}
-
-	return true, nil
+	exists, _, err := c.Head(ctx, key, bucket)
+	return exists, err
 }
 
 func (c *StorageClient) Download(ctx context.Context, key string, bucket string) ([]byte, error) {
@@ -222,15 +444,33 @@ func (c *StorageClient) ListDirectory(ctx context.Context, dir string, bucket st
 }
 
 func (c *StorageClient) GeneratePresignedPutURL(ctx context.Context, key string, expiresInSeconds int64, bucket string) (string, error) {
-	result, err := c.presignClient.PresignPutObject(ctx, &s3.PutObjectInput{
+	result, _, err := c.GeneratePresignedPutURLWithMetadata(ctx, key, expiresInSeconds, bucket, nil)
+	return result, err
+}
+
+func (c *StorageClient) GeneratePresignedPutURLWithMetadata(ctx context.Context, key string, expiresInSeconds int64, bucket string, metadata map[string]string) (string, map[string]string, error) {
+	input := &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-	}, s3.WithPresignExpires(time.Duration(expiresInSeconds)*time.Second))
-	if err != nil {
-		return "", fmt.Errorf("failed to generate presigned URL: %w", err)
+	}
+	if len(metadata) > 0 {
+		input.Metadata = metadata
 	}
 
-	return result.URL, nil
+	result, err := c.presignClient.PresignPutObject(ctx, input, s3.WithPresignExpires(time.Duration(expiresInSeconds)*time.Second))
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to generate presigned URL: %w", err)
+	}
+
+	headers := make(map[string]string)
+	for key, values := range result.SignedHeader {
+		if strings.EqualFold(key, "host") || len(values) == 0 {
+			continue
+		}
+		headers[key] = values[0]
+	}
+
+	return result.URL, headers, nil
 }
 
 func (c *StorageClient) GeneratePresignedGetURL(ctx context.Context, key string, expiresInSeconds int64, bucket string) (string, error) {
@@ -394,12 +634,28 @@ func (c *WorkspaceStorageClient) BucketName() string {
 	return *c.WorkspaceStorage.BucketName
 }
 
+func (c *WorkspaceStorageClient) EnsureLocalBucket(ctx context.Context) error {
+	endpointUrl := ""
+	if c.WorkspaceStorage.EndpointUrl != nil {
+		endpointUrl = *c.WorkspaceStorage.EndpointUrl
+	}
+	if !isLocalS3DevEndpoint(endpointUrl) {
+		return nil
+	}
+
+	return c.StorageClient.EnsureBucket(ctx, c.BucketName())
+}
+
 func (c *WorkspaceStorageClient) Upload(ctx context.Context, key string, data []byte) error {
 	return c.StorageClient.UploadToBucket(ctx, key, data, *c.WorkspaceStorage.BucketName)
 }
 
 func (c *WorkspaceStorageClient) UploadWithReader(ctx context.Context, key string, data io.Reader) error {
 	return c.StorageClient.UploadToBucketWithReader(ctx, key, data, *c.WorkspaceStorage.BucketName)
+}
+
+func (c *WorkspaceStorageClient) UploadWithReaderAndMetadata(ctx context.Context, key string, data io.Reader, metadata map[string]string) error {
+	return c.StorageClient.UploadToBucketWithReaderAndMetadata(ctx, key, data, *c.WorkspaceStorage.BucketName, metadata)
 }
 
 func (c *WorkspaceStorageClient) Head(ctx context.Context, key string) (bool, *s3.HeadObjectOutput, error) {
@@ -428,6 +684,10 @@ func (c *WorkspaceStorageClient) ListDirectory(ctx context.Context, dir string) 
 
 func (c *WorkspaceStorageClient) GeneratePresignedPutURL(ctx context.Context, key string, expiresInSeconds int64) (string, error) {
 	return c.StorageClient.GeneratePresignedPutURL(ctx, key, expiresInSeconds, *c.WorkspaceStorage.BucketName)
+}
+
+func (c *WorkspaceStorageClient) GeneratePresignedPutURLWithMetadata(ctx context.Context, key string, expiresInSeconds int64, metadata map[string]string) (string, map[string]string, error) {
+	return c.StorageClient.GeneratePresignedPutURLWithMetadata(ctx, key, expiresInSeconds, *c.WorkspaceStorage.BucketName, metadata)
 }
 
 func (c *WorkspaceStorageClient) GeneratePresignedGetURL(ctx context.Context, key string, expiresInSeconds int64) (string, error) {

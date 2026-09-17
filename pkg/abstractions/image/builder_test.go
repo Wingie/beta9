@@ -1,6 +1,7 @@
 package image
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -150,7 +151,7 @@ func TestGeneratePipInstallCommand(t *testing.T) {
 			opts: &BuildOpts{
 				PythonPackages: []string{"--extra-index-url https://download.pytorch.org/whl/cu121", "numpy==1.18", "scipy>1.4", "pandas>=1.0,<2.0", "matplotlib<=2.2", "seaborn"},
 			},
-			want: `uv-b9 pip install --system --extra-index-url https://download.pytorch.org/whl/cu121 "numpy==1.18" "scipy>1.4" "pandas>=1.0,<2.0" "matplotlib<=2.2" "seaborn"`,
+			want: `uv-b9 pip install --compile-bytecode --system --extra-index-url https://download.pytorch.org/whl/cu121 "numpy==1.18" "scipy>1.4" "pandas>=1.0,<2.0" "matplotlib<=2.2" "seaborn"`,
 		},
 	}
 
@@ -181,7 +182,7 @@ func TestParseBuildSteps(t *testing.T) {
 				{Type: pipCommandType, Command: "numpy"},
 				{Type: pipCommandType, Command: "pandas"},
 			},
-			want: []string{"uv-b9 pip install --system \"numpy\" \"pandas\""},
+			want: []string{"uv-b9 pip install --compile-bytecode --system \"numpy\" \"pandas\""},
 		},
 		{
 			steps: []BuildStep{
@@ -197,7 +198,7 @@ func TestParseBuildSteps(t *testing.T) {
 				{Type: micromambaCommandType, Command: "torch"},
 				{Type: shellCommandType, Command: "echo 'end'"},
 			},
-			want: []string{"echo 'start'", "uv-b9 pip install --system \"numpy\"", "micromamba install -y -n beta9 \"torch\"", "echo 'end'"},
+			want: []string{"echo 'start'", "uv-b9 pip install --compile-bytecode --system \"numpy\"", "micromamba install -y -n beta9 \"torch\"", "echo 'end'"},
 		},
 		{
 			steps: []BuildStep{
@@ -207,7 +208,7 @@ func TestParseBuildSteps(t *testing.T) {
 				{Type: micromambaCommandType, Command: "torch"},
 				{Type: micromambaCommandType, Command: "vllm"},
 			},
-			want: []string{"echo 'hello'", "uv-b9 pip install --system \"numpy\" \"pandas\"", "micromamba install -y -n beta9 \"torch\" \"vllm\""},
+			want: []string{"echo 'hello'", "uv-b9 pip install --compile-bytecode --system \"numpy\" \"pandas\"", "micromamba install -y -n beta9 \"torch\" \"vllm\""},
 		},
 		{
 			steps: []BuildStep{
@@ -219,7 +220,7 @@ func TestParseBuildSteps(t *testing.T) {
 				{Type: shellCommandType, Command: "apt install -y ffmpeg"},
 				{Type: micromambaCommandType, Command: "ffmpeg"},
 			},
-			want: []string{"echo 'hello'", "uv-b9 pip install --system \"numpy\" \"pandas\"", "micromamba install -y -n beta9 \"torch\" \"vllm\"", "apt install -y ffmpeg", "micromamba install -y -n beta9 \"ffmpeg\""},
+			want: []string{"echo 'hello'", "uv-b9 pip install --compile-bytecode --system \"numpy\" \"pandas\"", "micromamba install -y -n beta9 \"torch\" \"vllm\"", "apt install -y ffmpeg", "micromamba install -y -n beta9 \"ffmpeg\""},
 		},
 		{
 			steps: []BuildStep{
@@ -229,8 +230,8 @@ func TestParseBuildSteps(t *testing.T) {
 			},
 			want: []string{
 				"micromamba install -y -n beta9 \"torch\"",
-				"uv-b9 pip install --system \"unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git\"",
-				"uv-b9 pip install --system --no-deps trl peft accelerate bitsandbytes",
+				"uv-b9 pip install --compile-bytecode --system \"unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git\"",
+				"uv-b9 pip install --compile-bytecode --system --no-deps trl peft accelerate bitsandbytes",
 			},
 		},
 		{
@@ -241,8 +242,8 @@ func TestParseBuildSteps(t *testing.T) {
 			},
 			want: []string{
 				"micromamba install -y -n beta9 \"torch\"",
-				"uv-b9 pip install --system --no-deps trl peft accelerate bitsandbytes",
-				"uv-b9 pip install --system \"unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git\"",
+				"uv-b9 pip install --compile-bytecode --system --no-deps trl peft accelerate bitsandbytes",
+				"uv-b9 pip install --compile-bytecode --system \"unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git\"",
 			},
 		},
 		{
@@ -254,8 +255,8 @@ func TestParseBuildSteps(t *testing.T) {
 			},
 			want: []string{
 				"micromamba install -y -n beta9 -c pytorch \"pytorch-cuda=12.1\"",
-				"uv-b9 pip install --system --no-deps trl peft accelerate bitsandbytes",
-				"uv-b9 pip install --system \"unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git\"",
+				"uv-b9 pip install --compile-bytecode --system --no-deps trl peft accelerate bitsandbytes",
+				"uv-b9 pip install --compile-bytecode --system \"unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git\"",
 			},
 		},
 	}
@@ -264,4 +265,35 @@ func TestParseBuildSteps(t *testing.T) {
 		got := parseBuildSteps(tc.steps, "micromamba3.10", false)
 		assert.Equal(t, tc.want, got)
 	}
+}
+
+func TestRenderEnvVarsOnOneLine(t *testing.T) {
+	var sb strings.Builder
+	renderEnvVarsAndSecrets(&sb, &BuildOpts{
+		EnvVars: []string{"A=1", "", "PATH=/usr/local/bin:$PATH", `MSG=hello "world"`, "BARE"},
+	})
+	assert.Equal(t, "ENV A=1 PATH=/usr/local/bin:$PATH MSG=\"hello \\\"world\\\"\" BARE\n", sb.String())
+}
+
+func TestRenderEnvVarsSplitsInstructionAtDependency(t *testing.T) {
+	var sb strings.Builder
+	renderEnvVarsAndSecrets(&sb, &BuildOpts{
+		EnvVars: []string{"A=1", "B=$A", "C=${A}-x", "D=2", "E=${B:-fallback}", "F=$E"},
+	})
+	assert.Equal(t, "ENV A=1\nENV B=$A C=${A}-x D=2\nENV E=${B:-fallback}\nENV F=$E\n", sb.String())
+
+	// `\$A` is a literal dollar sign, not a reference, quoted or not; `\\$A`
+	// is an escaped backslash followed by a live reference.
+	sb.Reset()
+	renderEnvVarsAndSecrets(&sb, &BuildOpts{EnvVars: []string{"A=1", `B=\$A`, `C=\\$A`, `D=it's "x" \$A`}})
+	assert.Equal(t, "ENV A=1 B=\\$A\nENV C=\\\\$A D=\"it's \\\"x\\\" \\$A\"\n", sb.String())
+}
+
+func TestQuoteDockerfileValueKeepsAuthoredEscapes(t *testing.T) {
+	assert.Equal(t, `plain$VAR`, quoteDockerfileValue(`plain$VAR`))
+	assert.Equal(t, `C:\path`, quoteDockerfileValue(`C:\path`))
+	assert.Equal(t, `"two words"`, quoteDockerfileValue(`two words`))
+	assert.Equal(t, `"say \"hi\""`, quoteDockerfileValue(`say "hi"`))
+	assert.Equal(t, `"already \"escaped\" \$LITERAL"`, quoteDockerfileValue(`already \"escaped\" \$LITERAL`))
+	assert.Equal(t, `"escaped backslash \\ then quote \""`, quoteDockerfileValue(`escaped backslash \\ then quote "`))
 }

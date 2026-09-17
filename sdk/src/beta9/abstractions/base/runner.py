@@ -1,6 +1,8 @@
 import inspect
 import json
+import math
 import os
+import re
 import threading
 from typing import Callable, Dict, List, Optional, Union
 
@@ -13,12 +15,15 @@ from ...abstractions.volume import Volume
 from ...client.client import Client
 from ...clients.gateway import Autoscaler as AutoscalerProto
 from ...clients.gateway import (
+    DatabaseServingConfig as DatabaseServingConfigProto,
     GatewayServiceStub,
     GetOrCreateStubRequest,
     GetOrCreateStubResponse,
     GetUrlRequest,
     GetUrlResponse,
+    LlmConfig as LLMConfigProto,
     SecretVar,
+    ServingConfig as ServingConfigProto,
 )
 from ...clients.gateway import (
     Schema as SchemaProto,
@@ -28,6 +33,7 @@ from ...clients.gateway import (
 )
 from ...clients.gateway import TaskPolicy as TaskPolicyProto
 from ...clients.shell import ShellServiceStub
+from ...clients.types import CheckpointTrigger
 from ...clients.types import PricingPolicy as PricingPolicyProto
 from ...config import ConfigContext, SDKSettings, get_config_context, get_settings
 from ...env import called_on_import, is_notebook_env
@@ -36,13 +42,20 @@ from ...sync import FileSyncer
 from ...type import (
     _AUTOSCALER_TYPES,
     Autoscaler,
+    DurableDisk,
     GpuType,
     GpuTypeAlias,
+    LLMConfig,
+    Pool,
     PricingPolicy,
     QueueDepthAutoscaler,
+    ServingConfig,
     TaskPolicy,
+    normalize_gpu_type,
 )
 from ...utils import TempFile
+from .capacity import credit_error_hint, handle_capacity_verdict
+from .utils import sdk_timing, timed_lock
 
 CONTAINER_STUB_TYPE = "container"
 FUNCTION_STUB_TYPE = "function"
@@ -70,19 +83,22 @@ POD_DEPLOYMENT_STUB_TYPE = "pod/deployment"
 POD_RUN_STUB_TYPE = "pod/run"
 SANDBOX_STUB_TYPE = "sandbox"
 
+# Sentinel error message for prepare_runtime failures. prepare_runtime prints
+# the specific reason itself, so callers seeing this message should not print
+# another generic error on top of it.
+RUNTIME_PREPARE_FAILED_MSG = "Failed to prepare runtime"
+
 _stub_creation_lock = threading.Lock()
 _stub_created_for_workspace = False
 
 
-def _is_stub_created_for_workspace() -> bool:
-    global _stub_created_for_workspace
-    _stub_created_for_workspace = False
+def _stub_created_for_current_workspace() -> bool:
     return _stub_created_for_workspace
 
 
-def _set_stub_created_for_workspace(value: bool) -> None:
+def _mark_stub_created_for_workspace() -> None:
     global _stub_created_for_workspace
-    _stub_created_for_workspace = value
+    _stub_created_for_workspace = True
 
 
 class RunnerAbstraction(BaseAbstraction):
@@ -96,7 +112,7 @@ class RunnerAbstraction(BaseAbstraction):
         image: Image = Image(),
         workers: int = 1,
         concurrent_requests: int = 1,
-        keep_warm_seconds: float = 10.0,
+        keep_warm_seconds: float = 0.0,
         max_pending_tasks: int = 100,
         retries: int = 3,
         timeout: int = 3600,
@@ -120,6 +136,17 @@ class RunnerAbstraction(BaseAbstraction):
         block_network: bool = False,
         allow_list: Optional[List[str]] = None,
         docker_enabled: bool = False,
+        allow_marketplace: bool = False,
+        pool: Optional[Union[str, Pool]] = None,
+        app_kind: str = "",
+        serving_protocol: str = "",
+        llm: Optional[LLMConfig] = None,
+        serving: Optional[ServingConfig] = None,
+        disks: Optional[List[DurableDisk]] = None,
+        checkpoint_readiness_path: Optional[str] = None,
+        checkpoint_readiness_port: Optional[int] = None,
+        checkpoint_readiness_timeout: int = 600,
+        checkpoint_readiness_interval: int = 1,
     ) -> None:
         super().__init__()
 
@@ -138,6 +165,7 @@ class RunnerAbstraction(BaseAbstraction):
         self.files_synced: bool = False
         self.stub_created: bool = False
         self.runtime_ready: bool = False
+        self._runtime_prepare_lock = threading.Lock()
         self.object_id: str = ""
         self.image_id: str = ""
         self.stub_id: str = ""
@@ -149,7 +177,10 @@ class RunnerAbstraction(BaseAbstraction):
         self.memory = self.parse_memory(memory)
         self.gpu = gpu
         self.gpu_count = gpu_count
+        self.pool = pool
+        self.pool_config = self.parse_pool(pool)
         self.volumes = volumes or []
+        self.disks = disks or []
         self.secrets = [SecretVar(name=s) for s in (secrets or [])]
         self.env: List[str] = formatted_env
         self.workers = workers
@@ -163,7 +194,19 @@ class RunnerAbstraction(BaseAbstraction):
             ttl=task_policy.ttl,
         )
         self.checkpoint_enabled = checkpoint_enabled
+        self.checkpoint_readiness_path = checkpoint_readiness_path
+        self.checkpoint_readiness_port = checkpoint_readiness_port
+        self.checkpoint_readiness_timeout = checkpoint_readiness_timeout
+        self.checkpoint_readiness_interval = checkpoint_readiness_interval
         self.docker_enabled = docker_enabled
+        self.allow_marketplace = allow_marketplace
+        self.is_service = False
+        self.serving = ServingConfig.from_options(
+            app_kind=app_kind,
+            serving_protocol=serving_protocol,
+            llm=llm,
+            serving=serving,
+        )
         self.extra: dict = {}
         self.entrypoint: Optional[List[str]] = entrypoint
         self.tcp = tcp
@@ -203,6 +246,66 @@ class RunnerAbstraction(BaseAbstraction):
         self.client = Client(token=self.config_context.token) if self.config_context.token else None
         return self.client
 
+    @property
+    def app_kind(self) -> str:
+        return self.serving.app_kind
+
+    @app_kind.setter
+    def app_kind(self, value: str) -> None:
+        self.serving.app_kind = value or ""
+
+    @property
+    def serving_protocol(self) -> str:
+        return self.serving.serving_protocol
+
+    @serving_protocol.setter
+    def serving_protocol(self, value: str) -> None:
+        self.serving.serving_protocol = value or ""
+
+    @property
+    def llm(self) -> Optional[LLMConfig]:
+        return self.serving.llm
+
+    @llm.setter
+    def llm(self, value: Optional[LLMConfig]) -> None:
+        self.serving.llm = value
+        self.serving.normalize()
+
+    def _serving_config_proto(self) -> Optional[ServingConfigProto]:
+        if not self.serving or self.serving.is_empty():
+            return None
+
+        llm = self.serving.llm
+        return ServingConfigProto(
+            app_kind=self.serving.app_kind,
+            serving_protocol=self.serving.serving_protocol,
+            database=DatabaseServingConfigProto(
+                kind=self.serving.database.kind,
+                port=self.serving.database.port,
+                readiness_probe=self.serving.database.readiness_probe,
+                connection_env_name=self.serving.database.connection_env_name,
+                credential_secret_names=self.serving.database.credential_secret_names,
+                durability_mode=self.serving.database.durability_mode,
+                username_secret_name=self.serving.database.username_secret_name,
+                password_secret_name=self.serving.database.password_secret_name,
+                database_secret_name=self.serving.database.database_secret_name,
+                connection_url_secret_name=self.serving.database.connection_url_secret_name,
+            )
+            if self.serving.database
+            else None,
+            llm=LLMConfigProto(
+                model_id=llm.model_id,
+                engine=llm.engine,
+                served_model_name=llm.served_model_name,
+                context_length=llm.context_length,
+                tokenizer=llm.tokenizer,
+                metrics_path=llm.metrics_path,
+                slo_tier=llm.slo_tier,
+            )
+            if llm
+            else None,
+        )
+
     def print_invocation_snippet(self, url_type: str = "") -> GetUrlResponse:
         """Print curl request to call deployed container URL"""
 
@@ -216,16 +319,24 @@ class RunnerAbstraction(BaseAbstraction):
         if not res.ok:
             return terminal.error("Failed to get invocation URL", exit=False)
 
-        if "<PORT>" in res.url or self.tcp:
+        if "<PORT>" in res.url and not self.ports:
+            # The URL is port-templated but no ports were declared: nothing
+            # is actually exposed, so there is no endpoint to print.
+            return res
+
+        if self.ports or self.tcp:
             terminal.header("Exposed endpoints\n")
 
             if self.tcp:
                 res.url = res.url.replace("http://", "").replace("https://", "")
                 res.url += ":443"
 
-            for port in self.ports:
+            for port in self.ports or [""]:
                 url_text = res.url.replace("<PORT>", str(port))
-                terminal.print(f"\tPort {port}: ", end="")
+                if port:
+                    terminal.print(f"\tPort {port}: ", end="")
+                else:
+                    terminal.print("\t", end="")
                 terminal.url(url_text)
 
             terminal.print("")
@@ -260,19 +371,34 @@ class RunnerAbstraction(BaseAbstraction):
         return res
 
     def parse_memory(self, memory_str: str) -> int:
+        """Parse memory strings into megabytes."""
         if not isinstance(memory_str, str):
             return memory_str
 
-        """Parse memory str (with units) to megabytes."""
-
-        if memory_str.lower().endswith("mi"):
-            return int(memory_str[:-2])
-        elif memory_str.lower().endswith("gb"):
-            return int(memory_str[:-2]) * 1000
-        elif memory_str.lower().endswith("gi"):
-            return int(memory_str[:-2]) * 1024
-        else:
+        memory = memory_str.strip().lower()
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)([a-z]*)", memory)
+        if not match:
             raise ValueError("Unsupported memory format")
+
+        amount = float(match.group(1))
+        unit = match.group(2) or "mb"
+        units = {
+            "m": 1,
+            "mb": 1,
+            "mi": 1,
+            "mib": 1,
+            "g": 1000,
+            "gb": 1000,
+            "gi": 1024,
+            "gib": 1024,
+        }
+        if unit not in units:
+            raise ValueError("Unsupported memory format")
+
+        memory_mb = math.ceil(amount * units[unit])
+        if memory_mb <= 0:
+            raise ValueError("memory must be greater than 0")
+        return memory_mb
 
     @property
     def gateway_stub(self) -> GatewayServiceStub:
@@ -373,9 +499,40 @@ class RunnerAbstraction(BaseAbstraction):
             raise ValueError("Invalid GPU type")
 
         if isinstance(gpu, list):
-            return ",".join([GpuType(g).value for g in gpu])
+            return ",".join([GpuType(normalize_gpu_type(g)).value for g in gpu])
         else:
-            return GpuType(gpu).value
+            return GpuType(normalize_gpu_type(gpu)).value
+
+    def _gpu_values(self, gpu: Union[GpuTypeAlias, List[GpuTypeAlias]]) -> List[str]:
+        if gpu is None or gpu == "":
+            return []
+        if isinstance(gpu, list):
+            return [GpuType(normalize_gpu_type(g)).value for g in gpu]
+        return [GpuType(normalize_gpu_type(gpu)).value]
+
+    def parse_pool(self, pool: Optional[Union[str, Pool]]):
+        if pool is None:
+            return None
+
+        if isinstance(pool, str):
+            if not pool:
+                raise ValueError("Pool name cannot be empty")
+            return Pool(name=pool).export(selector=pool)
+
+        if not isinstance(pool, Pool):
+            raise ValueError("pool must be a string or Pool")
+
+        pool_gpu_values = pool.gpu_values()
+        function_gpu_values = self._gpu_values(self.gpu)
+        if pool_gpu_values:
+            if not function_gpu_values:
+                self.gpu = pool.gpu
+            elif not set(pool_gpu_values).intersection(function_gpu_values):
+                raise ValueError(
+                    "Function GPU requirements are incompatible with pool GPU requirements"
+                )
+
+        return pool.export()
 
     def parse_on_deploy(self, func: Callable):
         if func is None:
@@ -425,144 +582,232 @@ class RunnerAbstraction(BaseAbstraction):
 
         stub_name = f"{stub_type}/{self.handler}" if self.handler else stub_type
 
-        if self.runtime_ready:
+        with sdk_timing("prepare_runtime.total"):
+            with timed_lock(self._runtime_prepare_lock, "prepare_runtime.lock_wait"):
+                if self.runtime_ready:
+                    return True
+
+                tracker = terminal.StepTracker()
+                prepare_steps = [
+                    ("Preparing image", "Image ready", self._prepare_image),
+                    (
+                        "Syncing files",
+                        "Files synced",
+                        lambda: self._sync_runtime_files(ignore_patterns),
+                    ),
+                ]
+                for step_name, done_name, run_step in prepare_steps:
+                    with tracker.step(step_name, done_name) as step:
+                        step.ok = run_step()
+                    if not step.ok:
+                        return False
+
+                if not self._prepare_volumes():
+                    return False
+
+                runtime_config = self._prepare_runtime_config()
+                if runtime_config is None:
+                    return False
+
+                if not self.stub_created:
+                    stub_request = self._stub_request(
+                        stub_type=stub_type,
+                        stub_name=stub_name,
+                        force_create_stub=force_create_stub,
+                        autoscaler_type=runtime_config["autoscaler_type"],
+                        inputs=runtime_config["inputs"],
+                        outputs=runtime_config["outputs"],
+                    )
+
+                    with sdk_timing("prepare_runtime.stub"):
+                        stub_response = self._get_or_create_stub(stub_request)
+
+                    stub_response = handle_capacity_verdict(
+                        self, stub_request, stub_response, stub_type
+                    )
+                    if stub_response is None or not self._apply_stub_response(stub_response):
+                        return False
+
+                self.runtime_ready = True
+                return True
+
+    def _prepare_image(self) -> bool:
+        if self.image_available:
             return True
 
-        if not self.image_available:
+        with sdk_timing("prepare_runtime.image"):
             image_build_result: ImageBuildResult = self.image.build()
 
-            if image_build_result and image_build_result.success:
-                self.image_available = True
-                self.image_id = image_build_result.image_id
-                self.image.python_version = image_build_result.python_version
-            else:
-                terminal.error("Image build failed ❌", exit=False)
-                return False
+        if image_build_result and image_build_result.success:
+            self.image_available = True
+            self.image_id = image_build_result.image_id
+            self.image.python_version = image_build_result.python_version
+            return True
 
-        if not self.files_synced:
+        terminal.error("Image build failed", exit=False)
+        return False
+
+    def _sync_runtime_files(self, ignore_patterns: Optional[List[str]]) -> bool:
+        if self.files_synced:
+            return True
+
+        with sdk_timing("prepare_runtime.files_sync"):
             sync_result = self.syncer.sync(ignore_patterns=ignore_patterns)
             self._remove_tmp_files()
 
-            if sync_result.success:
-                self.files_synced = True
-                self.object_id = sync_result.object_id
-            else:
-                terminal.error("File sync failed", exit=False)
-                return False
+        if sync_result.success:
+            self.files_synced = True
+            self.object_id = sync_result.object_id
+            return True
 
-        for v in self.volumes:
-            if not v.ready and not v.get_or_create():
-                terminal.error(f"Volume is not ready: {v.name}", exit=False)
-                return False
+        terminal.error("File sync failed", exit=False)
+        return False
 
-        try:
-            self.gpu = self.parse_gpu(self.gpu)
-        except ValueError:
-            terminal.error(f"Invalid GPU type: {self.gpu}", exit=False)
-            return False
+    def _prepare_volumes(self) -> bool:
+        with sdk_timing("prepare_runtime.volumes"):
+            for volume in self.volumes:
+                if not volume.ready and not volume.get_or_create():
+                    terminal.error(f"Volume is not ready: {volume.name}", exit=False)
+                    return False
+        return True
 
-        autoscaler_type = _AUTOSCALER_TYPES.get(type(self.autoscaler), "")
-        if not autoscaler_type:
-            terminal.error(
-                f"Invalid Autoscaler class: {type(self.autoscaler).__name__}",
-                exit=False,
-            )
-            return False
+    def _prepare_runtime_config(self) -> Optional[Dict[str, object]]:
+        with sdk_timing("prepare_runtime.config"):
+            try:
+                self.gpu = self.parse_gpu(self.gpu)
+            except ValueError:
+                terminal.error(f"Invalid GPU type: {self.gpu}", exit=False)
+                return None
 
-        if not self.app:
-            self.app = self.name or os.path.basename(os.getcwd())
-
-        inputs = None
-        if self.inputs:
-            inputs = self._schema_to_proto(self.inputs)
-
-        outputs = None
-        if self.outputs:
-            outputs = self._schema_to_proto(self.outputs)
-
-        if not self.stub_created:
-            stub_request = GetOrCreateStubRequest(
-                object_id=self.object_id,
-                image_id=self.image_id,
-                stub_type=stub_type,
-                name=stub_name,
-                app_name=self.app,
-                python_version=self.image.python_version,
-                cpu=self.cpu,
-                memory=self.memory,
-                gpu=self.gpu,
-                gpu_count=self.gpu_count,
-                handler=self.handler,
-                on_start=self.on_start,
-                on_deploy=self.on_deploy.parent.handler if self.on_deploy else "",
-                on_deploy_stub_id=self.on_deploy.parent.stub_id if self.on_deploy else "",
-                callback_url=self.callback_url,
-                keep_warm_seconds=self.keep_warm_seconds,
-                workers=self.workers,
-                max_pending_tasks=self.max_pending_tasks,
-                volumes=[v.export() for v in self.volumes],
-                secrets=self.secrets,
-                env=self.env,
-                force_create=force_create_stub,
-                authorized=self.authorized,
-                autoscaler=AutoscalerProto(
-                    type=autoscaler_type,
-                    max_containers=self.autoscaler.max_containers,
-                    tasks_per_container=self.autoscaler.tasks_per_container,
-                    min_containers=self.autoscaler.min_containers,
-                ),
-                task_policy=TaskPolicyProto(
-                    max_retries=self.task_policy.max_retries,
-                    timeout=self.task_policy.timeout,
-                    ttl=self.task_policy.ttl,
-                ),
-                concurrent_requests=self.concurrent_requests,
-                checkpoint_enabled=self.checkpoint_enabled,
-                extra=json.dumps(self.extra),
-                entrypoint=self.entrypoint,
-                ports=self.ports,
-                pricing=PricingPolicyProto(
-                    cost_per_task=self.pricing.cost_per_task,
-                    cost_per_task_duration_ms=self.pricing.cost_per_task_duration_ms,
-                    cost_model=self.pricing.cost_model,
-                    max_in_flight=self.pricing.max_in_flight,
+            autoscaler_type = _AUTOSCALER_TYPES.get(type(self.autoscaler), "")
+            if not autoscaler_type:
+                terminal.error(
+                    f"Invalid Autoscaler class: {type(self.autoscaler).__name__}",
+                    exit=False,
                 )
-                if self.pricing
-                else None,
-                inputs=inputs,
-                outputs=outputs,
-                docker_enabled=self.docker_enabled,
-                tcp=self.tcp,
-                block_network=self.block_network,
-                allow_list=self.allow_list,
-            )
+                return None
 
-            if _is_stub_created_for_workspace():
+            if not self.app:
+                self.app = self.name or os.path.basename(os.getcwd())
+
+            return {
+                "autoscaler_type": autoscaler_type,
+                "inputs": self._schema_to_proto(self.inputs) if self.inputs else None,
+                "outputs": self._schema_to_proto(self.outputs) if self.outputs else None,
+            }
+
+    def _stub_request(
+        self,
+        *,
+        stub_type: str,
+        stub_name: str,
+        force_create_stub: bool,
+        autoscaler_type: str,
+        inputs: Optional[SchemaProto],
+        outputs: Optional[SchemaProto],
+    ) -> GetOrCreateStubRequest:
+        return GetOrCreateStubRequest(
+            object_id=self.object_id,
+            image_id=self.image_id,
+            stub_type=stub_type,
+            name=stub_name,
+            app_name=self.app,
+            python_version=self.image.python_version,
+            cpu=self.cpu,
+            memory=self.memory,
+            gpu=self.gpu,
+            gpu_count=self.gpu_count,
+            handler=self.handler,
+            on_start=self.on_start,
+            on_deploy=self.on_deploy.parent.handler if self.on_deploy else "",
+            on_deploy_stub_id=self.on_deploy.parent.stub_id if self.on_deploy else "",
+            callback_url=self.callback_url,
+            keep_warm_seconds=self.keep_warm_seconds,
+            workers=self.workers,
+            max_pending_tasks=self.max_pending_tasks,
+            volumes=[v.export() for v in self.volumes],
+            secrets=self.secrets,
+            env=self.env,
+            force_create=force_create_stub,
+            authorized=self.authorized,
+            autoscaler=AutoscalerProto(
+                type=autoscaler_type,
+                max_containers=self.autoscaler.max_containers,
+                tasks_per_container=self.autoscaler.tasks_per_container,
+                min_containers=self.autoscaler.min_containers,
+            ),
+            task_policy=TaskPolicyProto(
+                max_retries=self.task_policy.max_retries,
+                timeout=self.task_policy.timeout,
+                ttl=self.task_policy.ttl,
+            ),
+            concurrent_requests=self.concurrent_requests,
+            checkpoint_enabled=self.checkpoint_enabled,
+            checkpoint_trigger=self._checkpoint_trigger_proto(),
+            extra=json.dumps(self.extra),
+            entrypoint=self.entrypoint,
+            ports=self.ports,
+            pricing=PricingPolicyProto(
+                cost_per_task=self.pricing.cost_per_task,
+                cost_per_task_duration_ms=self.pricing.cost_per_task_duration_ms,
+                cost_model=self.pricing.cost_model,
+                max_in_flight=self.pricing.max_in_flight,
+            )
+            if self.pricing
+            else None,
+            inputs=inputs,
+            outputs=outputs,
+            docker_enabled=self.docker_enabled,
+            allow_marketplace=self.allow_marketplace,
+            tcp=self.tcp,
+            block_network=self.block_network,
+            allow_list=self.allow_list,
+            pool=self.pool_config,
+            is_service=self.is_service,
+            serving=self._serving_config_proto(),
+            disks=[disk.export() for disk in self.disks],
+        )
+
+    def _checkpoint_trigger_proto(self) -> Optional[CheckpointTrigger]:
+        if not self.checkpoint_enabled or not self.checkpoint_readiness_path:
+            return None
+
+        return CheckpointTrigger(
+            type="http",
+            http_path=self.checkpoint_readiness_path,
+            http_port=int(self.checkpoint_readiness_port or 0),
+            timeout_seconds=int(self.checkpoint_readiness_timeout),
+            interval_seconds=int(self.checkpoint_readiness_interval),
+        )
+
+    def _get_or_create_stub(self, stub_request: GetOrCreateStubRequest) -> GetOrCreateStubResponse:
+        if _stub_created_for_current_workspace():
+            return self.gateway_stub.get_or_create_stub(stub_request)
+
+        with _stub_creation_lock:
+            if not _stub_created_for_current_workspace():
                 stub_response: GetOrCreateStubResponse = self.gateway_stub.get_or_create_stub(
                     stub_request
                 )
-            else:
-                with _stub_creation_lock:
-                    stub_response: GetOrCreateStubResponse = self.gateway_stub.get_or_create_stub(
-                        stub_request
-                    )
+                if stub_response.ok:
+                    _mark_stub_created_for_workspace()
+                return stub_response
 
-                    _set_stub_created_for_workspace(True)
+        return self.gateway_stub.get_or_create_stub(stub_request)
 
-            if stub_response.ok:
-                self.stub_created = True
-                self.stub_id = stub_response.stub_id
-                if stub_response.warn_msg:
-                    terminal.warn(stub_response.warn_msg)
-            else:
-                if err := stub_response.err_msg:
-                    terminal.error(err, exit=False)
-                else:
-                    terminal.error("Failed to get or create stub", exit=False)
-                return False
+    def _apply_stub_response(self, stub_response: GetOrCreateStubResponse) -> bool:
+        if stub_response.ok:
+            self.stub_created = True
+            self.stub_id = stub_response.stub_id
+            if stub_response.warn_msg:
+                terminal.warn(stub_response.warn_msg)
+            return True
 
-        self.runtime_ready = True
-        return True
+        if err := stub_response.err_msg:
+            terminal.error(err, exit=False, hint=credit_error_hint(err))
+        else:
+            terminal.error("Failed to get or create stub", exit=False)
+        return False
 
 
 class AbstractCallableWrapper:

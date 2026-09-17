@@ -29,8 +29,10 @@ from ..env import is_local
 from ..schema import Schema
 from ..type import (
     Autoscaler,
+    DurableDisk,
     GpuType,
     GpuTypeAlias,
+    Pool,
     PricingPolicy,
     QueueDepthAutoscaler,
     TaskPolicy,
@@ -143,6 +145,7 @@ class Endpoint(RunnerAbstraction):
         on_start: Optional[Callable] = None,
         on_deploy: Optional[AbstractCallableWrapper] = None,
         volumes: Optional[List[Union[Volume, CloudBucket]]] = None,
+        disks: Optional[List[DurableDisk]] = None,
         secrets: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = {},
         name: Optional[str] = None,
@@ -154,6 +157,8 @@ class Endpoint(RunnerAbstraction):
         pricing: Optional[PricingPolicy] = None,
         inputs: Optional[Schema] = None,
         outputs: Optional[Schema] = None,
+        pool: Optional[Union[str, Pool]] = None,
+        allow_marketplace: bool = False,
     ):
         super().__init__(
             cpu=cpu,
@@ -169,6 +174,7 @@ class Endpoint(RunnerAbstraction):
             on_start=on_start,
             on_deploy=on_deploy,
             volumes=volumes,
+            disks=disks,
             secrets=secrets,
             env=env,
             name=name,
@@ -182,6 +188,8 @@ class Endpoint(RunnerAbstraction):
             pricing=pricing,
             inputs=inputs,
             outputs=outputs,
+            pool=pool,
+            allow_marketplace=allow_marketplace,
         )
 
         self._endpoint_stub: Optional[EndpointServiceStub] = None
@@ -310,6 +318,7 @@ class ASGI(Endpoint):
         on_start: Optional[Callable] = None,
         on_deploy: Optional[AbstractCallableWrapper] = None,
         volumes: Optional[List[Union[Volume, CloudBucket]]] = None,
+        disks: Optional[List[DurableDisk]] = None,
         secrets: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = {},
         name: Optional[str] = None,
@@ -318,6 +327,8 @@ class ASGI(Endpoint):
         callback_url: Optional[str] = None,
         checkpoint_enabled: bool = False,
         pricing: Optional[PricingPolicy] = None,
+        pool: Optional[Union[str, Pool]] = None,
+        allow_marketplace: bool = False,
     ):
         self.concurrent_requests = concurrent_requests
         super().__init__(
@@ -333,6 +344,7 @@ class ASGI(Endpoint):
             on_start=on_start,
             on_deploy=on_deploy,
             volumes=volumes,
+            disks=disks,
             secrets=secrets,
             env=env,
             name=name,
@@ -342,6 +354,8 @@ class ASGI(Endpoint):
             checkpoint_enabled=checkpoint_enabled,
             app=app,
             pricing=pricing,
+            pool=pool,
+            allow_marketplace=allow_marketplace,
         )
 
         self.is_asgi = True
@@ -448,6 +462,7 @@ class RealtimeASGI(ASGI):
         on_start: Optional[Callable] = None,
         on_deploy: Optional[AbstractCallableWrapper] = None,
         volumes: Optional[List[Union[Volume, CloudBucket]]] = None,
+        disks: Optional[List[DurableDisk]] = None,
         secrets: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = {},
         name: Optional[str] = None,
@@ -456,6 +471,8 @@ class RealtimeASGI(ASGI):
         callback_url: Optional[str] = None,
         checkpoint_enabled: bool = False,
         pricing: Optional[PricingPolicy] = None,
+        pool: Optional[Union[str, Pool]] = None,
+        allow_marketplace: bool = False,
     ):
         super().__init__(
             cpu=cpu,
@@ -470,6 +487,7 @@ class RealtimeASGI(ASGI):
             on_start=on_start,
             on_deploy=on_deploy,
             volumes=volumes,
+            disks=disks,
             secrets=secrets,
             env=env,
             name=name,
@@ -479,6 +497,8 @@ class RealtimeASGI(ASGI):
             concurrent_requests=concurrent_requests,
             checkpoint_enabled=checkpoint_enabled,
             pricing=pricing,
+            pool=pool,
+            allow_marketplace=allow_marketplace,
         )
         self.is_websocket = True
 

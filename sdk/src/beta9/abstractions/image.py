@@ -1,4 +1,6 @@
+import json
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Dict, List, Literal, NamedTuple, Optional, Sequence, Tuple, TypedDict, Union
@@ -8,6 +10,7 @@ from beta9.sync import FileSyncer
 
 from .. import env, terminal
 from ..abstractions.base import BaseAbstraction
+from ..abstractions.base.utils import TTLCache, env_enabled, sdk_timing
 from ..clients.image import (
     BuildImageRequest,
     BuildImageResponse,
@@ -20,12 +23,20 @@ from ..env import is_notebook_env
 from ..type import GpuType, GpuTypeAlias, PythonVersion, PythonVersionAlias
 
 LOCAL_PYTHON_VERSION = f"python{sys.version_info.major}.{sys.version_info.minor}"
+_DEFAULT_IMAGE_BUILD_CACHE_TTL_SECONDS = 300.0
 
 
 class ImageBuildResult(NamedTuple):
     success: bool = False
     image_id: str = ""
     python_version: str = ""
+
+
+_image_build_cache = TTLCache(
+    default_ttl_seconds=_DEFAULT_IMAGE_BUILD_CACHE_TTL_SECONDS,
+    ttl_env_var="BETA9_IMAGE_BUILD_CACHE_TTL_SECONDS",
+    disabled=lambda: env_enabled("BETA9_DISABLE_IMAGE_BUILD_CACHE"),
+)
 
 
 class ImageCredentialValueNotFound(Exception):
@@ -328,6 +339,7 @@ class Image(BaseAbstraction):
         self.secrets = []
         self._stub: Optional[ImageServiceStub] = None
         self.dockerfile = ""
+        self.dockerfile_path = ""
         self.build_ctx_object = ""
         self.gpu = GpuType.NoGPU
         self.ignore_python = False
@@ -410,13 +422,14 @@ class Image(BaseAbstraction):
             return image
 
         if not context_dir:
-            context_dir = os.path.dirname(path)
+            context_dir = os.path.dirname(path) or "."
 
         image.sync_files(context_dir)
 
         with open(path, "r") as f:
             dockerfile = f.read()
         image.dockerfile = dockerfile
+        image.dockerfile_path = path
         return image
 
     def sync_files(self, context_dir: Optional[str] = None, cache_object_id: bool = True) -> None:
@@ -430,6 +443,36 @@ class Image(BaseAbstraction):
             raise ValueError("Failed to sync context directory.")
 
         self.build_ctx_object = result.object_id
+
+    def _cache_key(self) -> str:
+        spec = {
+            "python_packages": self.python_packages,
+            "python_version": self.python_version,
+            "commands": self.commands,
+            "build_steps": [repr(step) for step in self.build_steps],
+            "base_image": self.base_image,
+            "env_vars": self.env_vars,
+            "dockerfile": self.dockerfile,
+            "build_ctx_object": self.build_ctx_object,
+            "secrets": self.secrets,
+            "gpu": self.gpu,
+            "ignore_python": self.ignore_python,
+            "image_id": self.image_id,
+            "include_files_patterns": self.include_files_patterns,
+        }
+        return json.dumps(spec, sort_keys=True, separators=(",", ":"))
+
+    def _cached_build_result(self, cache_key: str) -> Optional[ImageBuildResult]:
+        result = _image_build_cache.get(cache_key)
+        return result if isinstance(result, ImageBuildResult) else None
+
+    def _remember_build_result(self, cache_key: str, result: ImageBuildResult) -> None:
+        if not result.success:
+            return
+
+        self.image_id = result.image_id
+        self.python_version = result.python_version
+        _image_build_cache.set(cache_key, result, aliases=(self._cache_key(),))
 
     @classmethod
     def from_registry(
@@ -502,23 +545,24 @@ class Image(BaseAbstraction):
         )
 
     def exists(self) -> Tuple[bool, ImageBuildResult]:
-        r: VerifyImageBuildResponse = self.stub.verify_image_build(
-            VerifyImageBuildRequest(
-                python_packages=self.python_packages,
-                python_version=self.python_version,
-                commands=self.commands,
-                build_steps=self.build_steps,
-                force_rebuild=False,
-                existing_image_uri=self.base_image,
-                env_vars=self.env_vars,
-                dockerfile=self.dockerfile,
-                build_ctx_object=self.build_ctx_object,
-                secrets=self.secrets,
-                gpu=self.gpu,
-                ignore_python=self.ignore_python,
-                image_id=self.image_id,
+        with sdk_timing("image.verify_build"):
+            r: VerifyImageBuildResponse = self.stub.verify_image_build(
+                VerifyImageBuildRequest(
+                    python_packages=self.python_packages,
+                    python_version=self.python_version,
+                    commands=self.commands,
+                    build_steps=self.build_steps,
+                    force_rebuild=False,
+                    existing_image_uri=self.base_image,
+                    env_vars=self.env_vars,
+                    dockerfile=self.dockerfile,
+                    build_ctx_object=self.build_ctx_object,
+                    secrets=self.secrets,
+                    gpu=self.gpu,
+                    ignore_python=self.ignore_python,
+                    image_id=self.image_id,
+                )
             )
-        )
 
         return (
             r.exists,
@@ -530,8 +574,6 @@ class Image(BaseAbstraction):
     def build(
         self,
     ) -> ImageBuildResult:
-        terminal.header("Building image")
-
         if is_notebook_env():
             if LOCAL_PYTHON_VERSION != self.python_version:
                 terminal.warn(
@@ -546,52 +588,66 @@ class Image(BaseAbstraction):
             # Compared to a custom Dockerfile build context, which does upload all files.
             self.sync_files(cache_object_id=False)
 
+        cache_key = self._cache_key()
+        if cached_result := self._cached_build_result(cache_key):
+            terminal.header("Using cached image")
+            self.image_id = cached_result.image_id
+            self.python_version = cached_result.python_version
+            return cached_result
+
+        terminal.header("Building image")
+
         exists, exists_response = self.exists()
         if exists:
             terminal.header("Using cached image")
-            return ImageBuildResult(
+            result = ImageBuildResult(
                 success=True,
                 image_id=exists_response.image_id,
                 python_version=exists_response.python_version,
             )
+            self._remember_build_result(cache_key, result)
+            return result
 
-        with terminal.progress("Working..."):
-            last_response = BuildImageResponse(success=False)
-            for r in self.stub.build_image(
-                BuildImageRequest(
-                    python_packages=self.python_packages,
-                    python_version=self.python_version,
-                    commands=self.commands,
-                    build_steps=self.build_steps,
-                    existing_image_uri=self.base_image,
-                    existing_image_creds=self.get_credentials_from_env(),
-                    env_vars=self.env_vars,
-                    dockerfile=self.dockerfile,
-                    build_ctx_object=self.build_ctx_object,
-                    secrets=self.secrets,
-                    gpu=self.gpu,
-                    ignore_python=self.ignore_python,
-                )
-            ):
-                if r.warning:
-                    terminal.warn("WARNING: " + r.msg)
-                elif r.msg != "" and not r.done:
-                    terminal.detail(r.msg, end="")
+        with sdk_timing("image.build_stream"):
+            with terminal.progress("Working..."):
+                last_response = BuildImageResponse(success=False)
+                for r in self.stub.build_image(
+                    BuildImageRequest(
+                        python_packages=self.python_packages,
+                        python_version=self.python_version,
+                        commands=self.commands,
+                        build_steps=self.build_steps,
+                        existing_image_uri=self.base_image,
+                        existing_image_creds=self.get_credentials_from_env(),
+                        env_vars=self.env_vars,
+                        dockerfile=self.dockerfile,
+                        build_ctx_object=self.build_ctx_object,
+                        secrets=self.secrets,
+                        gpu=self.gpu,
+                        ignore_python=self.ignore_python,
+                    )
+                ):
+                    if r.warning:
+                        terminal.warn("WARNING: " + r.msg)
+                    elif r.msg != "" and not r.done:
+                        terminal.detail(r.msg, end="")
 
-                if r.done:
-                    last_response = r
-                    break
+                    if r.done:
+                        last_response = r
+                        break
 
         if not last_response.success:
             terminal.error(str(last_response.msg).rstrip(), exit=False)
             return ImageBuildResult(success=False)
 
         terminal.header("Build complete 🎉")
-        return ImageBuildResult(
+        result = ImageBuildResult(
             success=True,
             image_id=last_response.image_id,
             python_version=last_response.python_version,
         )
+        self._remember_build_result(cache_key, result)
+        return result
 
     def get_credentials_from_env(self) -> Dict[str, str]:
         if env.is_remote():
@@ -711,6 +767,116 @@ class Image(BaseAbstraction):
 
         return self
 
+    def add_local_dir(
+        self, local_path: str, remote_path: Optional[str] = None, copy: bool = False
+    ) -> "Image":
+        """
+        Make a local directory available in the image.
+
+        The directory has to live inside the current working directory; it is
+        uploaded with the rest of your synced files. With `copy=False` (the
+        default) the files are mounted when a container starts, so changing
+        them does not rebuild the image; `remote_path` becomes a symlink to the
+        mount. With `copy=True` the files are copied into the image at build
+        time, so later build steps can use them and the image is self-contained.
+
+        Parameters:
+            local_path: Directory to add, relative to the working directory.
+            remote_path: Where it appears in the container. With `copy=False`
+                it defaults to `/mnt/code/<local_path>`, where synced files are
+                mounted; `copy=True` requires it.
+            copy: Copy the files into the image at build time instead of
+                mounting them at run time.
+
+        Returns:
+            Image: The Image object.
+        """
+        return self._add_local(local_path, remote_path, copy, is_dir=True)
+
+    def add_local_file(
+        self, local_path: str, remote_path: Optional[str] = None, copy: bool = False
+    ) -> "Image":
+        """
+        Make a single local file available in the image. See `add_local_dir`.
+        """
+        return self._add_local(local_path, remote_path, copy, is_dir=False)
+
+    def _add_local(
+        self, local_path: str, remote_path: Optional[str], copy: bool, is_dir: bool
+    ) -> "Image":
+        rel = Path(os.path.relpath(local_path, os.getcwd())).as_posix()
+        if rel == ".." or rel.startswith("../") or os.path.isabs(rel):
+            raise ValueError(
+                f"{local_path} is outside the working directory; local paths are synced relative to it."
+            )
+        if is_dir and not os.path.isdir(local_path):
+            raise ValueError(f"{local_path} is not a directory.")
+        if not is_dir and not os.path.isfile(local_path):
+            raise ValueError(f"{local_path} is not a file.")
+        if remote_path is None and copy:
+            raise ValueError("remote_path is required with copy=True.")
+
+        # The working directory itself is every synced file, as in add_local_path.
+        self.include_files_patterns.append(("*" if rel == "." else f"{rel}/**") if is_dir else rel)
+        mounted = f"/mnt/code/{rel}" if rel != "." else "/mnt/code"
+        if remote_path is None:
+            return self
+
+        remote = shlex.quote(remote_path)
+        parent = shlex.quote(os.path.dirname(remote_path.rstrip("/")) or "/")
+        src = shlex.quote(mounted)
+        if copy:
+            if is_dir:
+                # Only files are synced, so a directory with none to sync is
+                # absent from the mount; it still becomes an empty remote_path.
+                command = f"mkdir -p {remote} && if [ -d {src} ]; then cp -a {src}/. {remote}/; fi"
+            else:
+                command = f"mkdir -p {parent} && cp -a {src} {remote}"
+        else:
+            # ln -n keeps an existing symlink from being followed, but an
+            # existing (empty) directory would still be linked into; make
+            # remote_path itself the link, and let a non-empty one fail
+            # loudly rather than be replaced.
+            command = (
+                f"mkdir -p {parent} && "
+                f"if [ -d {remote} ] && [ ! -L {remote} ]; then rmdir {remote}; fi && "
+                f"ln -sfn {src} {remote}"
+            )
+        self.build_steps.append(BuildStep(command=command, type="shell"))
+        return self
+
+    def apt_install(self, *packages: str) -> "Image":
+        """
+        Install Debian packages with apt-get.
+
+        Parameters:
+            packages: Package names, as given to `apt-get install`.
+
+        Returns:
+            Image: The Image object.
+        """
+        if not packages:
+            return self
+        pkgs = " ".join(shlex.quote(p) for p in packages)
+        return self.add_commands(
+            [
+                "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "
+                f"{pkgs} && rm -rf /var/lib/apt/lists/*"
+            ]
+        )
+
+    def pip_install(self, *packages: str) -> "Image":
+        """Alias of `add_python_packages`, taking packages as arguments."""
+        return self.add_python_packages(list(packages))
+
+    def run_commands(self, *commands: str) -> "Image":
+        """Alias of `add_commands`, taking commands as arguments."""
+        return self.add_commands(list(commands))
+
+    def env(self, env_vars: Dict[str, str]) -> "Image":
+        """Alias of `with_envs`."""
+        return self.with_envs(env_vars)
+
     def add_python_version(self, python_version: Union[str, PythonVersion]) -> "Image":
         """
         Add a specific version of Python to the image. This will override any existing python configuration in the Image.
@@ -813,8 +979,9 @@ class Image(BaseAbstraction):
         - Docker Compose standalone (docker-compose)
         - Docker Buildx plugin (docker buildx)
 
-        NOTE: This feature only works with gVisor as the container runtime for
-        enhanced security isolation.
+        NOTE: Docker-enabled sandboxes work with both runc and gVisor. Docker
+        helper methods run inner containers with host network/PID mode so common
+        Docker operations behave consistently inside the sandbox.
 
         Returns:
             Image: The Image object.

@@ -1,7 +1,8 @@
+from types import SimpleNamespace
 from unittest import TestCase, mock
 from unittest.mock import MagicMock
 
-from beta9 import Image, Pod, asgi, endpoint, function, realtime, schedule, task_queue
+from beta9 import Image, Pod, Service, asgi, endpoint, function, realtime, schedule, task_queue
 from beta9.integrations import VLLM, VLLMArgs
 
 PHI_VISION_INSTRUCT = "microsoft/Phi-3.5-vision-instruct"
@@ -187,6 +188,63 @@ class TestDeployment(TestCase):
         self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)
 
     @mock.patch(
+        "beta9.abstractions.pod.Pod.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.gateway_stub",
+        return_value=MagicMock(),
+    )
+    def test_pod_deploy_passes_rollout_mode(self, gateway_stub_mock, prepare_runtime_mock):
+        gateway_stub_mock.deploy_stub.return_value = SimpleNamespace(
+            deployment_id="test-deployment-id",
+            ok=True,
+            invoke_url="",
+            version=1,
+            warn_msg="",
+            rollout_action="replace",
+        )
+        test_pod = Pod(
+            name="test-pod",
+            cpu=1,
+            memory=128,
+            image=Image(python_version="python3.8"),
+            entrypoint=["python", "app.py"],
+        )
+
+        resp, ok = test_pod.deploy(rollout="replace")
+
+        self.assertTrue(ok)
+        self.assertEqual(resp["rollout_action"], "replace")
+        request = gateway_stub_mock.deploy_stub.call_args.args[0]
+        self.assertEqual(request.rollout, "replace")
+
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.gateway_stub",
+        return_value=MagicMock(
+            deploy_stub=MagicMock(
+                return_value=MagicMock(deployment_id="test-deployment-id", ok=True)
+            )
+        ),
+    )
+    def test_service_deploy_with_image_entrypoint(self, gateway_stub_mock, prepare_runtime_mock):
+        test_service = Service(
+            name="test-service",
+            image=Image.from_id("img-123"),
+            ports=[8080],
+        )
+
+        with mock.patch.object(Service, "print_invocation_snippet"):
+            resp, ok = test_service.deploy()
+
+        self.assertEqual(ok, gateway_stub_mock.deploy_stub().ok)
+        self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)
+
+    @mock.patch(
         "beta9.abstractions.integrations.vllm.VLLM.prepare_runtime",
         return_value=True,
     )
@@ -215,6 +273,14 @@ class TestDeployment(TestCase):
                 limit_mm_per_prompt={"image": 2},
             ),
         )
+
+        self.assertEqual(test_vllm.app_kind, "llm_model")
+        self.assertEqual(test_vllm.serving_protocol, "openai")
+        self.assertEqual(test_vllm.llm.model_id, PHI_VISION_INSTRUCT)
+        self.assertEqual(test_vllm.llm.engine, "vllm")
+        self.assertEqual(test_vllm.llm.served_model_name, PHI_VISION_INSTRUCT)
+        self.assertEqual(test_vllm.llm.context_length, 4096)
+        self.assertEqual(test_vllm.llm.metrics_path, "/metrics")
 
         resp, ok = test_vllm.deploy()
 

@@ -20,6 +20,7 @@ event.json
 config.yaml
 config.yaml.local
 config.local.yaml
+config.local.yaml.bak
 config.stage.yaml
 *.tgz
 test
@@ -32,17 +33,16 @@ okteto.yaml
 .vscode/launch.json
 pyrightconfig.json
 .go-version
-# Build output binaries (not source directories)
-/agent-go
-/cmd/agent-go/b9agent
-/cmd/b9agent/b9agent
-/b9agent
-/b9gateway-linux
-/gateway
-/worker
+docs/*.md
+.beta9ignore
+/benchmarks/runs/
+/artifacts/
+/metrics.jsonl
+/summary.json
+/summary.md
 
-# Build logs
-*.log
-build_gateway.log
-build_output.log
-build_runner.log
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/
+
+# staging okteto config: contains live credentials
+hack/stage/config.stage.yaml

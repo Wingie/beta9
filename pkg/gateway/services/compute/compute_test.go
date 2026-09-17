@@ -1,0 +1,7172 @@
+package compute
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	cftypes "github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
+	"github.com/aws/smithy-go"
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/cache"
+	"github.com/beam-cloud/beta9/pkg/clients"
+	"github.com/beam-cloud/beta9/pkg/common"
+	model "github.com/beam-cloud/beta9/pkg/compute"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/scheduler"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+)
+
+func TestPrivatePoolReadsAreWorkspaceScoped(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "viewer-token")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{Name: "owned", Mode: string(types.PoolModePrivate), CreatedByTokenID: "owner-token", Status: "active"},
+				{Name: "other", Mode: string(types.PoolModePrivate), CreatedByTokenID: "other-token", Status: "active"},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "other"): {
+				{WorkspaceID: "workspace-1", PoolName: "other", MachineID: "machine-1"},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	pools, err := service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !pools.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", pools.ErrMsg)
+	}
+	if got, want := poolNames(pools.Pools), []string{"owned", "other"}; !sameStrings(got, want) {
+		t.Fatalf("ListPrivatePools() names = %v, want %v", got, want)
+	}
+
+	machines, err := service.ListPoolMachines(ctx, &pb.ListPoolMachinesRequest{PoolName: "other"})
+	if err != nil {
+		t.Fatalf("ListPoolMachines() error = %v", err)
+	}
+	if !machines.Ok {
+		t.Fatalf("ListPoolMachines() not ok: %s", machines.ErrMsg)
+	}
+	if got, want := len(machines.Machines), 1; got != want {
+		t.Fatalf("ListPoolMachines() count = %d, want %d", got, want)
+	}
+}
+
+func TestPrivatePoolJoinTokenIsWorkspaceOwned(t *testing.T) {
+	now := time.Now().UTC()
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {{
+				WorkspaceID:      "workspace-1",
+				Name:             "pool-1",
+				Mode:             string(types.PoolModePrivate),
+				Config:           &pb.PoolConfig{Name: "pool-1", Mode: string(types.PoolModePrivate)},
+				CreatedByTokenID: "creator-token",
+				CreatedAt:        now,
+			}},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	created, err := service.CreatePoolJoinToken(
+		testAuthContext("workspace-1", "current-token"),
+		&pb.CreatePoolJoinTokenRequest{PoolName: "pool-1"},
+	)
+	if err != nil || !created.Ok {
+		t.Fatalf("CreatePoolJoinToken() response = %+v, err = %v", created, err)
+	}
+
+	joined, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          created.Token,
+		MachineFingerprint: "fingerprint-1",
+		CpuCount:           4,
+		MemoryMb:           8192,
+		Schedulable:        true,
+	})
+	if err != nil || !joined.Ok {
+		t.Fatalf("JoinAgent() response = %+v, err = %v", joined, err)
+	}
+
+	denied, err := service.RevokePoolJoinToken(
+		testAuthContext("workspace-2", "other-token"),
+		&pb.RevokePoolJoinTokenRequest{Token: created.Token},
+	)
+	if err != nil || denied.Ok || denied.ErrMsg != "join token not found" {
+		t.Fatalf("cross-workspace RevokePoolJoinToken() response = %+v, err = %v", denied, err)
+	}
+
+	revoked, err := service.RevokePoolJoinToken(
+		testAuthContext("workspace-1", "rotated-token"),
+		&pb.RevokePoolJoinTokenRequest{Token: created.Token},
+	)
+	if err != nil || !revoked.Ok {
+		t.Fatalf("same-workspace RevokePoolJoinToken() response = %+v, err = %v", revoked, err)
+	}
+	if state := repo.joinTokens[hashComputeToken(created.Token)]; state == nil || !state.Revoked {
+		t.Fatalf("stored join token = %+v, want revoked", state)
+	}
+}
+
+func TestPrivatePoolJoinTokenCannotCrossWorkspaces(t *testing.T) {
+	service := &Service{computeRepo: &fakeComputeRepo{pools: map[string][]*model.PoolState{
+		"workspace-1": {{Name: "pool-1", Mode: string(types.PoolModePrivate)}},
+	}}}
+
+	response, err := service.CreatePoolJoinToken(
+		testAuthContext("workspace-2", "other-token"),
+		&pb.CreatePoolJoinTokenRequest{PoolName: "pool-1"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Ok || response.ErrMsg != "pool not found" {
+		t.Fatalf("CreatePoolJoinToken() response = %+v", response)
+	}
+}
+
+func TestPrivatePoolJoinTokenCannotJoinRecreatedPool(t *testing.T) {
+	createdAt := time.Now().UTC()
+	repo := &fakeComputeRepo{pools: map[string][]*model.PoolState{
+		"workspace-1": {{
+			WorkspaceID: "workspace-1",
+			Name:        "pool-1",
+			Mode:        string(types.PoolModePrivate),
+			Config:      &pb.PoolConfig{Name: "pool-1", Mode: string(types.PoolModePrivate)},
+			CreatedAt:   createdAt,
+		}},
+	}}
+	service := &Service{computeRepo: repo}
+	created, err := service.CreatePoolJoinToken(
+		testAuthContext("workspace-1", "workspace-token"),
+		&pb.CreatePoolJoinTokenRequest{PoolName: "pool-1"},
+	)
+	if err != nil || !created.Ok {
+		t.Fatalf("CreatePoolJoinToken() response = %+v, err = %v", created, err)
+	}
+
+	repo.pools["workspace-1"][0].CreatedAt = createdAt.Add(time.Second)
+	joined, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          created.Token,
+		MachineFingerprint: "fingerprint-1",
+		CpuCount:           4,
+		MemoryMb:           8192,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined.Ok || joined.ErrMsg != "join token was issued for a previous instance of this pool" {
+		t.Fatalf("JoinAgent() response = %+v", joined)
+	}
+}
+
+// Legacy tokens predate PoolCreatedAt; rejecting their zero value stranded
+// machines provisioned right before a deploy.
+func TestPrivatePoolJoinTokenWithoutPoolCreatedAtStillJoins(t *testing.T) {
+	createdAt := time.Now().UTC()
+	repo := &fakeComputeRepo{pools: map[string][]*model.PoolState{
+		"workspace-1": {{
+			WorkspaceID: "workspace-1",
+			Name:        "pool-1",
+			Mode:        string(types.PoolModePrivate),
+			Config:      &pb.PoolConfig{Name: "pool-1", Mode: string(types.PoolModePrivate)},
+			CreatedAt:   createdAt,
+		}},
+	}}
+	repo.joinTokens = map[string]*model.JoinTokenState{
+		hashComputeToken("legacy-token"): {
+			TokenHash:   hashComputeToken("legacy-token"),
+			WorkspaceID: "workspace-1",
+			PoolName:    "pool-1",
+			// No PoolCreatedAt: minted by a build that predates the field.
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	joined, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          "legacy-token",
+		MachineFingerprint: "fingerprint-1",
+		CpuCount:           4,
+		MemoryMb:           8192,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !joined.Ok {
+		t.Fatalf("JoinAgent() rejected a legacy token: %+v", joined)
+	}
+}
+
+func TestListPrivatePoolsReadyMachineCountUsesAgentConnection(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "viewer-token")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{Name: "private-pool", Mode: string(types.PoolModePrivate), Status: "active"},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "private-pool"): {
+				{
+					WorkspaceID:     "workspace-1",
+					PoolName:        "private-pool",
+					MachineID:       "machine-1",
+					Schedulable:     true,
+					LastJoinAt:      now.Add(-time.Minute),
+					LastHeartbeatAt: now,
+				},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	pools, err := service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !pools.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", pools.ErrMsg)
+	}
+	if got, want := len(pools.Pools), 1; got != want {
+		t.Fatalf("pool count = %d, want %d", got, want)
+	}
+	if got, want := pools.Pools[0].ReadyMachineCount, uint32(1); got != want {
+		t.Fatalf("ready machine count = %d, want %d", got, want)
+	}
+}
+
+func TestConfiguredRuntimePoolReadyMachineCountRequiresMatchingWorker(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "viewer-token")
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "restore-pool",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastJoinAt:      now.Add(-time.Minute),
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {{
+				Name:   "restore-pool",
+				Mode:   string(types.PoolModePrivate),
+				Status: "active",
+				Config: &pb.PoolConfig{ContainerRuntime: types.ContainerRuntimeGvisor.String()},
+			}},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "restore-pool"): {machine},
+		},
+	}
+	worker := &types.Worker{
+		Id:        model.AgentMachineWorkerID(machine.MachineID),
+		PoolName:  machine.PoolName,
+		MachineId: machine.MachineID,
+		Status:    types.WorkerStatusAvailable,
+		Runtime:   types.ContainerRuntimeRunc.String(),
+	}
+	service := &Service{computeRepo: repo, workerRepo: &fakeWorkerRepo{worker: worker}}
+
+	pools, err := service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil || !pools.Ok {
+		t.Fatalf("ListPrivatePools() = (%+v, %v)", pools, err)
+	}
+	if got := pools.Pools[0].ReadyMachineCount; got != 0 {
+		t.Fatalf("runc restore pool ready machines = %d, want 0", got)
+	}
+
+	worker.Runtime = types.ContainerRuntimeGvisor.String()
+	pools, err = service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil || !pools.Ok {
+		t.Fatalf("ListPrivatePools() = (%+v, %v)", pools, err)
+	}
+	if got := pools.Pools[0].ReadyMachineCount; got != 1 {
+		t.Fatalf("available gVisor restore pool ready machines = %d, want 1", got)
+	}
+
+	repo.pools["workspace-1"][0].Config.ContainerRuntime = types.ContainerRuntimeRunc.String()
+	pools, err = service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil || !pools.Ok {
+		t.Fatalf("ListPrivatePools() = (%+v, %v)", pools, err)
+	}
+	if got := pools.Pools[0].ReadyMachineCount; got != 0 {
+		t.Fatalf("gVisor worker in runc pool ready machines = %d, want 0", got)
+	}
+
+	worker.Runtime = types.ContainerRuntimeRunc.String()
+	pools, err = service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil || !pools.Ok {
+		t.Fatalf("ListPrivatePools() = (%+v, %v)", pools, err)
+	}
+	if got := pools.Pools[0].ReadyMachineCount; got != 1 {
+		t.Fatalf("available runc pool ready machines = %d, want 1", got)
+	}
+}
+
+func TestFindReadyPrivatePoolForGPU(t *testing.T) {
+	now := time.Now().UTC()
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{Name: "ondemand-a6000", Mode: string(types.PoolModePrivate), Status: "active", Config: &pb.PoolConfig{Gpu: []string{"A6000"}}},
+				{Name: "empty-t4", Mode: string(types.PoolModePrivate), Status: "active", Config: &pb.PoolConfig{Gpu: []string{"T4"}}},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "ondemand-a6000"): {
+				{
+					WorkspaceID:     "workspace-1",
+					PoolName:        "ondemand-a6000",
+					MachineID:       "machine-1",
+					Schedulable:     true,
+					LastJoinAt:      now.Add(-time.Minute),
+					LastHeartbeatAt: now,
+				},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+	ctx := context.Background()
+
+	// Matching GPU with a connected machine.
+	pool, err := service.FindReadyPrivatePoolForGPU(ctx, "workspace-1", []types.GpuType{types.GpuType("A6000")})
+	if err != nil {
+		t.Fatalf("FindReadyPrivatePoolForGPU() error = %v", err)
+	}
+	if pool != "ondemand-a6000" {
+		t.Fatalf("pool = %q, want %q", pool, "ondemand-a6000")
+	}
+
+	// Matching GPU config but no connected machines: not ready.
+	pool, err = service.FindReadyPrivatePoolForGPU(ctx, "workspace-1", []types.GpuType{types.GpuType("T4")})
+	if err != nil {
+		t.Fatalf("FindReadyPrivatePoolForGPU() error = %v", err)
+	}
+	if pool != "" {
+		t.Fatalf("pool = %q, want empty", pool)
+	}
+
+	// No pool configured for the GPU at all.
+	pool, err = service.FindReadyPrivatePoolForGPU(ctx, "workspace-1", []types.GpuType{types.GpuType("H100")})
+	if err != nil {
+		t.Fatalf("FindReadyPrivatePoolForGPU() error = %v", err)
+	}
+	if pool != "" {
+		t.Fatalf("pool = %q, want empty", pool)
+	}
+}
+
+func TestCreatePoolCanBeUpdatedByAnotherWorkspaceToken(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "viewer-token")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{Name: "existing", Mode: string(types.PoolModePrivate), CreatedByTokenID: "owner-token", Status: "active"},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.CreatePool(ctx, &pb.CreatePoolRequest{
+		Pool: &pb.PoolConfig{Name: "existing"},
+	})
+	if err != nil {
+		t.Fatalf("CreatePool() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("CreatePool() not ok: %s", res.ErrMsg)
+	}
+	if !repo.savedPool {
+		t.Fatal("CreatePool() did not persist the workspace-owned update")
+	}
+	if got, want := repo.pools["workspace-1"][0].CreatedByTokenID, "owner-token"; got != want {
+		t.Fatalf("creator audit field = %q, want %q", got, want)
+	}
+}
+
+func TestCreatePoolRejectsMultipleGPUTypes(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.CreatePool(ctx, &pb.CreatePoolRequest{
+		Pool: &pb.PoolConfig{Name: "gpu-pool", Gpu: []string{"A4000", "H100"}},
+	})
+	if err != nil {
+		t.Fatalf("CreatePool() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("CreatePool() unexpectedly accepted mixed GPU types")
+	}
+	if !strings.Contains(res.ErrMsg, "private pools require one GPU type") {
+		t.Fatalf("CreatePool() error = %q, want single GPU type error", res.ErrMsg)
+	}
+}
+
+func TestCreatePoolStoresCanonicalGPUType(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.CreatePool(ctx, &pb.CreatePoolRequest{
+		Pool: &pb.PoolConfig{Name: "gpu-pool", Gpu: []string{"NVIDIA RTX A4000"}},
+	})
+	if err != nil {
+		t.Fatalf("CreatePool() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("CreatePool() not ok: %s", res.ErrMsg)
+	}
+	if got, want := repo.pools["workspace-1"][0].Config.Gpu, []string{"A4000"}; !sameStrings(got, want) {
+		t.Fatalf("stored pool GPU = %v, want %v", got, want)
+	}
+}
+
+func TestCreatePoolRejectsConfiguredWorkerPoolIdentity(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	for _, pool := range []*pb.PoolConfig{
+		{Name: "configured"},
+		{Name: "private", Selector: "configured"},
+	} {
+		repo := &fakeComputeRepo{}
+		service := &Service{
+			computeRepo: repo,
+			appConfig: types.AppConfig{Worker: types.WorkerConfig{Pools: map[string]types.WorkerPoolConfig{
+				"configured": {Mode: types.PoolModeLocal},
+			}}},
+		}
+
+		res, err := service.CreatePool(ctx, &pb.CreatePoolRequest{Pool: pool})
+		if err != nil || res.Ok || !strings.Contains(res.ErrMsg, "configured worker pool") {
+			t.Fatalf("CreatePool(%+v) = %+v, %v; want config conflict", pool, res, err)
+		}
+		if repo.savedPool {
+			t.Fatal("config conflict persisted private pool state")
+		}
+	}
+}
+
+func TestCreatePoolRollsBackFailedRegistration(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	manager := scheduler.NewWorkerPoolManager()
+	s := scheduler.NewSchedulerForCapacityChecks(nil, repo, manager)
+	if err := s.EnsureAgentPool("workspace-1", &model.PoolState{
+		Name: "selector-owner", Selector: "shared", Mode: string(types.PoolModePrivate),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{computeRepo: repo, scheduler: s}
+
+	res, err := service.CreatePool(ctx, &pb.CreatePoolRequest{Pool: &pb.PoolConfig{Name: "requested", Selector: "shared"}})
+	if err != nil || res.Ok {
+		t.Fatalf("CreatePool() = %+v, %v; want registration conflict", res, err)
+	}
+	if state, err := repo.GetPoolState(ctx, "workspace-1", "requested"); err != nil || state != nil {
+		t.Fatalf("partial pool state = %+v, %v; want rollback", state, err)
+	}
+
+	previous := &model.PoolState{
+		Name: "requested", Selector: "old", Mode: string(types.PoolModePrivate), CreatedByTokenID: "owner-token",
+	}
+	if err := repo.SavePoolState(ctx, "workspace-1", previous); err != nil {
+		t.Fatal(err)
+	}
+	res, err = service.CreatePool(ctx, &pb.CreatePoolRequest{Pool: &pb.PoolConfig{Name: "requested", Selector: "shared"}})
+	if err != nil || res.Ok {
+		t.Fatalf("CreatePool(update) = %+v, %v; want registration conflict", res, err)
+	}
+	state, err := repo.GetPoolState(ctx, "workspace-1", "requested")
+	if err != nil || state == nil || state.Selector != "old" {
+		t.Fatalf("restored pool state = %+v, %v; want old selector", state, err)
+	}
+}
+
+func TestCreatePoolRemovesOldSelectorAfterReplacement(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	previous := &model.PoolState{
+		Name: "private", Selector: "old", Mode: string(types.PoolModePrivate), CreatedByTokenID: "owner-token",
+	}
+	repo := &fakeComputeRepo{pools: map[string][]*model.PoolState{"workspace-1": {previous}}}
+	s := scheduler.NewSchedulerForCapacityChecks(nil, repo, scheduler.NewWorkerPoolManager())
+	if err := s.EnsureAgentPool("workspace-1", previous); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{computeRepo: repo, scheduler: s}
+
+	res, err := service.CreatePool(ctx, &pb.CreatePoolRequest{Pool: &pb.PoolConfig{Name: "private", Selector: "new"}})
+	if err != nil || !res.Ok {
+		t.Fatalf("CreatePool() = %+v, %v", res, err)
+	}
+	if err := s.EnsureAgentPool("workspace-1", &model.PoolState{
+		Name: "old-selector-replacement", Selector: "old", Mode: string(types.PoolModePrivate),
+	}); err != nil {
+		t.Fatalf("old selector controller was not removed: %v", err)
+	}
+}
+
+func TestCreateBYOCPoolCreatesAWSCPUPrivatePool(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	templateURL := "https://s3.us-east-1.amazonaws.com/beam-byoc-templates-test/aws/byoc-template.yaml"
+	service := &Service{
+		computeRepo: repo,
+		appConfig: types.AppConfig{
+			GatewayService: types.GatewayServiceConfig{
+				HTTP: types.HTTPConfig{ExternalHost: "app.beam.cloud", ExternalPort: 443, TLS: true},
+			},
+			ManagedCompute: types.ManagedComputeConfig{
+				BYOC: types.ManagedComputeBYOCConfig{
+					AWS: types.ManagedComputeBYOCAWSConfig{TemplateURL: templateURL},
+				},
+			},
+			Worker: types.WorkerConfig{
+				ImageRegistry: "public.ecr.aws/n4e0e1y0",
+				ImageName:     "beta9-worker",
+				ImageTag:      "worker-test",
+			},
+		},
+	}
+
+	res, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider:     "aws",
+		PoolName:     "aws-cpu",
+		Region:       "us-east-1",
+		InstanceType: "i4i.xlarge",
+		DesiredNodes: 2,
+		MaxNodes:     4,
+		AccountId:    "123456789012",
+	})
+	if err != nil {
+		t.Fatalf("CreateBYOCPool() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("CreateBYOCPool() not ok: %s", res.ErrMsg)
+	}
+	if got, want := res.Pool.Name, "aws-cpu"; got != want {
+		t.Fatalf("pool name = %q, want %q", got, want)
+	}
+	if got, want := res.Pool.Source, string(model.SourceAWS); got != want {
+		t.Fatalf("pool source = %q, want %q", got, want)
+	}
+	if res.SetupUrl == "" {
+		t.Fatal("setup url is required")
+	}
+	if res.ResourceName == "" || !strings.Contains(res.ResourceUrl, res.ResourceName) {
+		t.Fatalf("resource response = name %q url %q, want URL containing resource name", res.ResourceName, res.ResourceUrl)
+	}
+	if !strings.Contains(res.SetupUrl, "templateURL="+url.QueryEscape(templateURL)) {
+		t.Fatalf("setup url should reference the BYOC AWS S3 template URL: %s", res.SetupUrl)
+	}
+	for _, fragment := range []string{
+		"templateURL=",
+		"stackName=",
+		"param_BeamGatewayURL=",
+		"param_BeamJoinToken=",
+		"param_BeamWorkerImage=public.ecr.aws%2Fn4e0e1y0%2Fbeta9-worker%3Aworker-test",
+		"param_ContainerStartConcurrency=16",
+		"param_DesiredCapacity=2",
+		"param_MaxSize=4",
+		"param_NetworkSlots=128",
+		"param_NodeGPUCount=0",
+		"param_NodeInstanceType=i4i.xlarge",
+		"param_RootVolumeSizeGB=200",
+		"param_TargetAWSAccountID=123456789012",
+	} {
+		if !strings.Contains(res.SetupUrl, fragment) {
+			t.Fatalf("setup url missing %q: %s", fragment, res.SetupUrl)
+		}
+	}
+	if got, want := len(repo.joinTokens), 1; got != want {
+		t.Fatalf("join token count = %d, want %d", got, want)
+	}
+	joinTokenHash := ""
+	for _, token := range repo.joinTokens {
+		joinTokenHash = token.TokenHash
+		if token.WorkspaceID != "workspace-1" || token.PoolName != "aws-cpu" {
+			t.Fatalf("join token identity = %+v, want workspace/pool", token)
+		}
+		if !token.ExpiresAt.IsZero() {
+			t.Fatalf("join token expiry = %s, want persistent BYOC bootstrap token", token.ExpiresAt)
+		}
+	}
+	stored := repo.pools["workspace-1"][0]
+	if stored.BYOC == nil || stored.BYOC.Provider != "aws" || stored.BYOC.AccountID != "123456789012" || stored.BYOC.Region != "us-east-1" || stored.BYOC.ResourceName != res.ResourceName {
+		t.Fatalf("stored BYOC metadata = %+v, want aws account/region/resource", stored.BYOC)
+	}
+	if len(stored.Config.GetGpu()) != 0 {
+		t.Fatalf("stored CPU pool GPU config = %v, want none", stored.Config.GetGpu())
+	}
+	if got := stored.BYOC.Labels[byocBootstrapJoinTokenHashLabel]; got == "" || got != joinTokenHash {
+		t.Fatalf("stored BYOC join token hash = %q, want %q", got, joinTokenHash)
+	}
+	if got := stored.BYOC.Labels[byocBootstrapJoinTokenHashesLabel]; got == "" || got != joinTokenHash {
+		t.Fatalf("stored BYOC join token hashes = %q, want %q", got, joinTokenHash)
+	}
+	for key, want := range map[string]string{
+		"instance_type":            "i4i.xlarge",
+		"desired_nodes":            "2",
+		"max_nodes":                "4",
+		"target_sandboxes":         "40",
+		"sandboxes_per_node":       "20",
+		"hourly_cost_micros":       "182000",
+		"total_hourly_cost_micros": "364000",
+	} {
+		if got := stored.BYOC.Labels[key]; got != want {
+			t.Fatalf("stored BYOC label %s = %q, want %q", key, got, want)
+		}
+	}
+	if got, want := res.GetByoc().GetHourlyCostMicros(), int64(182000); got != want {
+		t.Fatalf("BYOC hourly cost micros = %d, want %d", got, want)
+	}
+	if got, want := res.GetByoc().GetTotalHourlyCostMicros(), int64(364000); got != want {
+		t.Fatalf("BYOC total hourly cost micros = %d, want %d", got, want)
+	}
+	if res.GetByoc().GetGpu() != "" || res.GetByoc().GetGpuCount() != 0 {
+		t.Fatalf("CPU BYOC gpu = %q/%d, want none", res.GetByoc().GetGpu(), res.GetByoc().GetGpuCount())
+	}
+}
+
+func TestCreateBYOCPoolRollsBackFailedRegistration(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	s := scheduler.NewSchedulerForCapacityChecks(nil, repo, scheduler.NewWorkerPoolManager())
+	if err := s.EnsureAgentPool("workspace-1", &model.PoolState{
+		Name: "selector-owner", Selector: "aws-cpu", Mode: string(types.PoolModePrivate),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{
+		computeRepo: repo,
+		scheduler:   s,
+		appConfig: types.AppConfig{ManagedCompute: types.ManagedComputeConfig{BYOC: types.ManagedComputeBYOCConfig{
+			AWS: types.ManagedComputeBYOCAWSConfig{TemplateURL: "https://example.com/template.yaml"},
+		}}},
+	}
+
+	res, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider: "aws", PoolName: "aws-cpu", Region: "us-east-1", InstanceType: "i4i.xlarge", DesiredNodes: 1, MaxNodes: 1,
+	})
+	if err != nil || res.Ok {
+		t.Fatalf("CreateBYOCPool() = %+v, %v; want registration conflict", res, err)
+	}
+	if state, err := repo.GetPoolState(ctx, "workspace-1", "aws-cpu"); err != nil || state != nil {
+		t.Fatalf("partial BYOC pool state = %+v, %v; want rollback", state, err)
+	}
+}
+
+func TestCreateBYOCPoolCreatesAWSGPUPrivatePool(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	templateURL := "https://s3.us-east-1.amazonaws.com/beam-byoc-templates-test/aws/byoc-template.yaml"
+	service := &Service{
+		computeRepo: repo,
+		appConfig: types.AppConfig{
+			GatewayService: types.GatewayServiceConfig{
+				HTTP: types.HTTPConfig{ExternalHost: "app.beam.cloud", ExternalPort: 443, TLS: true},
+			},
+			ManagedCompute: types.ManagedComputeConfig{
+				BYOC: types.ManagedComputeBYOCConfig{
+					AWS: types.ManagedComputeBYOCAWSConfig{TemplateURL: templateURL},
+				},
+			},
+		},
+	}
+
+	res, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider:     "aws",
+		PoolName:     "aws-gpu",
+		Region:       "us-east-1",
+		InstanceType: "g6.xlarge",
+		DesiredNodes: 2,
+		MaxNodes:     2,
+		AccountId:    "123456789012",
+		Gpu:          "L4",
+		GpuCount:     1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBYOCPool() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("CreateBYOCPool() not ok: %s", res.ErrMsg)
+	}
+	if got, want := res.Pool.GetConfig().GetGpu(), []string{"L4"}; !sameStrings(got, want) {
+		t.Fatalf("pool GPU config = %v, want %v", got, want)
+	}
+	for _, fragment := range []string{
+		"param_NodeInstanceType=g6.xlarge",
+		"param_NodeGPUCount=1",
+		"param_DesiredCapacity=2",
+	} {
+		if !strings.Contains(res.SetupUrl, fragment) {
+			t.Fatalf("setup url missing %q: %s", fragment, res.SetupUrl)
+		}
+	}
+	stored := repo.pools["workspace-1"][0]
+	for key, want := range map[string]string{
+		"instance_type":            "g6.xlarge",
+		"gpu":                      "L4",
+		"gpu_count":                "1",
+		"capacity_unit":            "gpu",
+		"capacity_unit_label":      "GPUs",
+		"hourly_cost_micros":       "110000",
+		"total_hourly_cost_micros": "220000",
+	} {
+		if got := stored.BYOC.Labels[key]; got != want {
+			t.Fatalf("stored BYOC label %s = %q, want %q", key, got, want)
+		}
+	}
+	if got, want := res.GetByoc().GetGpu(), "L4"; got != want {
+		t.Fatalf("BYOC gpu = %q, want %q", got, want)
+	}
+	if got, want := res.GetByoc().GetGpuCount(), uint32(1); got != want {
+		t.Fatalf("BYOC gpu count = %d, want %d", got, want)
+	}
+	if got, want := res.GetByoc().GetTotalHourlyCostMicros(), int64(220000); got != want {
+		t.Fatalf("BYOC total hourly cost micros = %d, want %d", got, want)
+	}
+}
+
+func TestCreateBYOCPoolRejectsChangingExistingAWSHardwareClass(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{
+		computeRepo: repo,
+		appConfig: types.AppConfig{
+			GatewayService: types.GatewayServiceConfig{
+				HTTP: types.HTTPConfig{ExternalHost: "app.beam.cloud", ExternalPort: 443, TLS: true},
+			},
+			ManagedCompute: types.ManagedComputeConfig{
+				BYOC: types.ManagedComputeBYOCConfig{
+					AWS: types.ManagedComputeBYOCAWSConfig{
+						TemplateURL: "https://s3.us-east-1.amazonaws.com/beam-byoc-templates-test/aws/byoc-template.yaml",
+					},
+				},
+			},
+		},
+	}
+
+	first, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider:     "aws",
+		PoolName:     "aws-cpu",
+		Region:       "us-east-1",
+		InstanceType: "i4i.xlarge",
+		DesiredNodes: 1,
+		AccountId:    "123456789012",
+	})
+	if err != nil || !first.Ok {
+		t.Fatalf("first CreateBYOCPool() = (%v, %v)", first, err)
+	}
+
+	second, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider:     "aws",
+		PoolName:     "aws-cpu",
+		Region:       "us-east-1",
+		InstanceType: "g6.xlarge",
+		DesiredNodes: 1,
+		AccountId:    "123456789012",
+		Gpu:          "L4",
+		GpuCount:     1,
+	})
+	if err != nil {
+		t.Fatalf("second CreateBYOCPool() error = %v", err)
+	}
+	if second.Ok {
+		t.Fatal("CreateBYOCPool() unexpectedly allowed changing an existing AWS pool from CPU to GPU")
+	}
+	if !strings.Contains(second.ErrMsg, "create a new pool") {
+		t.Fatalf("error = %q, want create a new pool guidance", second.ErrMsg)
+	}
+}
+
+func TestCreateBYOCPoolKeepsExistingBYOCBootstrapJoinTokens(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{
+		computeRepo: repo,
+		appConfig: types.AppConfig{
+			GatewayService: types.GatewayServiceConfig{
+				HTTP: types.HTTPConfig{ExternalHost: "app.beam.cloud", ExternalPort: 443, TLS: true},
+			},
+			ManagedCompute: types.ManagedComputeConfig{
+				BYOC: types.ManagedComputeBYOCConfig{
+					AWS: types.ManagedComputeBYOCAWSConfig{TemplateURL: "https://s3.us-east-1.amazonaws.com/beam-byoc-templates-test/aws/byoc-template.yaml"},
+				},
+			},
+		},
+	}
+
+	first, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider:     "aws",
+		PoolName:     "aws-cpu",
+		InstanceType: "i4i.xlarge",
+		AccountId:    "123456789012",
+	})
+	if err != nil || !first.Ok {
+		t.Fatalf("first CreateBYOCPool() = (%v, %v)", first, err)
+	}
+	firstHash := repo.pools["workspace-1"][0].BYOC.Labels[byocBootstrapJoinTokenHashLabel]
+
+	second, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider:     "aws",
+		PoolName:     "aws-cpu",
+		InstanceType: "i4i.xlarge",
+		DesiredNodes: 2,
+		MaxNodes:     2,
+		AccountId:    "123456789012",
+	})
+	if err != nil || !second.Ok {
+		t.Fatalf("second CreateBYOCPool() = (%v, %v)", second, err)
+	}
+	secondHash := repo.pools["workspace-1"][0].BYOC.Labels[byocBootstrapJoinTokenHashLabel]
+	if firstHash == "" || secondHash == "" || firstHash == secondHash {
+		t.Fatalf("BYOC join token hashes = first %q second %q, want a new setup token", firstHash, secondHash)
+	}
+	if repo.joinTokens[firstHash].Revoked {
+		t.Fatal("previous BYOC bootstrap join token was revoked before pool deletion")
+	}
+	if repo.joinTokens[secondHash].Revoked {
+		t.Fatal("current BYOC bootstrap join token was revoked")
+	}
+	hashes := strings.Split(repo.pools["workspace-1"][0].BYOC.Labels[byocBootstrapJoinTokenHashesLabel], ",")
+	if got, want := hashes, []string{firstHash, secondHash}; !sameStrings(got, want) {
+		t.Fatalf("stored BYOC bootstrap join token hashes = %v, want %v", got, want)
+	}
+}
+
+func TestCreateBYOCPoolRejectsMissingAWSTemplateURL(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider:  "aws",
+		PoolName:  "aws-cpu",
+		AccountId: "123456789012",
+	})
+	if err != nil {
+		t.Fatalf("CreateBYOCPool() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("CreateBYOCPool() unexpectedly succeeded")
+	}
+	if !strings.Contains(res.ErrMsg, "template URL is not configured") {
+		t.Fatalf("error = %q, want missing template URL", res.ErrMsg)
+	}
+	if len(repo.pools["workspace-1"]) != 0 || len(repo.joinTokens) != 0 {
+		t.Fatalf("misconfigured BYOC pool setup created state: pools=%d tokens=%d", len(repo.pools["workspace-1"]), len(repo.joinTokens))
+	}
+}
+
+func TestCreateBYOCPoolRejectsNonS3AWSTemplateURL(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	service := &Service{
+		computeRepo: &fakeComputeRepo{},
+		appConfig: types.AppConfig{
+			ManagedCompute: types.ManagedComputeConfig{
+				BYOC: types.ManagedComputeBYOCConfig{
+					AWS: types.ManagedComputeBYOCAWSConfig{
+						TemplateURL: "https://app.stage.beam.cloud/api/v1/gateway/pools/byoc/aws/template.yaml",
+					},
+				},
+			},
+		},
+	}
+
+	res, err := service.CreateBYOCPool(ctx, &pb.CreateBYOCPoolRequest{
+		Provider:  "aws",
+		PoolName:  "aws-cpu",
+		AccountId: "123456789012",
+	})
+	if err != nil {
+		t.Fatalf("CreateBYOCPool() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("CreateBYOCPool() unexpectedly succeeded")
+	}
+	if !strings.Contains(res.ErrMsg, "CloudFormation-supported S3 URL") {
+		t.Fatalf("error = %q, want unsupported URL", res.ErrMsg)
+	}
+}
+
+func TestGetBYOCPoolReportsReadiness(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+					},
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "aws-cpu"): {
+				{
+					WorkspaceID:     "workspace-1",
+					PoolName:        "aws-cpu",
+					MachineID:       "machine-1",
+					Schedulable:     true,
+					LastJoinAt:      now.Add(-time.Minute),
+					LastHeartbeatAt: now,
+				},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.GetBYOCPool(ctx, &pb.GetBYOCPoolRequest{PoolName: "aws-cpu"})
+	if err != nil {
+		t.Fatalf("GetBYOCPool() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("GetBYOCPool() not ok: %s", res.ErrMsg)
+	}
+	if !res.Ready {
+		t.Fatal("expected pool to be ready")
+	}
+	if got, want := res.ReadyMachineCount, uint32(1); got != want {
+		t.Fatalf("ready machines = %d, want %d", got, want)
+	}
+	if got, want := res.Byoc.GetResourceUrl(), resourceURL; got != want {
+		t.Fatalf("BYOC resource url = %q, want %q", got, want)
+	}
+}
+
+func TestListPrivatePoolsIncludesBYOCState(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":      "i4i.xlarge",
+							"desired_nodes":      "2",
+							"max_nodes":          "4",
+							"target_sandboxes":   "40",
+							"sandboxes_per_node": "20",
+						},
+					},
+				},
+				{Name: "attached-cpu", Mode: string(types.PoolModePrivate), CreatedByTokenID: "owner-token", Source: model.SourceAttached},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "aws-cpu"): {
+				{
+					WorkspaceID:     "workspace-1",
+					PoolName:        "aws-cpu",
+					MachineID:       "machine-1",
+					Schedulable:     true,
+					LastJoinAt:      now.Add(-time.Minute),
+					LastHeartbeatAt: now,
+				},
+				{
+					WorkspaceID: "workspace-1",
+					PoolName:    "aws-cpu",
+					MachineID:   "machine-2",
+					Schedulable: true,
+				},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", res.ErrMsg)
+	}
+	if got, want := len(res.Pools), 2; got != want {
+		t.Fatalf("pool count = %d, want %d", got, want)
+	}
+	var awsPool *pb.PrivatePool
+	for _, pool := range res.Pools {
+		if pool.GetName() == "aws-cpu" {
+			awsPool = pool
+		} else if pool.GetByoc() != nil {
+			t.Fatalf("non-BYOC pool %q unexpectedly has BYOC state", pool.GetName())
+		}
+	}
+	if awsPool == nil {
+		t.Fatal("aws-cpu pool not found")
+	}
+	byoc := awsPool.GetByoc()
+	if byoc == nil {
+		t.Fatal("aws-cpu pool missing BYOC state")
+	}
+	if got, want := byoc.Provider, "aws"; got != want {
+		t.Fatalf("provider = %q, want %q", got, want)
+	}
+	if got, want := byoc.AccountId, "123456789012"; got != want {
+		t.Fatalf("account id = %q, want %q", got, want)
+	}
+	if got, want := byoc.Phase, "partially_ready"; got != want {
+		t.Fatalf("phase = %q, want %q", got, want)
+	}
+	if got, want := byoc.MachineCount, uint32(2); got != want {
+		t.Fatalf("machine count = %d, want %d", got, want)
+	}
+	if got, want := byoc.ReadyMachineCount, uint32(1); got != want {
+		t.Fatalf("ready machine count = %d, want %d", got, want)
+	}
+	if got, want := byoc.DesiredNodes, uint32(2); got != want {
+		t.Fatalf("desired nodes = %d, want %d", got, want)
+	}
+	if got, want := byoc.TargetSandboxes, uint32(40); got != want {
+		t.Fatalf("target sandboxes = %d, want %d", got, want)
+	}
+	if got, want := byoc.HourlyCostMicros, int64(182000); got != want {
+		t.Fatalf("hourly cost micros = %d, want %d", got, want)
+	}
+	if got, want := byoc.TotalHourlyCostMicros, int64(364000); got != want {
+		t.Fatalf("total hourly cost micros = %d, want %d", got, want)
+	}
+}
+
+func TestListPrivatePoolsCleansDeletedBYOCPool(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	tokenHash := hashComputeToken("byoc-token")
+	machine := &model.AgentTokenState{
+		WorkspaceID:      "workspace-1",
+		PoolName:         "aws-cpu",
+		MachineID:        "machine-1",
+		TokenHash:        hashComputeToken("machine-token"),
+		Schedulable:      true,
+		LastJoinAt:       now.Add(-byocDeletedPoolRetention - time.Minute),
+		LastHeartbeatAt:  now.Add(-byocDeletedPoolRetention - time.Second),
+		LastDisconnectAt: now.Add(-byocDeletedPoolRetention),
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							byocBootstrapJoinTokenHashLabel:   tokenHash,
+							byocBootstrapJoinTokenHashesLabel: tokenHash,
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "1",
+							"max_nodes":                       "1",
+							"target_sandboxes":                "20",
+							"sandboxes_per_node":              "20",
+						},
+					},
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "aws-cpu"): {machine},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			tokenHash: {
+				TokenHash:   tokenHash,
+				WorkspaceID: "workspace-1",
+				PoolName:    "aws-cpu",
+			},
+		},
+	}
+	containerRepo := &fakeContainerRepo{}
+	service := &Service{computeRepo: repo, containerRepo: containerRepo}
+
+	res, err := service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", res.ErrMsg)
+	}
+	if got := len(res.Pools); got != 0 {
+		t.Fatalf("pool count = %d, want 0 after BYOC cleanup", got)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 0 {
+		t.Fatalf("stored pool count = %d, want 0", got)
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "aws-cpu")]); got != 0 {
+		t.Fatalf("stored machine count = %d, want 0", got)
+	}
+	if token := repo.joinTokens[tokenHash]; token == nil || !token.Revoked {
+		t.Fatalf("BYOC bootstrap token revoked = %v, want true", token != nil && token.Revoked)
+	}
+	if got, want := containerRepo.deletedRoutes, []string{"workspace-1/aws-cpu/machine-1"}; !sameStrings(got, want) {
+		t.Fatalf("deleted routes = %v, want %v", got, want)
+	}
+}
+
+func TestListPrivatePoolsCleansDeletedBYOCPoolWithoutMachinesWhenProviderResourceGone(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	tokenHash := hashComputeToken("byoc-token")
+	roleARN := "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test"
+	externalID := "beam-byoc-test-external-id"
+	asgName := "beam-asg-aws-cpu-test"
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							byocBootstrapJoinTokenHashLabel:   tokenHash,
+							byocBootstrapJoinTokenHashesLabel: tokenHash,
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "2",
+							"max_nodes":                       "2",
+							"target_sandboxes":                "40",
+							"sandboxes_per_node":              "20",
+							awsBYOCAutoScalingGroupNameLabel:  asgName,
+							awsBYOCControlRoleArnLabel:        roleARN,
+							awsBYOCControlRoleExternalIDLabel: externalID,
+						},
+					},
+				},
+			},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			tokenHash: {
+				TokenHash:   tokenHash,
+				WorkspaceID: "workspace-1",
+				PoolName:    "aws-cpu",
+			},
+		},
+	}
+	var stackCheck awsBYOCResourceDeletedInput
+	oldResourceDeleted := awsBYOCResourceDeleted
+	awsBYOCResourceDeleted = func(ctx context.Context, input awsBYOCResourceDeletedInput) (bool, error) {
+		stackCheck = input
+		return true, nil
+	}
+	defer func() {
+		awsBYOCResourceDeleted = oldResourceDeleted
+	}()
+
+	res, err := (&Service{computeRepo: repo}).ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", res.ErrMsg)
+	}
+	if got := len(res.Pools); got != 0 {
+		t.Fatalf("pool count = %d, want 0 after provider-deleted BYOC cleanup", got)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 0 {
+		t.Fatalf("stored pool count = %d, want 0", got)
+	}
+	if token := repo.joinTokens[tokenHash]; token == nil || !token.Revoked {
+		t.Fatalf("BYOC bootstrap token revoked = %v, want true", token != nil && token.Revoked)
+	}
+	if stackCheck.Region != "us-east-1" || stackCheck.RoleARN != roleARN || stackCheck.ExternalID != externalID || stackCheck.StackName != "beam-aws-cpu-test" {
+		t.Fatalf("stack check input = %+v, want AWS control metadata", stackCheck)
+	}
+}
+
+func TestListPrivatePoolsKeepsFreshBYOCPoolWhenProviderControlUnavailable(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					CreatedAt:        time.Now().UTC(),
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "2",
+							"max_nodes":                       "2",
+							"target_sandboxes":                "40",
+							"sandboxes_per_node":              "20",
+							awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+							awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+							awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+						},
+					},
+				},
+			},
+		},
+	}
+	oldResourceDeleted := awsBYOCResourceDeleted
+	awsBYOCResourceDeleted = func(context.Context, awsBYOCResourceDeletedInput) (bool, error) {
+		return false, errBYOCProviderControlUnavailable
+	}
+	defer func() {
+		awsBYOCResourceDeleted = oldResourceDeleted
+	}()
+
+	res, err := (&Service{computeRepo: repo}).ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", res.ErrMsg)
+	}
+	if got := len(res.Pools); got != 1 {
+		t.Fatalf("pool count = %d, want fresh creating BYOC pool to remain visible", got)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 1 {
+		t.Fatalf("stored pool count = %d, want 1", got)
+	}
+	if got, want := res.Pools[0].GetByoc().GetPhase(), "waiting_for_provider"; got != want {
+		t.Fatalf("BYOC phase = %q, want %q", got, want)
+	}
+}
+
+func TestListPrivatePoolsKeepsFreshBYOCPoolDuringProviderNotFoundRace(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					CreatedAt:        time.Now().UTC(),
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "2",
+							"max_nodes":                       "2",
+							"target_sandboxes":                "40",
+							"sandboxes_per_node":              "20",
+							awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+							awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+							awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+						},
+					},
+				},
+			},
+		},
+	}
+	oldResourceDeleted := awsBYOCResourceDeleted
+	awsBYOCResourceDeleted = func(context.Context, awsBYOCResourceDeletedInput) (bool, error) {
+		return false, errBYOCProviderResourceNotFound
+	}
+	defer func() {
+		awsBYOCResourceDeleted = oldResourceDeleted
+	}()
+
+	res, err := (&Service{computeRepo: repo}).ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", res.ErrMsg)
+	}
+	if got := len(res.Pools); got != 1 {
+		t.Fatalf("pool count = %d, want fresh creating BYOC pool to remain visible", got)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 1 {
+		t.Fatalf("stored pool count = %d, want 1", got)
+	}
+}
+
+func TestListPrivatePoolsCleansOldNeverJoinedBYOCPoolWhenProviderControlUnavailable(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	tokenHash := hashComputeToken("byoc-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					CreatedAt:        time.Now().UTC().Add(-byocProviderControlUnavailableCleanupGrace - time.Minute),
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							byocBootstrapJoinTokenHashLabel:   tokenHash,
+							byocBootstrapJoinTokenHashesLabel: tokenHash,
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "2",
+							"max_nodes":                       "2",
+							"target_sandboxes":                "40",
+							"sandboxes_per_node":              "20",
+							awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+							awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+							awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+						},
+					},
+				},
+			},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			tokenHash: {
+				TokenHash:   tokenHash,
+				WorkspaceID: "workspace-1",
+				PoolName:    "aws-cpu",
+			},
+		},
+	}
+	oldResourceDeleted := awsBYOCResourceDeleted
+	awsBYOCResourceDeleted = func(context.Context, awsBYOCResourceDeletedInput) (bool, error) {
+		return false, errBYOCProviderControlUnavailable
+	}
+	defer func() {
+		awsBYOCResourceDeleted = oldResourceDeleted
+	}()
+
+	res, err := (&Service{computeRepo: repo}).ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", res.ErrMsg)
+	}
+	if got := len(res.Pools); got != 0 {
+		t.Fatalf("pool count = %d, want stale never-joined BYOC pool cleaned up", got)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 0 {
+		t.Fatalf("stored pool count = %d, want 0", got)
+	}
+	if token := repo.joinTokens[tokenHash]; token == nil || !token.Revoked {
+		t.Fatalf("BYOC bootstrap token revoked = %v, want true", token != nil && token.Revoked)
+	}
+}
+
+func TestListPrivatePoolsKeepsRecentlyDisconnectedBYOCPool(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":      "i4i.xlarge",
+							"desired_nodes":      "1",
+							"max_nodes":          "1",
+							"target_sandboxes":   "20",
+							"sandboxes_per_node": "20",
+						},
+					},
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "aws-cpu"): {
+				{
+					WorkspaceID:      "workspace-1",
+					PoolName:         "aws-cpu",
+					MachineID:        "machine-1",
+					Schedulable:      true,
+					LastJoinAt:       now.Add(-byocDeletedPoolRetention),
+					LastHeartbeatAt:  now.Add(-byocDeletedPoolRetention + time.Minute),
+					LastDisconnectAt: now.Add(-byocDeletedPoolRetention + time.Minute),
+				},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", res.ErrMsg)
+	}
+	if got := len(res.Pools); got != 1 {
+		t.Fatalf("pool count = %d, want 1", got)
+	}
+	if got, want := res.Pools[0].GetByoc().GetPhase(), "nodes_booting"; got != want {
+		t.Fatalf("BYOC phase = %q, want %q", got, want)
+	}
+}
+
+func TestListPrivatePoolsCleansBYOCWhenProviderUnavailableAndMachinesDisconnected(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "1",
+							"max_nodes":                       "1",
+							"target_sandboxes":                "20",
+							"sandboxes_per_node":              "20",
+							awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+							awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+							awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+						},
+					},
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "aws-cpu"): {
+				{
+					WorkspaceID:      "workspace-1",
+					PoolName:         "aws-cpu",
+					MachineID:        "machine-1",
+					Schedulable:      true,
+					LastJoinAt:       now.Add(-time.Minute),
+					LastHeartbeatAt:  now.Add(-30 * time.Second),
+					LastDisconnectAt: now,
+				},
+			},
+		},
+	}
+	oldResourceDeleted := awsBYOCResourceDeleted
+	awsBYOCResourceDeleted = func(context.Context, awsBYOCResourceDeletedInput) (bool, error) {
+		return false, errBYOCProviderControlUnavailable
+	}
+	defer func() {
+		awsBYOCResourceDeleted = oldResourceDeleted
+	}()
+
+	res, err := (&Service{computeRepo: repo}).ListPrivatePools(ctx, &pb.ListPrivatePoolsRequest{})
+	if err != nil {
+		t.Fatalf("ListPrivatePools() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPrivatePools() not ok: %s", res.ErrMsg)
+	}
+	if got := len(res.Pools); got != 0 {
+		t.Fatalf("pool count = %d, want 0 after provider-unavailable BYOC cleanup", got)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 0 {
+		t.Fatalf("stored pool count = %d, want 0", got)
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "aws-cpu")]); got != 0 {
+		t.Fatalf("stored machine count = %d, want 0", got)
+	}
+}
+
+func TestReleasePrivateMachineTerminatesAWSBYOCNode(t *testing.T) {
+	now := time.Now().UTC()
+	roleARN := "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test"
+	externalID := "beam-byoc-test-external-id"
+	asgName := "beam-asg-aws-cpu-test"
+	state := &model.PoolState{
+		WorkspaceID:      "workspace-1",
+		Name:             "aws-cpu",
+		Mode:             string(types.PoolModePrivate),
+		CreatedByTokenID: "owner-token",
+		Source:           model.SourceAWS,
+		BYOC: &model.BYOCProviderState{
+			Provider: string(model.SourceAWS),
+			Region:   "us-east-1",
+			Labels: map[string]string{
+				awsBYOCAutoScalingGroupNameLabel:  asgName,
+				awsBYOCControlRoleArnLabel:        roleARN,
+				awsBYOCControlRoleExternalIDLabel: externalID,
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:        "workspace-1",
+		PoolName:           "aws-cpu",
+		MachineID:          "machine-1",
+		MachineFingerprint: "i-0123456789abcdef0",
+		Hostname:           "i-0123456789abcdef0",
+		Schedulable:        true,
+		LastHeartbeatAt:    now,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "aws-cpu"): {machine}},
+	}
+	var releaseInput awsBYOCReleaseMachineInput
+	oldReleaseMachine := awsBYOCReleaseMachine
+	awsBYOCReleaseMachine = func(ctx context.Context, input awsBYOCReleaseMachineInput) error {
+		releaseInput = input
+		return nil
+	}
+	defer func() {
+		awsBYOCReleaseMachine = oldReleaseMachine
+	}()
+
+	if err := (&Service{computeRepo: repo}).releasePrivateMachine(context.Background(), machine); err != nil {
+		t.Fatalf("releasePrivateMachine() error = %v", err)
+	}
+	if releaseInput.Region != "us-east-1" || releaseInput.RoleARN != roleARN || releaseInput.ExternalID != externalID || releaseInput.AutoScalingGroupName != asgName {
+		t.Fatalf("release input = %+v, want AWS control metadata", releaseInput)
+	}
+	if releaseInput.Machine != machine {
+		t.Fatal("release did not pass the machine to the AWS provider")
+	}
+	if machine.Schedulable {
+		t.Fatal("releasePrivateMachine() did not mark the machine unschedulable")
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "aws-cpu")]); got != 0 {
+		t.Fatalf("machine count after release = %d, want 0", got)
+	}
+}
+
+func TestReleasePrivateMachineKeepsLocalStateWhenAWSBYOCTerminationFails(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "aws-cpu",
+		Source:      model.SourceAWS,
+		BYOC: &model.BYOCProviderState{
+			Provider:     string(model.SourceAWS),
+			Region:       "us-east-1",
+			ResourceName: "beam-aws-cpu-test",
+			Labels: map[string]string{
+				awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+				awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+				awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "aws-cpu",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "aws-cpu"): {machine}},
+	}
+	oldReleaseMachine := awsBYOCReleaseMachine
+	awsBYOCReleaseMachine = func(context.Context, awsBYOCReleaseMachineInput) error {
+		return errors.New("aws failed")
+	}
+	defer func() {
+		awsBYOCReleaseMachine = oldReleaseMachine
+	}()
+
+	err := (&Service{computeRepo: repo}).releasePrivateMachine(context.Background(), machine)
+	if err == nil || !strings.Contains(err.Error(), "aws failed") {
+		t.Fatalf("releasePrivateMachine() error = %v, want AWS failure", err)
+	}
+	if !machine.Schedulable {
+		t.Fatal("failed release should not mark the machine unschedulable")
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "aws-cpu")]); got != 1 {
+		t.Fatalf("machine count after failed release = %d, want 1", got)
+	}
+}
+
+func TestReleasePrivateMachineCleansDisconnectedAWSBYOCWhenProviderControlUnavailable(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "aws-cpu",
+		Source:      model.SourceAWS,
+		BYOC: &model.BYOCProviderState{
+			Provider:     string(model.SourceAWS),
+			Region:       "us-east-1",
+			ResourceName: "beam-aws-cpu-test",
+			Labels: map[string]string{
+				awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+				awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+				awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:      "workspace-1",
+		PoolName:         "aws-cpu",
+		MachineID:        "machine-1",
+		Schedulable:      true,
+		LastJoinAt:       now.Add(-time.Minute),
+		LastHeartbeatAt:  now.Add(-30 * time.Second),
+		LastDisconnectAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "aws-cpu"): {machine}},
+	}
+	oldReleaseMachine := awsBYOCReleaseMachine
+	awsBYOCReleaseMachine = func(context.Context, awsBYOCReleaseMachineInput) error {
+		return errBYOCProviderControlUnavailable
+	}
+	oldResourceDeleted := awsBYOCResourceDeleted
+	awsBYOCResourceDeleted = func(context.Context, awsBYOCResourceDeletedInput) (bool, error) {
+		return false, errBYOCProviderControlUnavailable
+	}
+	defer func() {
+		awsBYOCReleaseMachine = oldReleaseMachine
+		awsBYOCResourceDeleted = oldResourceDeleted
+	}()
+
+	if err := (&Service{computeRepo: repo}).releasePrivateMachine(context.Background(), machine); err != nil {
+		t.Fatalf("releasePrivateMachine() error = %v", err)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 0 {
+		t.Fatalf("stored pool count = %d, want 0", got)
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "aws-cpu")]); got != 0 {
+		t.Fatalf("stored machine count = %d, want 0", got)
+	}
+}
+
+func TestDeletePoolReleasesAWSBYOCMachines(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "owner-token")
+	machineA := &model.AgentTokenState{
+		WorkspaceID:      "workspace-1",
+		PoolName:         "aws-cpu",
+		MachineID:        "machine-a",
+		Schedulable:      true,
+		LastJoinAt:       now,
+		LastHeartbeatAt:  now,
+		LastDisconnectAt: time.Time{},
+	}
+	machineB := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "aws-cpu",
+		MachineID:       "machine-b",
+		Schedulable:     true,
+		LastJoinAt:      now,
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					BYOC: &model.BYOCProviderState{
+						Provider: string(model.SourceAWS),
+						Region:   "us-east-1",
+						Labels: map[string]string{
+							byocBootstrapJoinTokenHashLabel:   hashComputeToken("byoc-token"),
+							byocBootstrapJoinTokenHashesLabel: strings.Join([]string{hashComputeToken("byoc-token"), hashComputeToken("old-byoc-token")}, ","),
+							awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+							awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+							awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+						},
+					},
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "aws-cpu"): {machineA, machineB},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			hashComputeToken("byoc-token"): {
+				TokenHash:   hashComputeToken("byoc-token"),
+				WorkspaceID: "workspace-1",
+				PoolName:    "aws-cpu",
+			},
+			hashComputeToken("old-byoc-token"): {
+				TokenHash:   hashComputeToken("old-byoc-token"),
+				WorkspaceID: "workspace-1",
+				PoolName:    "aws-cpu",
+			},
+		},
+	}
+	containerRepo := &fakeContainerRepo{}
+	service := &Service{computeRepo: repo, containerRepo: containerRepo}
+	oldReleaseMachine := awsBYOCReleaseMachine
+	awsBYOCReleaseMachine = func(context.Context, awsBYOCReleaseMachineInput) error { return nil }
+	defer func() { awsBYOCReleaseMachine = oldReleaseMachine }()
+
+	res, err := service.DeletePool(ctx, &pb.DeletePoolRequest{Name: "aws-cpu"})
+	if err != nil {
+		t.Fatalf("DeletePool() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("DeletePool() not ok: %s", res.ErrMsg)
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "aws-cpu")]); got != 0 {
+		t.Fatalf("machine count after pool release = %d, want 0", got)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 0 {
+		t.Fatalf("pool count after pool release = %d, want 0", got)
+	}
+	if machineA.Schedulable || machineB.Schedulable {
+		t.Fatal("DeletePool() did not mark BYOC machines unschedulable before deleting them")
+	}
+	if !repo.joinTokens[hashComputeToken("byoc-token")].Revoked {
+		t.Fatal("DeletePool() did not revoke the BYOC bootstrap join token")
+	}
+	if !repo.joinTokens[hashComputeToken("old-byoc-token")].Revoked {
+		t.Fatal("DeletePool() did not revoke the old BYOC bootstrap join token")
+	}
+	if got, want := containerRepo.deletedRoutes, []string{"workspace-1/aws-cpu/machine-a", "workspace-1/aws-cpu/machine-b"}; !sameStrings(got, want) {
+		t.Fatalf("deleted machine routes = %v, want %v", got, want)
+	}
+}
+
+func TestDeletePoolKeepsMachineThatReconnectsDuringProviderRelease(t *testing.T) {
+	now := time.Now().UTC()
+	key := fakeComputeKey("workspace-1", "aws-cpu")
+	machine := &model.AgentTokenState{
+		WorkspaceID:      "workspace-1",
+		PoolName:         "aws-cpu",
+		MachineID:        "machine-1",
+		Schedulable:      true,
+		LastHeartbeatAt:  now.Add(-2 * time.Minute),
+		LastDisconnectAt: now.Add(-time.Minute),
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {{
+				Name:             "aws-cpu",
+				Mode:             string(types.PoolModePrivate),
+				CreatedByTokenID: "owner-token",
+				Source:           model.SourceAWS,
+				BYOC: &model.BYOCProviderState{
+					Provider: string(model.SourceAWS),
+					Region:   "us-east-1",
+					Labels: map[string]string{
+						awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+						awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+						awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+					},
+				},
+			}},
+		},
+		machines: map[string][]*model.AgentTokenState{key: {machine}},
+	}
+
+	oldReleaseMachine := awsBYOCReleaseMachine
+	awsBYOCReleaseMachine = func(context.Context, awsBYOCReleaseMachineInput) error {
+		reconnected := *machine
+		reconnected.LastHeartbeatAt = time.Now().UTC()
+		reconnected.LastDisconnectAt = time.Time{}
+		repo.machines[key][0] = &reconnected
+		return errBYOCProviderControlUnavailable
+	}
+	defer func() { awsBYOCReleaseMachine = oldReleaseMachine }()
+
+	res, err := (&Service{computeRepo: repo}).DeletePool(
+		testAuthContext("workspace-1", "owner-token"),
+		&pb.DeletePoolRequest{Name: "aws-cpu"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePool() error = %v", err)
+	}
+	if res.Ok || !strings.Contains(res.ErrMsg, errBYOCProviderControlUnavailable.Error()) {
+		t.Fatalf("DeletePool() response = %#v, want provider control error", res)
+	}
+	if got := len(repo.machines[key]); got != 1 || !model.AgentMachineConnected(repo.machines[key][0], time.Now().UTC()) {
+		t.Fatalf("machine state after failed deletion = %#v, want connected machine", repo.machines[key])
+	}
+	if got := len(repo.pools["workspace-1"]); got != 1 {
+		t.Fatalf("pool count after failed deletion = %d, want 1", got)
+	}
+}
+
+func TestDeletePoolIsIdempotentWhenPoolAlreadyGone(t *testing.T) {
+	repo := &fakeComputeRepo{pools: map[string][]*model.PoolState{}}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.DeletePool(testAuthContext("workspace-1", "owner-token"), &pb.DeletePoolRequest{Name: "codex-hetzner-latency"})
+	if err != nil {
+		t.Fatalf("DeletePool() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePool() response = %#v", res)
+	}
+}
+
+func TestDeletePoolAllowsAnotherTokenInWorkspace(t *testing.T) {
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "pool-1",
+					CreatedByTokenID: "creator-token",
+					Mode:             string(types.PoolModePrivate),
+				},
+			},
+			"workspace-2": {
+				{Name: "pool-1", CreatedByTokenID: "other-workspace-token", Mode: string(types.PoolModePrivate)},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.DeletePool(
+		testAuthContext("workspace-1", "current-token"),
+		&pb.DeletePoolRequest{Name: "pool-1"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePool() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePool() response = %#v", res)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 0 {
+		t.Fatalf("stored pool count = %d, want 0", got)
+	}
+	if got := len(repo.pools["workspace-2"]); got != 1 {
+		t.Fatalf("other workspace pool count = %d, want 1", got)
+	}
+}
+
+func TestScaleBYOCPoolUpdatesAWSAutoScalingGroupAndState(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	roleARN := "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test"
+	externalID := "beam-byoc-test-external-id"
+	asgName := "beam-asg-aws-cpu-test"
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "1",
+							"max_nodes":                       "4",
+							"target_sandboxes":                "20",
+							"sandboxes_per_node":              "20",
+							"hourly_cost_micros":              "182000",
+							"total_hourly_cost_micros":        "182000",
+							awsBYOCAutoScalingGroupNameLabel:  asgName,
+							awsBYOCControlRoleArnLabel:        roleARN,
+							awsBYOCControlRoleExternalIDLabel: externalID,
+							awsBYOCControlRoleNameLabel:       "beam-control-aws-cpu-test",
+						},
+					},
+				},
+			},
+		},
+	}
+	var scaleInput awsBYOCScaleAutoScalingGroupInput
+	oldScaler := awsBYOCScaleAutoScalingGroup
+	awsBYOCScaleAutoScalingGroup = func(ctx context.Context, input awsBYOCScaleAutoScalingGroupInput) error {
+		scaleInput = input
+		return nil
+	}
+	defer func() {
+		awsBYOCScaleAutoScalingGroup = oldScaler
+	}()
+
+	res, err := (&Service{computeRepo: repo}).ScaleBYOCPool(ctx, &pb.ScaleBYOCPoolRequest{
+		PoolName:     "aws-cpu",
+		DesiredNodes: 3,
+		MaxNodes:     5,
+	})
+	if err != nil {
+		t.Fatalf("ScaleBYOCPool() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ScaleBYOCPool() not ok: %s", res.ErrMsg)
+	}
+	if scaleInput.Region != "us-east-1" || scaleInput.RoleARN != roleARN || scaleInput.ExternalID != externalID || scaleInput.AutoScalingGroupName != asgName {
+		t.Fatalf("scale input metadata = %+v, want region/role/external/asg", scaleInput)
+	}
+	if scaleInput.DesiredNodes != 3 || scaleInput.MaxNodes != 5 {
+		t.Fatalf("scale input nodes = desired %d max %d, want 3/5", scaleInput.DesiredNodes, scaleInput.MaxNodes)
+	}
+	stored := repo.pools["workspace-1"][0]
+	for key, want := range map[string]string{
+		"desired_nodes":            "3",
+		"max_nodes":                "5",
+		"target_sandboxes":         "60",
+		"total_hourly_cost_micros": "546000",
+	} {
+		if got := stored.BYOC.Labels[key]; got != want {
+			t.Fatalf("stored label %s = %q, want %q", key, got, want)
+		}
+	}
+	if !res.GetByoc().GetDirectScaleEnabled() {
+		t.Fatal("scaled BYOC pool should report direct scale enabled")
+	}
+	if got, want := res.GetByoc().GetDesiredNodes(), uint32(3); got != want {
+		t.Fatalf("response desired nodes = %d, want %d", got, want)
+	}
+}
+
+func TestScaleBYOCPoolPrunesDisconnectedMachinesAboveDesired(t *testing.T) {
+	now := time.Now().UTC()
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	roleARN := "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test"
+	externalID := "beam-byoc-test-external-id"
+	asgName := "beam-asg-aws-cpu-test"
+	connected := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "aws-cpu",
+		MachineID:       "machine-connected",
+		Schedulable:     true,
+		LastJoinAt:      now.Add(-time.Minute),
+		LastHeartbeatAt: now,
+	}
+	disconnected := &model.AgentTokenState{
+		WorkspaceID:      "workspace-1",
+		PoolName:         "aws-cpu",
+		MachineID:        "machine-disconnected",
+		Schedulable:      true,
+		LastJoinAt:       now.Add(-time.Minute),
+		LastHeartbeatAt:  now.Add(-30 * time.Second),
+		LastDisconnectAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "2",
+							"max_nodes":                       "2",
+							"target_sandboxes":                "40",
+							"sandboxes_per_node":              "20",
+							awsBYOCAutoScalingGroupNameLabel:  asgName,
+							awsBYOCControlRoleArnLabel:        roleARN,
+							awsBYOCControlRoleExternalIDLabel: externalID,
+						},
+					},
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "aws-cpu"): {connected, disconnected},
+		},
+	}
+	oldScaler := awsBYOCScaleAutoScalingGroup
+	awsBYOCScaleAutoScalingGroup = func(context.Context, awsBYOCScaleAutoScalingGroupInput) error {
+		return nil
+	}
+	defer func() {
+		awsBYOCScaleAutoScalingGroup = oldScaler
+	}()
+
+	res, err := (&Service{computeRepo: repo}).ScaleBYOCPool(ctx, &pb.ScaleBYOCPoolRequest{
+		PoolName:     "aws-cpu",
+		DesiredNodes: 1,
+		MaxNodes:     1,
+	})
+	if err != nil {
+		t.Fatalf("ScaleBYOCPool() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ScaleBYOCPool() not ok: %s", res.ErrMsg)
+	}
+	machines := repo.machines[fakeComputeKey("workspace-1", "aws-cpu")]
+	if got := len(machines); got != 1 {
+		t.Fatalf("stored machine count = %d, want 1", got)
+	}
+	if got := machines[0].MachineID; got != "machine-connected" {
+		t.Fatalf("remaining machine = %q, want connected machine", got)
+	}
+	if got, want := res.GetByoc().GetMachineCount(), uint32(1); got != want {
+		t.Fatalf("response machine count = %d, want %d", got, want)
+	}
+}
+
+func TestScaleBYOCPoolRejectsStackWithoutControlRole(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":      "i4i.xlarge",
+							"desired_nodes":      "1",
+							"max_nodes":          "1",
+							"target_sandboxes":   "20",
+							"sandboxes_per_node": "20",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	res, err := (&Service{computeRepo: repo}).ScaleBYOCPool(ctx, &pb.ScaleBYOCPoolRequest{
+		PoolName:     "aws-cpu",
+		DesiredNodes: 2,
+		MaxNodes:     2,
+	})
+	if err != nil {
+		t.Fatalf("ScaleBYOCPool() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("ScaleBYOCPool() unexpectedly succeeded without control role metadata")
+	}
+	if !strings.Contains(res.ErrMsg, "direct BYOC scaling is unavailable") {
+		t.Fatalf("error = %q, want direct scale unavailable", res.ErrMsg)
+	}
+	if got := repo.pools["workspace-1"][0].BYOC.Labels["desired_nodes"]; got != "1" {
+		t.Fatalf("desired_nodes changed to %q, want unchanged", got)
+	}
+}
+
+func TestAWSBYOCTemplateDoesNotEmbedSecrets(t *testing.T) {
+	template := AWSBYOCTemplate()
+	if !strings.Contains(template, "NoEcho: true") {
+		t.Fatal("template should mark BeamJoinToken NoEcho")
+	}
+	if strings.Contains(template, "sk_") || strings.Contains(template, "test-secret-token") {
+		t.Fatalf("template appears to contain an embedded secret: %s", template)
+	}
+	if !strings.Contains(template, "AWS::AutoScaling::AutoScalingGroup") {
+		t.Fatal("template should create an auto scaling group")
+	}
+	if !strings.Contains(template, "FromPort: 41641") {
+		t.Fatal("template should allow Tailscale direct WireGuard UDP")
+	}
+	for _, fragment := range []string{
+		"BeamWorkerImage:",
+		"--worker-image '${BeamWorkerImage}'",
+		"Default: i4i.xlarge",
+		"AllowedValues:",
+		"- i4i.large",
+		"- i4i.xlarge",
+		"- i4i.4xlarge",
+		"- g6.xlarge",
+		"- g5.xlarge",
+		"NodeGPUCount:",
+		"LatestGPUAmiId:",
+		"/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id",
+		"UseGPUAMI:",
+		"ImageId: !If [UseGPUAMI, !Ref LatestGPUAmiId, !Ref LatestCPUAmiId]",
+		"nvme-Amazon_EC2_NVMe_Instance_Storage",
+		"BEAM_AGENT_INSTALL_DOCKER=1",
+		"nvidia-ctk runtime configure --runtime=docker",
+		"GPU_ARGS=\"--max-gpus ${NodeGPUCount}\"",
+		"$GPU_ARGS",
+		"--state-dir \"$BEAM_STATE_DIR\"",
+		"/etc/docker/daemon.json",
+		"NetworkSlots:",
+		"Default: 128",
+		"--network-slots '${NetworkSlots}'",
+		"RootVolumeSizeGB:",
+		"VolumeSize: !Ref RootVolumeSizeGB",
+		"VolumeType: gp3",
+		"ContainerStartConcurrency:",
+		"--container-start-concurrency '${ContainerStartConcurrency}'",
+		"NodeSecurityGroupSelfIngress:",
+		"IpProtocol: -1",
+		"SourceSecurityGroupId: !Ref NodeSecurityGroup",
+		"Description: Beam BYOC node-to-node private traffic",
+		"NodeSecurityGroupVpcIngress:",
+		"CidrIp: !Ref VpcCidr",
+		"Description: Beam BYOC private VPC traffic",
+		"TargetAWSAccountID:",
+		"TargetAccountMustMatch:",
+		"!Equals [!Ref TargetAWSAccountID, !Ref \"AWS::AccountId\"]",
+		"BeamControlRole:",
+		"BeamControlRolePrincipalArn:",
+		"sts:ExternalId: !Ref BeamControlExternalId",
+		"autoscaling:UpdateAutoScalingGroup",
+		"autoscaling:TerminateInstanceInAutoScalingGroup",
+		"cloudformation:DescribeStacks",
+		"ec2:DescribeInstances",
+		"autoScalingGroupName/${BeamAutoScalingGroupName}",
+		"AutoScalingGroupName: !Ref BeamAutoScalingGroupName",
+		"BEAM_AGENT_MACHINE_FINGERPRINT=\"$INSTANCE_ID\"",
+		"BEAM_AGENT_HOSTNAME=\"$INSTANCE_ID\"",
+	} {
+		if !strings.Contains(template, fragment) {
+			t.Fatalf("template missing %q", fragment)
+		}
+	}
+}
+
+func TestAWSBYOCStackDeletionErrorClassification(t *testing.T) {
+	stackMissing := &smithy.GenericAPIError{
+		Code:    "ValidationError",
+		Message: "Stack with id beam-aws-cpu-test does not exist",
+	}
+	if !awsBYOCCloudFormationStackNotFound(stackMissing) {
+		t.Fatal("CloudFormation missing-stack validation error should be recognized as not found")
+	}
+
+	assumeRoleDenied := &smithy.OperationError{
+		ServiceID:     "STS",
+		OperationName: "AssumeRole",
+		Err: &smithy.GenericAPIError{
+			Code:    "AccessDenied",
+			Message: "User is not authorized to perform: sts:AssumeRole",
+		},
+	}
+	if !awsBYOCControlRoleUnavailable(fmt.Errorf("get credentials: %w", assumeRoleDenied)) {
+		t.Fatal("STS assume-role denial should be treated as the BYOC control role being unavailable")
+	}
+
+	cloudFormationDenied := &smithy.OperationError{
+		ServiceID:     "CloudFormation",
+		OperationName: "DescribeStacks",
+		Err: &smithy.GenericAPIError{
+			Code:    "AccessDenied",
+			Message: "User is not authorized to perform: cloudformation:DescribeStacks",
+		},
+	}
+	if awsBYOCControlRoleUnavailable(cloudFormationDenied) {
+		t.Fatal("CloudFormation authorization errors should not be treated as stack deletion")
+	}
+	if !awsBYOCStackStatusCreating(cftypes.StackStatusCreateInProgress) {
+		t.Fatal("CREATE_IN_PROGRESS should be treated as creating")
+	}
+	if awsBYOCStackStatusDeleted(cftypes.StackStatusCreateInProgress) {
+		t.Fatal("CREATE_IN_PROGRESS should not be treated as deleted")
+	}
+	if !awsBYOCStackStatusDeleted(cftypes.StackStatusDeleteInProgress) {
+		t.Fatal("DELETE_IN_PROGRESS should be treated as deleted")
+	}
+}
+
+func TestValidatePrivatePoolGPURequestAllowsWorkloadPreferenceList(t *testing.T) {
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{Name: "gpu-pool", Config: &pb.PoolConfig{Name: "gpu-pool", Gpu: []string{"A4000"}}},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	err := service.ValidatePrivatePoolGPURequest(
+		context.Background(),
+		"workspace-1",
+		"gpu-pool",
+		[]types.GpuType{types.GPU_H100, types.GPU_A4000},
+	)
+	if err != nil {
+		t.Fatalf("ValidatePrivatePoolGPURequest() error = %v", err)
+	}
+}
+
+func TestGPURequirementSatisfiedByConcreteMemoryVariant(t *testing.T) {
+	tests := []struct {
+		name      string
+		required  string
+		available string
+		want      bool
+	}{
+		{name: "generic A100 accepts 40 GB", required: "A100", available: "A100-40", want: true},
+		{name: "generic A100 accepts 80 GB", required: "A100", available: "NVIDIA A100 80GB PCI", want: true},
+		{name: "generic V100 accepts 32 GB", required: "V100", available: "V100-32", want: true},
+		{name: "80 GB requirement rejects 40 GB", required: "A100-80", available: "A100-40", want: false},
+		{name: "different family rejected", required: "A4000", available: "H100", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := gpuRequirementSatisfiedBy(tt.required, tt.available); got != tt.want {
+				t.Fatalf("gpuRequirementSatisfiedBy(%q, %q) = %v, want %v", tt.required, tt.available, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnforcePoolGPUTypeAcceptsConcreteVariantForGenericPool(t *testing.T) {
+	service := &Service{}
+	pool := &model.PoolState{
+		Name:   "gpu-pool",
+		Config: &pb.PoolConfig{Name: "gpu-pool", Gpu: []string{"A100"}},
+	}
+	agent := &model.AgentTokenState{
+		MachineID: "machine-1",
+		GPUs:      []string{"A100-40"},
+		GPUCount:  1,
+	}
+
+	if err := service.enforcePoolGPUType(context.Background(), pool, agent); err != nil {
+		t.Fatalf("enforcePoolGPUType() error = %v", err)
+	}
+
+	pool.Config.Gpu = []string{"A100-80"}
+	if err := service.enforcePoolGPUType(context.Background(), pool, agent); err == nil {
+		t.Fatal("enforcePoolGPUType() accepted A100-40 for an A100-80 requirement")
+	}
+}
+
+func TestJoinAgentLocksPoolGPUTypeFromFirstMachine(t *testing.T) {
+	now := time.Now().UTC()
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					WorkspaceID:      "workspace-1",
+					Name:             "gpu-pool",
+					Config:           &pb.PoolConfig{Name: "gpu-pool"},
+					CreatedByTokenID: "owner-token",
+					CreatedAt:        now,
+					UpdatedAt:        now,
+				},
+			},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			hashComputeToken("join-token"): {
+				TokenHash:     hashComputeToken("join-token"),
+				WorkspaceID:   "workspace-1",
+				PoolName:      "gpu-pool",
+				PoolCreatedAt: now,
+				ExpiresAt:     now.Add(time.Hour),
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          "join-token",
+		MachineFingerprint: "fingerprint-1",
+		Gpu:                []string{"A4000"},
+		GpuCount:           1,
+		CpuCount:           4,
+		MemoryMb:           1024,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("JoinAgent() not ok: %s", res.ErrMsg)
+	}
+	pool := repo.pools["workspace-1"][0]
+	if got, want := pool.Config.Gpu, []string{"A4000"}; !sameStrings(got, want) {
+		t.Fatalf("pool GPU config = %v, want %v", got, want)
+	}
+}
+
+func TestJoinAgentAcceptsPersistentJoinToken(t *testing.T) {
+	now := time.Now().UTC()
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					WorkspaceID:      "workspace-1",
+					Name:             "aws-cpu",
+					Config:           &pb.PoolConfig{Name: "aws-cpu"},
+					CreatedByTokenID: "owner-token",
+					CreatedAt:        now,
+				},
+			},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			hashComputeToken("byoc-token"): {
+				TokenHash:     hashComputeToken("byoc-token"),
+				WorkspaceID:   "workspace-1",
+				PoolName:      "aws-cpu",
+				PoolCreatedAt: now,
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          "byoc-token",
+		MachineFingerprint: "fingerprint-1",
+		CpuCount:           4,
+		MemoryMb:           1024,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("JoinAgent() not ok: %s", res.ErrMsg)
+	}
+}
+
+func TestJoinAgentRejectsPoolGPUMismatch(t *testing.T) {
+	now := time.Now().UTC()
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					WorkspaceID:      "workspace-1",
+					Name:             "gpu-pool",
+					Config:           &pb.PoolConfig{Name: "gpu-pool", Gpu: []string{"A4000"}},
+					CreatedByTokenID: "owner-token",
+					CreatedAt:        now,
+				},
+			},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			hashComputeToken("join-token"): {
+				TokenHash:     hashComputeToken("join-token"),
+				WorkspaceID:   "workspace-1",
+				PoolName:      "gpu-pool",
+				PoolCreatedAt: now,
+				ExpiresAt:     now.Add(time.Hour),
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          "join-token",
+		MachineFingerprint: "fingerprint-1",
+		Gpu:                []string{"H100"},
+		GpuCount:           1,
+		CpuCount:           4,
+		MemoryMb:           1024,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("JoinAgent() unexpectedly accepted a mismatched GPU")
+	}
+	if !strings.Contains(res.ErrMsg, `requires GPU type "A4000"`) {
+		t.Fatalf("JoinAgent() error = %q, want pool GPU mismatch", res.ErrMsg)
+	}
+}
+
+func TestJoinAgentRejectsGPUAfterCPUOnlyPoolInitialized(t *testing.T) {
+	now := time.Now().UTC()
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					WorkspaceID:      "workspace-1",
+					Name:             "cpu-pool",
+					Config:           &pb.PoolConfig{Name: "cpu-pool"},
+					CreatedByTokenID: "owner-token",
+					CreatedAt:        now,
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "cpu-pool"): {
+				{WorkspaceID: "workspace-1", PoolName: "cpu-pool", MachineID: "cpu-machine"},
+			},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			hashComputeToken("join-token"): {
+				TokenHash:     hashComputeToken("join-token"),
+				WorkspaceID:   "workspace-1",
+				PoolName:      "cpu-pool",
+				PoolCreatedAt: now,
+				ExpiresAt:     now.Add(time.Hour),
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          "join-token",
+		MachineFingerprint: "fingerprint-1",
+		Gpu:                []string{"A4000"},
+		GpuCount:           1,
+		CpuCount:           4,
+		MemoryMb:           1024,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("JoinAgent() unexpectedly accepted a machine with GPU attributes after CPU-only initialization")
+	}
+	if !strings.Contains(res.ErrMsg, "initialized without GPUs") {
+		t.Fatalf("JoinAgent() error = %q, want CPU-only pool error", res.ErrMsg)
+	}
+}
+
+func TestJoinAgentRejectsMixedMachineGPUTypes(t *testing.T) {
+	now := time.Now().UTC()
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					WorkspaceID:      "workspace-1",
+					Name:             "gpu-pool",
+					Config:           &pb.PoolConfig{Name: "gpu-pool"},
+					CreatedByTokenID: "owner-token",
+					CreatedAt:        now,
+				},
+			},
+		},
+		joinTokens: map[string]*model.JoinTokenState{
+			hashComputeToken("join-token"): {
+				TokenHash:     hashComputeToken("join-token"),
+				WorkspaceID:   "workspace-1",
+				PoolName:      "gpu-pool",
+				PoolCreatedAt: now,
+				ExpiresAt:     now.Add(time.Hour),
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          "join-token",
+		MachineFingerprint: "fingerprint-1",
+		Gpu:                []string{"A4000", "H100"},
+		GpuCount:           2,
+		CpuCount:           4,
+		MemoryMb:           1024,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("JoinAgent() unexpectedly accepted mixed GPU types")
+	}
+	if !strings.Contains(res.ErrMsg, "mixed GPU types") {
+		t.Fatalf("JoinAgent() error = %q, want mixed GPU type error", res.ErrMsg)
+	}
+}
+
+func TestMissingPrivatePoolGPUWarning(t *testing.T) {
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{Name: "gpu-pool", Config: &pb.PoolConfig{Name: "gpu-pool", Gpu: []string{"A4000"}}},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	warning, err := service.MissingPrivatePoolGPUWarning(context.Background(), "workspace-1", []types.GpuType{types.GPU_H100})
+	if err != nil {
+		t.Fatalf("MissingPrivatePoolGPUWarning() error = %v", err)
+	}
+	if !strings.Contains(warning, "GPU type H100 is not available") || !strings.Contains(warning, "A4000") {
+		t.Fatalf("warning = %q, want requested and configured GPU types", warning)
+	}
+}
+
+func TestIsLocalGatewayURL(t *testing.T) {
+	tests := []struct {
+		rawURL string
+		want   bool
+	}{
+		{rawURL: "http://localhost:1994", want: true},
+		{rawURL: "http://127.0.0.1:1994", want: true},
+		{rawURL: "http://[::1]:1994", want: true},
+		{rawURL: "https://gateway.beam.cloud", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.rawURL, func(t *testing.T) {
+			if got := isLocalGatewayURL(tt.rawURL); got != tt.want {
+				t.Fatalf("isLocalGatewayURL() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetAgentPoolVirtualizationReportsGPUVirtualized(t *testing.T) {
+	workspaceID := "workspace-1"
+	poolName := "pool-1"
+	agentToken := "agent-token"
+	service := &Service{
+		appConfig: types.AppConfig{
+			Tailscale: types.TailscaleConfig{
+				Enabled:      true,
+				AuthKey:      "tskey-auth-gateway",
+				AgentAuthKey: "tskey-auth-worker",
+			},
+		},
+		computeRepo: &fakeComputeRepo{
+			pools: map[string][]*model.PoolState{
+				workspaceID: {
+					{
+						Name: poolName,
+						WorkerConfig: &types.WorkerPoolConfig{
+							GPUVirtualized: true,
+						},
+					},
+				},
+			},
+			machines: map[string][]*model.AgentTokenState{
+				fakeComputeKey(workspaceID, poolName): {
+					{
+						TokenHash:   hashComputeToken(agentToken),
+						WorkspaceID: workspaceID,
+						PoolName:    poolName,
+						MachineID:   "machine-1",
+					},
+				},
+			},
+		},
+	}
+
+	resp, err := service.GetAgentPoolVirtualization(context.Background(), &pb.GetAgentPoolVirtualizationRequest{AgentToken: agentToken})
+	if err != nil {
+		t.Fatalf("GetAgentPoolVirtualization() error = %v", err)
+	}
+	if !resp.GetOk() || !resp.GetGpuVirtualized() {
+		t.Fatalf("GetAgentPoolVirtualization() = %+v, want gpu virtualized", resp)
+	}
+}
+
+func TestAgentPoolGPUVirtualizedRequiresWorkerConfig(t *testing.T) {
+	service := &Service{computeRepo: &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {{Name: "pool-1"}},
+		},
+	}}
+
+	_, err := service.agentPoolGPUVirtualized(context.Background(), &model.AgentTokenState{
+		WorkspaceID: "workspace-1",
+		PoolName:    "pool-1",
+	})
+	if err == nil || err.Error() != "agent pool worker config is unavailable" {
+		t.Fatalf("agentPoolGPUVirtualized() error = %v", err)
+	}
+}
+
+func TestValidateAgentTransportConfig(t *testing.T) {
+	s := &Service{
+		appConfig: types.AppConfig{
+			Tailscale: types.TailscaleConfig{
+				Enabled:      true,
+				AuthKey:      "tskey-auth-gateway",
+				AgentAuthKey: "tskey-auth-worker",
+			},
+		},
+	}
+
+	if err := s.validateAgentTransportConfig(types.BackendRouteTransportTSNet); err != nil {
+		t.Fatalf("expected configured tsnet transport to pass, got %v", err)
+	}
+
+	s.appConfig.Tailscale.AgentAuthKey = ""
+	if err := s.validateAgentTransportConfig(types.BackendRouteTransportTSNet); err == nil {
+		t.Fatal("expected missing agent auth key to fail")
+	}
+}
+
+func TestAgentInstallCommandLeavesCapacityUnboundedByDefault(t *testing.T) {
+	command := agentInstallCommand("https://app.stage.beam.cloud", "join-token", false, "worker:test")
+
+	if strings.Contains(command, "--max-cpu") || strings.Contains(command, "--max-memory") {
+		t.Fatalf("default install command should use detected host capacity, got %s", command)
+	}
+}
+
+func TestAgentInstallCommandDoesNotUseSudoOnDarwin(t *testing.T) {
+	command := agentInstallCommand("https://app.stage.beam.cloud", "join-token", false, "worker:test")
+
+	if !strings.Contains(command, `uname -s`) || !strings.Contains(command, `Darwin`) {
+		t.Fatalf("expected command to branch on Darwin, got %s", command)
+	}
+	if !strings.Contains(command, `then curl -fsSL 'https://app.stage.beam.cloud/install/agent' | sh -s -- --gateway 'https://app.stage.beam.cloud' --join-token 'join-token' --worker-image 'worker:test'`) {
+		t.Fatalf("expected Darwin/root path to run without sudo, got %s", command)
+	}
+	if !strings.Contains(command, `else curl -fsSL 'https://app.stage.beam.cloud/install/agent' | sudo sh -s -- --gateway 'https://app.stage.beam.cloud' --join-token 'join-token' --worker-image 'worker:test'`) {
+		t.Fatalf("expected non-root Linux path to use sudo, got %s", command)
+	}
+}
+
+func TestAgentInstallCommandDevModeRunsWithoutSudo(t *testing.T) {
+	command := agentInstallCommand("http://localhost:1994", "join-token", true, "worker:test")
+
+	if strings.Contains(command, "sudo") {
+		t.Fatalf("dev command should not use sudo: %s", command)
+	}
+	if !strings.Contains(command, "--dev") {
+		t.Fatalf("dev command should include --dev: %s", command)
+	}
+}
+
+func TestManagedComputeBillableMicros(t *testing.T) {
+	tests := []struct {
+		name       string
+		provider   int64
+		margin     float64
+		want       int64
+		wantBudget int64
+	}{
+		{name: "default margin", provider: 1_500_000, margin: 0.10, want: 1_650_000, wantBudget: 1_363_636},
+		{name: "explicit zero margin", provider: 1_500_000, margin: 0, want: 1_500_000, wantBudget: 1_500_000},
+		{name: "negative margin clamps", provider: 1_500_000, margin: -0.5, want: 1_500_000, wantBudget: 1_500_000},
+		{name: "keeps positive budgets positive", provider: 1, margin: 0.10, want: 2, wantBudget: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := billableMicros(tt.provider, tt.margin); got != tt.want {
+				t.Fatalf("billableMicros() = %d, want %d", got, tt.want)
+			}
+			if got := providerBudgetMicros(tt.provider, tt.margin); got != tt.wantBudget {
+				t.Fatalf("providerBudgetMicros() = %d, want %d", got, tt.wantBudget)
+			}
+		})
+	}
+}
+
+func TestManagedBYOCNodeHourlyCostMicros(t *testing.T) {
+	tests := []struct {
+		name          string
+		cpuMillicores int64
+		memoryMB      int64
+		config        types.ManagedComputeConfig
+		want          int64
+	}{
+		{name: "i4i xlarge shape", cpuMillicores: 4_000, memoryMB: 32 * 1024, want: 182_000},
+		{name: "single gpu xlarge shape", cpuMillicores: 4_000, memoryMB: 16 * 1024, want: 110_000},
+		{name: "fractional resources round up", cpuMillicores: 250, memoryMB: 512, want: 4_625},
+		{
+			name:          "configured rate card",
+			cpuMillicores: 4_000,
+			memoryMB:      32 * 1024,
+			config: types.ManagedComputeConfig{
+				BYOC: types.ManagedComputeBYOCConfig{
+					Pricing: types.ManagedComputeBYOCPricingConfig{
+						CPUHourlyMicrosPerVCPU:  20_000,
+						MemoryHourlyMicrosPerGB: 10_000,
+					},
+				},
+			},
+			want: 400_000,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := managedBYOCNodeHourlyCostMicros(tt.cpuMillicores, tt.memoryMB, tt.config); got != tt.want {
+				t.Fatalf("managedBYOCNodeHourlyCostMicros() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckManagedLaunchCreditBuildsBillingRequest(t *testing.T) {
+	billing := &fakeManagedBilling{
+		launchDecision: billingDecision{OK: true, AvailableCents: 3000, RequiredCents: 2500},
+	}
+	service := &Service{
+		billing: billing,
+		appConfig: types.AppConfig{
+			ManagedCompute: types.ManagedComputeConfig{
+				Billing: types.ManagedComputeBillingConfig{MinimumCreditCents: 2500},
+			},
+		},
+	}
+
+	plan := model.SolvePlan{
+		Actions: []model.SolveAction{
+			{
+				Type:  model.ActionCreate,
+				Count: 2,
+				Offer: model.Offer{HourlyCostMicros: 1_500_000},
+			},
+			{
+				Type:  model.ActionKeep,
+				Count: 1,
+				Offer: model.Offer{HourlyCostMicros: 9_000_000},
+			},
+		},
+		CommittedCostMicros: 42_000_000,
+	}
+
+	decision, err := service.checkManagedLaunchCredit(context.Background(), "workspace-1", "pool-1", plan, nil)
+	if err != nil {
+		t.Fatalf("checkManagedLaunchCredit() error = %v", err)
+	}
+	if !decision.OK {
+		t.Fatal("checkManagedLaunchCredit() returned non-ok decision")
+	}
+	if billing.launchCalls != 1 {
+		t.Fatalf("CheckLaunchCredit calls = %d, want 1", billing.launchCalls)
+	}
+	req := billing.launchRequest
+	if req.WorkspaceID != "workspace-1" || req.PoolName != "pool-1" {
+		t.Fatalf("billing request identity = %s/%s, want workspace-1/pool-1", req.WorkspaceID, req.PoolName)
+	}
+	if req.RequiredCents != 2500 {
+		t.Fatalf("billing request required cents = %d, want 2500", req.RequiredCents)
+	}
+	if req.Quantity != 2 {
+		t.Fatalf("billing request quantity = %d, want 2", req.Quantity)
+	}
+	if req.EstimatedHourlyCostMicros != 3_300_000 {
+		t.Fatalf("billing request hourly micros = %d, want 3300000", req.EstimatedHourlyCostMicros)
+	}
+	if req.EstimatedCommittedMicros != 46_200_000 {
+		t.Fatalf("billing request committed micros = %d, want 46200000", req.EstimatedCommittedMicros)
+	}
+}
+
+func TestListPoolOffersReturnsHetznerCPUOffers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/locations":
+			_, _ = w.Write([]byte(`{
+				"locations": [{"id":1,"name":"ash","description":"Ashburn, VA","country":"US","city":"Ashburn","latitude":39.0438,"longitude":-77.4874,"network_zone":"us-east"}],
+				"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}
+			}`))
+		case "/server_types":
+			_, _ = w.Write([]byte(`{
+				"server_types": [{
+					"id":45,
+					"name":"cpx31",
+					"description":"CPX31",
+					"cores":4,
+					"memory":8,
+					"disk":160,
+					"deprecated":false,
+					"category":"Shared vCPU",
+					"cpu_type":"shared",
+					"storage_type":"local",
+					"architecture":"x86",
+					"locations":[{"id":1,"name":"ash","available":true,"deprecation":null}],
+					"prices":[{"location":"ash","price_hourly":{"net":"0.0312","gross":"0.0248"}}]
+				}],
+				"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}
+			}`))
+		default:
+			t.Fatalf("unexpected Hetzner path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	service := &Service{
+		appConfig: types.AppConfig{
+			Providers: types.ProviderConfig{
+				Hetzner: types.HetznerProviderConfig{
+					ApiToken:             "hetzner-token",
+					BaseURL:              server.URL,
+					ServerTypeCategories: map[string]string{"cpx31": "shared"},
+					RegionMetadata: map[string]types.HetznerRegionConfig{
+						"ash": {DisplayName: "Ashburn", Latitude: 39.0438, Longitude: -77.4874},
+					},
+				},
+			},
+		},
+	}
+
+	res, err := service.ListPoolOffers(context.Background(), &pb.ListPoolOffersRequest{
+		Pool: &pb.PoolConfig{Providers: []string{"hetzner"}},
+	})
+	if err != nil {
+		t.Fatalf("ListPoolOffers() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListPoolOffers() not ok: %s", res.ErrMsg)
+	}
+	if got, want := len(res.Offers), 1; got != want {
+		t.Fatalf("offers = %d, want %d", got, want)
+	}
+
+	offer := res.Offers[0]
+	if offer.Provider != "hetzner" || offer.Cloud != "hetzner" {
+		t.Fatalf("offer provider/cloud = %s/%s, want hetzner/hetzner", offer.Provider, offer.Cloud)
+	}
+	if offer.NodeCount != 1 || offer.GpuCount != 0 {
+		t.Fatalf("offer node/gpu count = %d/%d, want 1/0", offer.NodeCount, offer.GpuCount)
+	}
+	if offer.CpuMillicores != 4000 || offer.MemoryMb != 8192 || offer.StorageMb != 163840 {
+		t.Fatalf("offer resources = %d/%d/%d", offer.CpuMillicores, offer.MemoryMb, offer.StorageMb)
+	}
+	if offer.DisplayName != "CPX31" || offer.Category != "shared" || offer.RegionDisplayName != "Ashburn" {
+		t.Fatalf("offer display fields = %q/%q/%q", offer.DisplayName, offer.Category, offer.RegionDisplayName)
+	}
+	if offer.Latitude != 39.0438 || offer.Longitude != -77.4874 {
+		t.Fatalf("offer coordinates = %f/%f", offer.Latitude, offer.Longitude)
+	}
+}
+
+func TestLaunchPoolCapacityCreatesProviderReservation(t *testing.T) {
+	var createCalls int
+	var createBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/instances/types":
+			_, _ = w.Write([]byte(`{"instance_types":[{"id":"sf-a10g-1","cloud":"lambda","shade_instance_type":"A10Gx1","hourly_price":150,"deployment_type":"vm","configuration":{"gpu_type":"A10G","num_gpus":1,"vcpus":4,"memory_in_gb":16,"storage_in_gb":128},"availability":[{"region":"us-east","available":true}]}]}`))
+		case "/instances/create":
+			createCalls++
+			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
+				t.Fatalf("decode create body: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"id":"reservation-1"}`))
+		default:
+			t.Fatalf("unexpected shadeform path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repo := &fakeComputeRepo{}
+	service := &Service{
+		computeRepo: repo,
+		billing: &fakeManagedBilling{
+			launchDecision: billingDecision{OK: true, AvailableCents: 5000, RequiredCents: 2500},
+		},
+		appConfig: types.AppConfig{
+			GatewayService: types.GatewayServiceConfig{
+				HTTP: types.HTTPConfig{ExternalHost: "app.beam.test", ExternalPort: 443, TLS: true},
+			},
+			Tailscale: types.TailscaleConfig{Enabled: true, AuthKey: "gateway-key", AgentAuthKey: "agent-key"},
+			Providers: types.ProviderConfig{
+				Shadeform: types.ShadeformProviderConfig{ApiKey: "shadeform-key", BaseURL: server.URL},
+			},
+			ManagedCompute: types.ManagedComputeConfig{
+				Billing: types.ManagedComputeBillingConfig{MinimumCreditCents: 2500},
+			},
+		},
+	}
+
+	res, err := service.LaunchPoolCapacity(testAuthContext("workspace-1", "token-1"), &pb.LaunchPoolCapacityRequest{
+		Pool: &pb.PoolConfig{
+			Name:      "pool-1",
+			Gpu:       []string{"A10G"},
+			Nodes:     1,
+			OfferId:   "sf-a10g-1",
+			Ttl:       "1h",
+			MaxSpend:  2,
+			Providers: []string{"shadeform"},
+			Regions:   []string{"us-east"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("LaunchPoolCapacity() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("LaunchPoolCapacity() not ok: code=%s msg=%s", res.ErrorCode, res.ErrMsg)
+	}
+	if createCalls != 1 {
+		t.Fatalf("shadeform create calls = %d, want 1", createCalls)
+	}
+	state := repo.pools["workspace-1"][0]
+	if got, want := len(state.Reservations), 1; got != want {
+		t.Fatalf("reservation count = %d, want %d", got, want)
+	}
+	reservation := state.Reservations[0]
+	if got, want := reservation.ID, "reservation-1"; got != want {
+		t.Fatalf("reservation id = %q, want %q", got, want)
+	}
+	if reservation.MachineID == "" {
+		t.Fatal("reservation missing managed machine id")
+	}
+	if !strings.Contains(createBody["name"].(string), reservation.MachineID) {
+		t.Fatalf("provider name %q does not include machine id %q", createBody["name"], reservation.MachineID)
+	}
+}
+
+func TestLaunchPoolCapacityCreatesHetznerCPUNodeReservation(t *testing.T) {
+	var createCalls int
+	var createBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/locations":
+			_, _ = w.Write([]byte(`{
+				"locations": [{"id":1,"name":"ash","description":"Ashburn","network_zone":"us-east"}],
+				"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}
+			}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/server_types":
+			_, _ = w.Write([]byte(`{
+				"server_types": [{
+					"id":45,
+					"name":"cpx31",
+					"description":"CPX31",
+					"cores":4,
+					"memory":8,
+					"disk":160,
+					"deprecated":false,
+					"category":"Shared vCPU",
+					"cpu_type":"shared",
+					"storage_type":"local",
+					"architecture":"x86",
+					"locations":[{"id":1,"name":"ash","available":true,"deprecation":null}],
+					"prices":[{"location":"ash","price_hourly":{"net":"0.0312","gross":"0.0248"}}]
+				}],
+				"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}
+			}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/networks":
+			_, _ = w.Write([]byte(`{
+				"networks": [{"id":456,"name":"beam-workers","subnets":[{"type":"cloud","ip_range":"10.42.0.0/24","network_zone":"us-east"}]}],
+				"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}
+			}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/servers":
+			createCalls++
+			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
+				t.Fatalf("decode create body: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"server":{"id":42,"status":"initializing","location":{"name":"ash"},"server_type":{"id":45,"name":"cpx31","cores":4,"memory":8,"disk":160}}}`))
+		default:
+			t.Fatalf("unexpected Hetzner request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repo := &fakeComputeRepo{}
+	service := &Service{
+		computeRepo: repo,
+		billing: &fakeManagedBilling{
+			launchDecision: billingDecision{OK: true, AvailableCents: 5000, RequiredCents: 2500},
+		},
+		appConfig: types.AppConfig{
+			GatewayService: types.GatewayServiceConfig{
+				HTTP: types.HTTPConfig{ExternalHost: "app.beam.test", ExternalPort: 443, TLS: true},
+			},
+			Tailscale: types.TailscaleConfig{Enabled: true, AuthKey: "gateway-key", AgentAuthKey: "agent-key"},
+			Providers: types.ProviderConfig{
+				Hetzner: types.HetznerProviderConfig{
+					ApiToken: "hetzner-token",
+					BaseURL:  server.URL,
+					Image:    "ubuntu-24.04",
+					PrivateNetwork: types.HetznerPrivateNetworkConfig{
+						Name: "beam-workers",
+					},
+				},
+			},
+			ManagedCompute: types.ManagedComputeConfig{
+				Billing: types.ManagedComputeBillingConfig{MinimumCreditCents: 2500},
+			},
+		},
+	}
+
+	res, err := service.LaunchPoolCapacity(testAuthContext("workspace-1", "token-1"), &pb.LaunchPoolCapacityRequest{
+		Nodes: 1,
+		Pool: &pb.PoolConfig{
+			Name:      "cpu-pool",
+			OfferId:   "cpx31",
+			Ttl:       "1h",
+			MaxSpend:  1,
+			Providers: []string{"hetzner"},
+			Regions:   []string{"ash"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("LaunchPoolCapacity() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("LaunchPoolCapacity() not ok: code=%s msg=%s", res.ErrorCode, res.ErrMsg)
+	}
+	if createCalls != 1 {
+		t.Fatalf("Hetzner create calls = %d, want 1", createCalls)
+	}
+	if createBody["server_type"] != "cpx31" || createBody["image"] != "ubuntu-24.04" || createBody["location"] != "ash" {
+		t.Fatalf("unexpected Hetzner create body: %#v", createBody)
+	}
+	if got := createBody["networks"]; fmt.Sprint(got) != "[456]" {
+		t.Fatalf("Hetzner networks = %#v, want [456]", got)
+	}
+
+	state := repo.pools["workspace-1"][0]
+	if got, want := state.ReservedNodes, uint32(1); got != want {
+		t.Fatalf("reserved nodes = %d, want %d", got, want)
+	}
+	if got, want := len(state.Reservations), 1; got != want {
+		t.Fatalf("reservation count = %d, want %d", got, want)
+	}
+	reservation := state.Reservations[0]
+	if reservation.Provider != "hetzner" || reservation.NodeCount != 1 || reservation.GPUCount != 0 {
+		t.Fatalf("reservation provider/node/gpu = %s/%d/%d", reservation.Provider, reservation.NodeCount, reservation.GPUCount)
+	}
+	if state.Config.Nodes != 1 {
+		t.Fatalf("pool config nodes = %d, want 1", state.Config.Nodes)
+	}
+}
+
+func TestLaunchPoolCapacityAddsReservationToExistingPool(t *testing.T) {
+	var createCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/instances/types":
+			_, _ = w.Write([]byte(`{"instance_types":[{"id":"sf-a10g-1","cloud":"lambda","shade_instance_type":"A10Gx1","hourly_price":150,"deployment_type":"vm","configuration":{"gpu_type":"A10G","num_gpus":1,"vcpus":4,"memory_in_gb":16,"storage_in_gb":128},"availability":[{"region":"us-east","available":true}]}]}`))
+		case "/instances/create":
+			createCalls++
+			_, _ = w.Write([]byte(`{"id":"reservation-2"}`))
+		default:
+			t.Fatalf("unexpected shadeform path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	now := time.Now().UTC()
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:                 "pool-1",
+					Mode:                 string(types.PoolModePrivate),
+					Selector:             "pool-1",
+					CreatedByTokenID:     "token-1",
+					ReservedNodes:        1,
+					CommittedSpendMicros: 1_650_000,
+					Reservations: []model.Reservation{
+						{
+							ID:               "reservation-1",
+							PoolName:         "pool-1",
+							Selector:         "pool-1",
+							Provider:         "shadeform",
+							OfferID:          "sf-a10g-1",
+							MachineID:        "machine-1",
+							GPU:              "A10G",
+							GPUCount:         1,
+							HourlyCostMicros: 1_500_000,
+							Source:           model.SourceCLIReservation,
+							Status:           model.ReservationActive,
+							CreatedAt:        now.Add(-time.Minute),
+							ExpiresAt:        now.Add(time.Hour),
+						},
+					},
+				},
+			},
+		},
+	}
+	service := &Service{
+		computeRepo: repo,
+		billing: &fakeManagedBilling{
+			launchDecision: billingDecision{OK: true, AvailableCents: 5000, RequiredCents: 2500},
+		},
+		appConfig: types.AppConfig{
+			GatewayService: types.GatewayServiceConfig{
+				HTTP: types.HTTPConfig{ExternalHost: "app.beam.test", ExternalPort: 443, TLS: true},
+			},
+			Tailscale: types.TailscaleConfig{Enabled: true, AuthKey: "gateway-key", AgentAuthKey: "agent-key"},
+			Providers: types.ProviderConfig{
+				Shadeform: types.ShadeformProviderConfig{ApiKey: "shadeform-key", BaseURL: server.URL},
+			},
+			ManagedCompute: types.ManagedComputeConfig{
+				Billing: types.ManagedComputeBillingConfig{MinimumCreditCents: 2500},
+			},
+		},
+	}
+
+	res, err := service.LaunchPoolCapacity(testAuthContext("workspace-1", "token-1"), &pb.LaunchPoolCapacityRequest{
+		Pool: &pb.PoolConfig{
+			Name:      "pool-1",
+			Gpu:       []string{"A10G"},
+			Nodes:     1,
+			OfferId:   "sf-a10g-1",
+			Ttl:       "1h",
+			MaxSpend:  2,
+			Providers: []string{"shadeform"},
+			Regions:   []string{"us-east"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("LaunchPoolCapacity() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("LaunchPoolCapacity() not ok: code=%s msg=%s", res.ErrorCode, res.ErrMsg)
+	}
+	if createCalls != 1 {
+		t.Fatalf("shadeform create calls = %d, want 1", createCalls)
+	}
+	state := repo.pools["workspace-1"][0]
+	if got, want := len(state.Reservations), 2; got != want {
+		t.Fatalf("reservation count = %d, want %d", got, want)
+	}
+	if got, want := state.Reservations[1].ID, "reservation-2"; got != want {
+		t.Fatalf("new reservation id = %q, want %q", got, want)
+	}
+	if got, want := state.ReservedNodes, uint32(2); got != want {
+		t.Fatalf("reserved nodes = %d, want %d", got, want)
+	}
+	if got, want := state.CommittedSpendMicros, int64(3_300_000); got != want {
+		t.Fatalf("committed spend micros = %d, want %d", got, want)
+	}
+}
+
+func TestRecordManagedUsageEmitsOpenMeterMetrics(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		Name: "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				InstanceID:       "instance-1",
+				MachineID:        "machine-1",
+				GPU:              "A10G",
+				GPUCount:         1,
+				CPUMillicores:    4000,
+				MemoryMB:         16384,
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				BillingCursorAt:  now.Add(-time.Minute),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_500_000,
+			},
+		},
+	}
+	billing := &fakeManagedBilling{}
+	usageRepo := &fakeUsageMetricsRepo{}
+	service := &Service{billing: billing, usageMetricsRepo: usageRepo}
+
+	if !service.recordManagedUsage(context.Background(), "workspace-1", state, now, false) {
+		t.Fatal("recordManagedUsage() did not report a state change")
+	}
+
+	if got, want := len(usageRepo.counters), 2; got != want {
+		t.Fatalf("usage counter count = %d, want %d", got, want)
+	}
+	if got, want := usageRepo.counters[0].name, types.UsageMetricsManagedComputeReservationSeconds; got != want {
+		t.Fatalf("usage counter[0] = %q, want %q", got, want)
+	}
+	if got, want := usageRepo.counters[0].value, float64(60); got < want-0.1 || got > want+0.1 {
+		t.Fatalf("seconds value = %f, want about %f", got, want)
+	}
+	if got, want := usageRepo.counters[1].name, types.UsageMetricsManagedComputeReservationCost; got != want {
+		t.Fatalf("usage counter[1] = %q, want %q", got, want)
+	}
+	if usageRepo.counters[1].value <= 0 {
+		t.Fatalf("cost value = %f, want positive", usageRepo.counters[1].value)
+	}
+	if got, want := usageRepo.counters[0].metadata["workspace_id"], "workspace-1"; got != want {
+		t.Fatalf("workspace metadata = %v, want %s", got, want)
+	}
+	if got, want := len(billing.usage), 1; got != want {
+		t.Fatalf("billing usage count = %d, want %d", got, want)
+	}
+	if got, want := billing.usage[0].HourlyCostMicros, int64(1_650_000); got != want {
+		t.Fatalf("billable hourly cost = %d, want %d", got, want)
+	}
+	if got, want := billing.usage[0].CostCents, 2.75; got < want-0.001 || got > want+0.001 {
+		t.Fatalf("billable cost cents = %f, want about %f", got, want)
+	}
+	if !state.Reservations[0].BillingCursorAt.Equal(now) {
+		t.Fatalf("billing cursor = %s, want %s", state.Reservations[0].BillingCursorAt, now)
+	}
+}
+
+func TestMergePoolConfigForLaunchPreservesPoolIdentity(t *testing.T) {
+	existing := &pb.PoolConfig{
+		Name:     "A4000-pool",
+		Gpu:      []string{"A4000"},
+		Ttl:      "1h",
+		MaxSpend: 0.18,
+		Regions:  []string{"oslo-norway-1"},
+		OfferId:  "A4000",
+	}
+	request := &pb.PoolConfig{
+		Name:     "A4000-pool",
+		Gpu:      []string{"A4000"},
+		Ttl:      "1h",
+		MaxSpend: 0.79,
+		Regions:  []string{"newyork-usa-1"},
+		OfferId:  "A4000",
+	}
+
+	merged := mergePoolConfigForLaunch(existing, request)
+
+	if got, want := merged.Regions, []string{"oslo-norway-1", "newyork-usa-1"}; !sameStrings(got, want) {
+		t.Fatalf("merged regions = %v, want %v", got, want)
+	}
+	if got, want := merged.MaxSpend, 0.97; got < want-0.001 || got > want+0.001 {
+		t.Fatalf("merged max spend = %f, want %f", got, want)
+	}
+	if got, want := merged.Gpu, []string{"A4000"}; !sameStrings(got, want) {
+		t.Fatalf("merged gpu = %v, want %v", got, want)
+	}
+	if merged.Ttl != "1h" {
+		t.Fatalf("merged ttl = %q, want 1h", merged.Ttl)
+	}
+}
+
+func TestValidatePoolLaunchCompatibleRejectsGPUMismatch(t *testing.T) {
+	existing := &model.PoolState{
+		Name:   "A4000-pool",
+		Config: &pb.PoolConfig{Name: "A4000-pool", Gpu: []string{"A4000"}},
+	}
+
+	if err := validatePoolLaunchCompatible(existing, model.Pool{GPUs: []string{"A4000"}}); err != nil {
+		t.Fatalf("same GPU should be compatible, got %v", err)
+	}
+	if err := validatePoolLaunchCompatible(existing, model.Pool{GPUs: []string{"A6000"}}); err == nil {
+		t.Fatal("different GPU should be rejected")
+	}
+}
+
+type fakeVendor struct {
+	extended  map[string]time.Time
+	deleted   []string
+	deleteErr error
+}
+
+func (v *fakeVendor) Name() string { return "shadeform" }
+func (v *fakeVendor) ListOffers(context.Context, model.OfferRequest) ([]model.Offer, error) {
+	return nil, nil
+}
+func (v *fakeVendor) CreateReservation(context.Context, model.ReservationRequest) (*model.Reservation, error) {
+	return nil, nil
+}
+func (v *fakeVendor) GetReservation(context.Context, string) (*model.Reservation, error) {
+	return nil, nil
+}
+func (v *fakeVendor) ExtendReservation(_ context.Context, id string, expiresAt time.Time) error {
+	if v.extended == nil {
+		v.extended = map[string]time.Time{}
+	}
+	v.extended[id] = expiresAt
+	return nil
+}
+func (v *fakeVendor) DeleteReservation(_ context.Context, id string) error {
+	v.deleted = append(v.deleted, id)
+	return v.deleteErr
+}
+
+func TestRenewManagedReservationsExtendsExpiringReservation(t *testing.T) {
+	now := time.Now().UTC()
+	expiresAt := now.Add(time.Minute)
+	state := &model.PoolState{
+		Name: "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				InstanceID:       "instance-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				ExpiresAt:        expiresAt,
+				HourlyCostMicros: 1_500_000,
+				CommittedMicros:  1_500_000,
+			},
+		},
+	}
+	vendor := &fakeVendor{}
+	service := &Service{}
+
+	// Plenty of balance: renew for another hour
+	decision := billingDecision{OK: true, AvailableCents: 10_000}
+	if !service.renewManagedReservations(context.Background(), "workspace-1", state, decision, 5, now, map[string]model.Vendor{"shadeform": vendor}) {
+		t.Fatal("renewManagedReservations() did not report a state change")
+	}
+	if got, want := state.Reservations[0].ExpiresAt, expiresAt.Add(time.Hour); !got.Equal(want) {
+		t.Fatalf("expires at = %s, want %s", got, want)
+	}
+	if got, want := state.Reservations[0].CommittedMicros, int64(3_000_000); got != want {
+		t.Fatalf("committed micros = %d, want %d", got, want)
+	}
+	if got, want := state.CommittedSpendMicros, int64(1_650_000); got != want {
+		t.Fatalf("pool committed spend = %d, want %d", got, want)
+	}
+	if got, want := vendor.extended["instance-1"], expiresAt.Add(time.Hour); !got.Equal(want) {
+		t.Fatalf("vendor extended to %s, want %s", got, want)
+	}
+}
+
+func TestRenewManagedReservationsSkipsWhenBalanceInsufficient(t *testing.T) {
+	now := time.Now().UTC()
+	expiresAt := now.Add(time.Minute)
+	state := &model.PoolState{
+		Name: "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				InstanceID:       "instance-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				ExpiresAt:        expiresAt,
+				HourlyCostMicros: 1_500_000,
+			},
+		},
+	}
+	vendor := &fakeVendor{}
+	service := &Service{}
+
+	// 16.5 cents/hr billable but only 10 cents headroom: do not renew
+	decision := billingDecision{OK: true, AvailableCents: 15}
+	if service.renewManagedReservations(context.Background(), "workspace-1", state, decision, 5, now, map[string]model.Vendor{"shadeform": vendor}) {
+		t.Fatal("renewManagedReservations() renewed without sufficient balance")
+	}
+	if !state.Reservations[0].ExpiresAt.Equal(expiresAt) {
+		t.Fatal("reservation expiry should be unchanged")
+	}
+	if len(vendor.extended) != 0 {
+		t.Fatal("vendor should not have been called")
+	}
+}
+
+func TestRenewManagedReservationsIgnoresDistantExpiry(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		Name: "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				InstanceID:       "instance-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now,
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_500_000,
+			},
+		},
+	}
+	vendor := &fakeVendor{}
+	service := &Service{}
+
+	decision := billingDecision{OK: true, AvailableCents: 10_000}
+	if service.renewManagedReservations(context.Background(), "workspace-1", state, decision, 0, now, map[string]model.Vendor{"shadeform": vendor}) {
+		t.Fatal("renewManagedReservations() should not renew a reservation far from expiry")
+	}
+}
+
+func TestRecordAgentMetricsEmitsNodeUsage(t *testing.T) {
+	now := time.Now().UTC()
+	previous := now.Add(-5 * time.Second)
+	machine := &model.AgentTokenState{
+		TokenHash:       "agent-token-hash",
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Hostname:        "node-1",
+		OS:              "linux",
+		Arch:            "amd64",
+		CPUCount:        4,
+		CPUMillicores:   4000,
+		MemoryMB:        8192,
+		GPUs:            []string{"A10G"},
+		GPUIDs:          []string{"0"},
+		GPUCount:        1,
+		Executor:        types.DefaultAgentWorkerContainerMode,
+		Schedulable:     true,
+		LastJoinAt:      now.Add(-time.Minute),
+		LastHeartbeatAt: previous,
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					WorkspaceID: "workspace-1",
+					Name:        "pool-1",
+					Source:      model.SourceCLIReservation,
+					Mode:        string(types.PoolModePrivate),
+					Transport:   string(types.BackendRouteTransportTSNet),
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "pool-1"): {machine},
+		},
+	}
+	usageRepo := &fakeUsageMetricsRepo{}
+	service := &Service{computeRepo: repo, usageMetricsRepo: usageRepo}
+
+	err := service.recordAgentMetrics(context.Background(), machine, &pb.AgentMetricSnapshot{
+		TimestampUnixNano:    now.UnixNano(),
+		CpuUtilizationPct:    25,
+		MemoryUsedMb:         2048,
+		MemoryTotalMb:        8192,
+		MemoryUtilizationPct: 25,
+		DiskUsedMb:           1024,
+		DiskTotalMb:          4096,
+		DiskUsagePct:         25,
+		WorkerCount:          1,
+		ContainerCount:       2,
+		FreeGpuCount:         1,
+	})
+	if err != nil {
+		t.Fatalf("recordAgentMetrics() error = %v", err)
+	}
+
+	if got, want := len(usageRepo.counters), 1; got != want {
+		t.Fatalf("usage counter count = %d, want %d", got, want)
+	}
+	counter := usageRepo.counters[0]
+	if got, want := counter.name, types.UsageMetricsNodeUsage; got != want {
+		t.Fatalf("usage counter = %q, want %q", got, want)
+	}
+	// Usage seconds are measured on the gateway clock, so allow a small delta
+	// between the test's reference time and the call's time.Now().
+	if got, want := counter.value, float64(5); got < want || got > want+1 {
+		t.Fatalf("node usage value = %f, want ~%f", got, want)
+	}
+	if got, want := counter.metadata["workspace_id"], "workspace-1"; got != want {
+		t.Fatalf("workspace metadata = %v, want %s", got, want)
+	}
+	if got, want := counter.metadata["node_type"], "managed"; got != want {
+		t.Fatalf("node type metadata = %v, want %s", got, want)
+	}
+	if got, want := counter.metadata["capacity_source"], string(model.SourceCLIReservation); got != want {
+		t.Fatalf("capacity source metadata = %v, want %s", got, want)
+	}
+	if got, want := counter.metadata["worker_count"], int32(1); got != want {
+		t.Fatalf("worker count metadata = %v, want %d", got, want)
+	}
+	if got, want := counter.metadata["container_count"], int32(2); got != want {
+		t.Fatalf("container count metadata = %v, want %d", got, want)
+	}
+}
+
+func TestRecordAgentMetricsKeepsAgentAliveWhenNodeUsageMetricsFail(t *testing.T) {
+	now := time.Now().UTC()
+	machine := &model.AgentTokenState{
+		TokenHash:       "agent-token-hash",
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		CPUCount:        4,
+		CPUMillicores:   4000,
+		MemoryMB:        8192,
+		Executor:        types.DefaultAgentWorkerContainerMode,
+		LastJoinAt:      now.Add(-time.Minute),
+		LastHeartbeatAt: now.Add(-5 * time.Second),
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{WorkspaceID: "workspace-1", Name: "pool-1", Source: model.SourceCLIReservation},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "pool-1"): {machine},
+		},
+	}
+	service := &Service{
+		computeRepo:      repo,
+		usageMetricsRepo: &fakeUsageMetricsRepo{err: errors.New("openmeter unavailable")},
+	}
+
+	err := service.recordAgentMetrics(context.Background(), machine, &pb.AgentMetricSnapshot{
+		TimestampUnixNano: now.UnixNano(),
+		MemoryTotalMb:     8192,
+	})
+	if err != nil {
+		t.Fatalf("recordAgentMetrics() error = %v", err)
+	}
+}
+
+func TestUpdateAgentAvailabilityDisablesMachineWorker(t *testing.T) {
+	now := time.Now().UTC()
+	agentToken := "agent-token"
+	machine := &model.AgentTokenState{
+		TokenHash:       hashComputeToken(agentToken),
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Hostname:        "node-1",
+		OS:              "linux",
+		Arch:            "amd64",
+		CPUCount:        4,
+		CPUMillicores:   4000,
+		MemoryMB:        8192,
+		GPUs:            []string{"A10G"},
+		GPUIDs:          []string{"GPU-one"},
+		GPUCount:        1,
+		Executor:        types.DefaultAgentWorkerContainerMode,
+		Schedulable:     true,
+		LastJoinAt:      now,
+		LastHeartbeatAt: now,
+	}
+	computeRepo := &fakeComputeRepo{
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "pool-1"): {machine},
+		},
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	workerRepo := &fakeWorkerRepo{worker: &types.Worker{
+		Id:        workerID,
+		MachineId: machine.MachineID,
+		PoolName:  machine.PoolName,
+		Status:    types.WorkerStatusAvailable,
+	}}
+	containerRepo := &fakeContainerRepo{containers: []types.ContainerState{{
+		ContainerId: "container-one",
+		Status:      types.ContainerStatusRunning,
+	}}}
+	service := &Service{computeRepo: computeRepo, workerRepo: workerRepo, containerRepo: containerRepo}
+
+	resp, err := service.UpdateAgentAvailability(context.Background(), &pb.UpdateAgentAvailabilityRequest{
+		AgentToken:         agentToken,
+		Schedulable:        false,
+		Reason:             "vast_preempt",
+		ObservedAtUnixNano: now.UnixNano(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ok {
+		t.Fatalf("response not ok: %s", resp.ErrMsg)
+	}
+	if machine.Schedulable {
+		t.Fatal("machine is still schedulable")
+	}
+	if machine.AvailabilityReason != "vast_preempt" {
+		t.Fatalf("availability reason = %q", machine.AvailabilityReason)
+	}
+	if workerRepo.worker.Status != types.WorkerStatusDisabled {
+		t.Fatalf("worker status = %s, want %s", workerRepo.worker.Status, types.WorkerStatusDisabled)
+	}
+	if got, want := strings.Join(containerRepo.stopped, ","), "container-one"; got != want {
+		t.Fatalf("stopped containers = %q, want %q", got, want)
+	}
+}
+
+func TestRecordAgentDisconnectIgnoresFreshHeartbeat(t *testing.T) {
+	now := time.Now().UTC()
+	machine := &model.AgentTokenState{
+		TokenHash:       "agent-token-hash",
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastJoinAt:      now.Add(-time.Minute),
+		LastHeartbeatAt: now.Add(-5 * time.Second),
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	workerRepo := &fakeWorkerRepo{
+		worker: &types.Worker{Id: workerID, MachineId: machine.MachineID, PoolName: machine.PoolName},
+	}
+	service := &Service{
+		computeRepo: &fakeComputeRepo{
+			machines: map[string][]*model.AgentTokenState{
+				fakeComputeKey("workspace-1", "pool-1"): {machine},
+			},
+		},
+		workerRepo: workerRepo,
+	}
+
+	service.recordAgentDisconnect(context.Background(), machine)
+
+	if !machine.LastDisconnectAt.IsZero() {
+		t.Fatalf("last disconnect = %s, want zero", machine.LastDisconnectAt)
+	}
+	if got := workerRepo.worker.Status; got == types.WorkerStatusDisabled {
+		t.Fatalf("worker status = %q, want not disabled", got)
+	}
+}
+
+func TestRecordAgentDisconnectDisablesStaleHeartbeat(t *testing.T) {
+	now := time.Now().UTC()
+	machine := &model.AgentTokenState{
+		TokenHash:       "agent-token-hash",
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastJoinAt:      now.Add(-model.AgentHeartbeatTimeout - 2*time.Second),
+		LastHeartbeatAt: now.Add(-model.AgentHeartbeatTimeout - time.Second),
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	workerRepo := &fakeWorkerRepo{
+		worker: &types.Worker{Id: workerID, MachineId: machine.MachineID, PoolName: machine.PoolName},
+	}
+	service := &Service{
+		computeRepo: &fakeComputeRepo{
+			machines: map[string][]*model.AgentTokenState{
+				fakeComputeKey("workspace-1", "pool-1"): {machine},
+			},
+		},
+		workerRepo: workerRepo,
+	}
+
+	service.recordAgentDisconnect(context.Background(), machine)
+
+	if machine.LastDisconnectAt.IsZero() {
+		t.Fatal("last disconnect is zero, want timestamp")
+	}
+	if got, want := workerRepo.status, types.WorkerStatusDisabled; got != want {
+		t.Fatalf("worker status = %q, want %q", got, want)
+	}
+}
+
+func TestDisableMachineWorkerStopsActiveContainers(t *testing.T) {
+	machine := &model.AgentTokenState{
+		WorkspaceID: "workspace-1",
+		PoolName:    "pool-1",
+		MachineID:   "machine-1",
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	workerRepo := &fakeWorkerRepo{
+		worker: &types.Worker{Id: workerID, MachineId: machine.MachineID, PoolName: machine.PoolName},
+	}
+	containerRepo := &fakeContainerRepo{
+		containers: []types.ContainerState{
+			{ContainerId: "container-running", Status: types.ContainerStatusRunning},
+			{ContainerId: "container-stopping", Status: types.ContainerStatusStopping},
+		},
+	}
+	service := &Service{workerRepo: workerRepo, containerRepo: containerRepo}
+
+	if !service.disableMachineWorker(context.Background(), machine, reconcileReasonCreditExhausted) {
+		t.Fatal("disableMachineWorker() = false, want true")
+	}
+	if got, want := workerRepo.status, types.WorkerStatusDisabled; got != want {
+		t.Fatalf("worker status = %q, want %q", got, want)
+	}
+	if got, want := containerRepo.stopped, []string{"container-running"}; !sameStrings(got, want) {
+		t.Fatalf("stopped containers = %v, want %v", got, want)
+	}
+}
+
+func TestDisableMachineWorkerKeepsActiveContainersOnDisconnect(t *testing.T) {
+	machine := &model.AgentTokenState{
+		WorkspaceID: "workspace-1",
+		PoolName:    "pool-1",
+		MachineID:   "machine-1",
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	workerRepo := &fakeWorkerRepo{
+		worker: &types.Worker{Id: workerID, MachineId: machine.MachineID, PoolName: machine.PoolName},
+	}
+	containerRepo := &fakeContainerRepo{
+		containers: []types.ContainerState{
+			{ContainerId: "container-running", Status: types.ContainerStatusRunning},
+		},
+	}
+	service := &Service{workerRepo: workerRepo, containerRepo: containerRepo}
+
+	if !service.disableMachineWorker(context.Background(), machine, reconcileReasonAgentDisconnected) {
+		t.Fatal("disableMachineWorker() = false, want true")
+	}
+	if got, want := workerRepo.status, types.WorkerStatusDisabled; got != want {
+		t.Fatalf("worker status = %q, want %q", got, want)
+	}
+	if len(containerRepo.stopped) != 0 {
+		t.Fatalf("stopped containers = %v, want none", containerRepo.stopped)
+	}
+}
+
+func TestDisableMachineWorkerStopsContainersWhenAlreadyDisabledForHardTeardown(t *testing.T) {
+	machine := &model.AgentTokenState{
+		WorkspaceID: "workspace-1",
+		PoolName:    "pool-1",
+		MachineID:   "machine-1",
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	workerRepo := &fakeWorkerRepo{
+		worker: &types.Worker{
+			Id:        workerID,
+			MachineId: machine.MachineID,
+			PoolName:  machine.PoolName,
+			Status:    types.WorkerStatusDisabled,
+		},
+	}
+	containerRepo := &fakeContainerRepo{
+		containers: []types.ContainerState{
+			{ContainerId: "container-running", Status: types.ContainerStatusRunning},
+		},
+	}
+	service := &Service{workerRepo: workerRepo, containerRepo: containerRepo}
+
+	if service.disableMachineWorker(context.Background(), machine, reconcileReasonCreditExhausted) {
+		t.Fatal("disableMachineWorker() = true, want false for already-disabled worker")
+	}
+	if got, want := containerRepo.stopped, []string{"container-running"}; !sameStrings(got, want) {
+		t.Fatalf("stopped containers = %v, want %v", got, want)
+	}
+}
+
+func TestNodeUsageSecondsCapsStaleGap(t *testing.T) {
+	now := time.Now().UTC()
+	if got, want := nodeUsageSeconds(now.Add(-model.AgentHeartbeatTimeout-time.Minute), now), model.AgentHeartbeatTimeout.Seconds(); got != want {
+		t.Fatalf("nodeUsageSeconds() = %f for stale gap, want capped %f", got, want)
+	}
+	if got := nodeUsageSeconds(now.Add(-5*time.Second), now); got != 5 {
+		t.Fatalf("nodeUsageSeconds() = %f, want 5", got)
+	}
+	if got := nodeUsageSeconds(time.Time{}, now); got != 0 {
+		t.Fatalf("nodeUsageSeconds() = %f for zero previous, want 0", got)
+	}
+}
+
+func TestAgentNodeUsageMetadataMarksAttachedNodesAsBYO(t *testing.T) {
+	metadata := agentNodeUsageMetadata(
+		&model.AgentTokenState{WorkspaceID: "workspace-1", PoolName: "pool-1", MachineID: "machine-1"},
+		&model.PoolState{Source: model.SourceAttached},
+		nil,
+		5,
+	)
+	if got, want := metadata["node_type"], "byo"; got != want {
+		t.Fatalf("node type metadata = %v, want %s", got, want)
+	}
+	if got, want := metadata["capacity_source"], string(model.SourceAttached); got != want {
+		t.Fatalf("capacity source metadata = %v, want %s", got, want)
+	}
+}
+
+func TestRecordManagedUsageAdvancesCursorWhenMetricsFailAfterBilling(t *testing.T) {
+	now := time.Now().UTC()
+	cursor := now.Add(-time.Minute)
+	state := managedUsageTestState(now, cursor, now.Add(time.Hour), 1_500_000)
+	billing := &fakeManagedBilling{}
+	service := &Service{
+		billing:          billing,
+		usageMetricsRepo: &fakeUsageMetricsRepo{err: errors.New("openmeter unavailable")},
+	}
+
+	if !service.recordManagedUsage(context.Background(), "workspace-1", state, now, false) {
+		t.Fatal("recordManagedUsage() did not report a state change")
+	}
+	if got, want := len(billing.usage), 1; got != want {
+		t.Fatalf("billing usage count = %d, want %d", got, want)
+	}
+	if !state.Reservations[0].BillingCursorAt.Equal(now) {
+		t.Fatalf("billing cursor = %s, want %s", state.Reservations[0].BillingCursorAt, now)
+	}
+	if !strings.Contains(state.Reservations[0].LastError, "openmeter unavailable") {
+		t.Fatalf("last error = %q, want openmeter error", state.Reservations[0].LastError)
+	}
+}
+
+func TestRecordManagedUsageDoesNotEmitMetricsOrAdvanceCursorWhenBillingFails(t *testing.T) {
+	now := time.Now().UTC()
+	cursor := now.Add(-time.Minute)
+	state := managedUsageTestState(now, cursor, now.Add(time.Hour), 1_500_000)
+	billing := &fakeManagedBilling{usageErr: errors.New("billing callback unavailable")}
+	usageRepo := &fakeUsageMetricsRepo{}
+	service := &Service{
+		billing:          billing,
+		usageMetricsRepo: usageRepo,
+	}
+
+	if !service.recordManagedUsage(context.Background(), "workspace-1", state, now, false) {
+		t.Fatal("recordManagedUsage() did not report a state change")
+	}
+	if got, want := len(usageRepo.counters), 0; got != want {
+		t.Fatalf("usage counter count = %d, want %d", got, want)
+	}
+	if !state.Reservations[0].BillingCursorAt.Equal(cursor) {
+		t.Fatalf("billing cursor advanced to %s, want %s", state.Reservations[0].BillingCursorAt, cursor)
+	}
+	if !strings.Contains(state.Reservations[0].LastError, "billing callback unavailable") {
+		t.Fatalf("last error = %q, want billing callback error", state.Reservations[0].LastError)
+	}
+}
+
+func TestRecordManagedUsageSkipsActiveSubCentWindow(t *testing.T) {
+	now := time.Now().UTC()
+	cursor := now.Add(-5 * time.Second)
+	state := managedUsageTestState(now, cursor, now.Add(time.Hour), 1_000_000)
+	billing := &fakeManagedBilling{}
+	service := &Service{billing: billing}
+
+	if service.recordManagedUsage(context.Background(), "workspace-1", state, now, false) {
+		t.Fatal("recordManagedUsage() reported a change for an active sub-cent window")
+	}
+	if got := len(billing.usage); got != 0 {
+		t.Fatalf("billing usage count = %d, want 0", got)
+	}
+	if !state.Reservations[0].BillingCursorAt.Equal(cursor) {
+		t.Fatalf("billing cursor advanced to %s, want %s", state.Reservations[0].BillingCursorAt, cursor)
+	}
+}
+
+func TestRecordManagedUsageRecordsBYOCMachineWithManagedRates(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	activeWindow := 4 * time.Minute
+	cursor := now.Add(-activeWindow)
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "aws-cpu",
+		Source:      model.SourceAWS,
+		BYOC: &model.BYOCProviderState{
+			Provider: "aws",
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:        "workspace-1",
+		PoolName:           "aws-cpu",
+		MachineID:          "machine-1",
+		MachineFingerprint: "i-0123456789abcdef0",
+		CPUMillicores:      4_000,
+		MemoryMB:           32 * 1024,
+		GPUs:               []string{"A10G"},
+		GPUCount:           1,
+		CreatedAt:          now.Add(-2 * time.Hour),
+		LastJoinAt:         now.Add(-2 * time.Hour),
+		LastHeartbeatAt:    now,
+		BillingCursorAt:    cursor,
+		Schedulable:        true,
+	}
+	billing := &fakeManagedBilling{}
+	usageRepo := &fakeUsageMetricsRepo{}
+	repo := &fakeComputeRepo{
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "aws-cpu"): {machine},
+		},
+	}
+	service := &Service{billing: billing, usageMetricsRepo: usageRepo, computeRepo: repo}
+
+	if !service.recordManagedUsage(context.Background(), "workspace-1", state, now, false) {
+		t.Fatal("recordManagedUsage() did not report a state change")
+	}
+	if got, want := len(billing.usage), 1; got != want {
+		t.Fatalf("billing usage count = %d, want %d", got, want)
+	}
+	usage := billing.usage[0]
+	if got, want := usage.ReservationID, "byoc:machine-1"; got != want {
+		t.Fatalf("reservation id = %q, want %q", got, want)
+	}
+	if got, want := usage.Provider, "byoc"; got != want {
+		t.Fatalf("provider = %q, want %q", got, want)
+	}
+	if got, want := usage.Cloud, "aws"; got != want {
+		t.Fatalf("cloud = %q, want %q", got, want)
+	}
+	if got, want := usage.HourlyCostMicros, int64(182_000); got != want {
+		t.Fatalf("hourly cost micros = %d, want %d", got, want)
+	}
+	if got, want := usage.CostCents, 1.0; got < want-0.001 || got > want+0.001 {
+		t.Fatalf("cost cents = %f, want about %f", got, want)
+	}
+	wantBillableDuration := time.Duration(float64(activeWindow) * (1.0 / managedCostCents(182_000, activeWindow))).Truncate(time.Second)
+	if got, want := usage.DurationSeconds, wantBillableDuration.Seconds(); got != want {
+		t.Fatalf("duration seconds = %f, want %f", got, want)
+	}
+	if got, want := usage.CPUMillicores, int64(4_000); got != want {
+		t.Fatalf("cpu millicores = %d, want %d", got, want)
+	}
+	if got, want := usage.MemoryMB, int64(32*1024); got != want {
+		t.Fatalf("memory mb = %d, want %d", got, want)
+	}
+	if got, want := usage.GPU, "A10G"; got != want {
+		t.Fatalf("gpu = %q, want %q", got, want)
+	}
+	if want := cursor.Add(wantBillableDuration); !machine.BillingCursorAt.Equal(want) {
+		t.Fatalf("machine billing cursor = %s, want %s", machine.BillingCursorAt, want)
+	}
+	if got, want := len(usageRepo.counters), 2; got != want {
+		t.Fatalf("usage counter count = %d, want %d", got, want)
+	}
+}
+
+func TestRecordManagedUsageBillsClosedSubCentWindow(t *testing.T) {
+	now := time.Now().UTC()
+	cursor := now.Add(-5 * time.Second)
+	state := managedUsageTestState(now, cursor, now, 1_000_000)
+	billing := &fakeManagedBilling{}
+	service := &Service{billing: billing}
+
+	if !service.recordManagedUsage(context.Background(), "workspace-1", state, now, false) {
+		t.Fatal("recordManagedUsage() did not bill a closed sub-cent window")
+	}
+	if got := len(billing.usage); got != 1 {
+		t.Fatalf("billing usage count = %d, want 1", got)
+	}
+	if !state.Reservations[0].BillingCursorAt.Equal(now) {
+		t.Fatalf("billing cursor = %s, want %s", state.Reservations[0].BillingCursorAt, now)
+	}
+}
+
+func TestReconcileManagedComputeTerminatesReservationsWhenCreditsAreExhausted(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:         "workspace-1",
+		PoolName:            "pool-1",
+		MachineID:           "machine-1",
+		Schedulable:         true,
+		LastHeartbeatAt:     now,
+		LastJoinAt:          now,
+		Executor:            types.DefaultAgentWorkerContainerMode,
+		CPUCount:            4,
+		CPUMillicores:       4000,
+		MemoryMB:            8192,
+		NetworkSlotPoolSize: 16,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "pool-1"): {machine}},
+	}
+	service := &Service{
+		computeRepo: repo,
+		billing: &fakeManagedBilling{
+			balanceDecision: billingDecision{
+				OK:             false,
+				ErrorCode:      launchErrorInsufficientCredit,
+				Message:        "credits exhausted",
+				AvailableCents: 0,
+				RequiredCents:  2500,
+			},
+		},
+	}
+
+	if err := service.ReconcileManagedCompute(context.Background()); err != nil {
+		t.Fatalf("ReconcileManagedCompute() error = %v", err)
+	}
+
+	saved := repo.pools["workspace-1"][0]
+	if !repo.savedPool {
+		t.Fatal("ReconcileManagedCompute() did not persist the pool transition")
+	}
+	if got, want := saved.Reservations[0].Status, model.ReservationTerminating; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+	if got, want := saved.Reservations[0].TerminatingReason, "credit_exhausted"; got != want {
+		t.Fatalf("terminating reason = %q, want %q", got, want)
+	}
+	if machine.Schedulable {
+		t.Fatal("credit exhaustion did not mark the machine unschedulable")
+	}
+}
+
+func TestReconcileManagedComputeRecordsUsageBeforeBalanceCheck(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				BillingCursorAt:  now.Add(-time.Minute),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	repo := &fakeComputeRepo{pools: map[string][]*model.PoolState{"workspace-1": {state}}}
+	billing := &fakeManagedBilling{balanceDecision: billingDecision{OK: true, RequiredCents: 1, AvailableCents: 1000}}
+	service := &Service{computeRepo: repo, billing: billing}
+
+	if err := service.ReconcileManagedCompute(context.Background()); err != nil {
+		t.Fatalf("ReconcileManagedCompute() error = %v", err)
+	}
+
+	if got, want := len(billing.usage), 1; got != want {
+		t.Fatalf("managed usage records = %d, want %d", got, want)
+	}
+	if got, want := billing.balanceSawUsageCount, 1; got != want {
+		t.Fatalf("balance saw usage count = %d, want %d", got, want)
+	}
+	if !state.Reservations[0].BillingCursorAt.After(now.Add(-time.Second)) {
+		t.Fatalf("billing cursor was not advanced: %s", state.Reservations[0].BillingCursorAt)
+	}
+}
+
+func TestReconcileManagedComputeChecksBalanceAfterFreshUsageTick(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:                 "reservation-1",
+				Source:             model.SourceCLIReservation,
+				Status:             model.ReservationActive,
+				CreatedAt:          now.Add(-time.Hour),
+				BillingCursorAt:    now.Add(-time.Minute),
+				LastBillingCheckAt: now.Add(-time.Second),
+				ExpiresAt:          now.Add(time.Hour),
+				HourlyCostMicros:   1_000_000,
+			},
+		},
+	}
+	repo := &fakeComputeRepo{pools: map[string][]*model.PoolState{"workspace-1": {state}}}
+	billing := &fakeManagedBilling{balanceDecision: billingDecision{OK: true, RequiredCents: 1, AvailableCents: 1000}}
+	service := &Service{computeRepo: repo, billing: billing}
+
+	if err := service.ReconcileManagedCompute(context.Background()); err != nil {
+		t.Fatalf("ReconcileManagedCompute() error = %v", err)
+	}
+	if got, want := billing.balanceCalls, 1; got != want {
+		t.Fatalf("balance calls = %d, want %d", got, want)
+	}
+}
+
+func TestReconcileManagedComputeChecksBalanceWhenUsageCursorIsFresh(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:                 "reservation-1",
+				Source:             model.SourceCLIReservation,
+				Status:             model.ReservationActive,
+				CreatedAt:          now.Add(-time.Hour),
+				BillingCursorAt:    now,
+				LastBillingCheckAt: now,
+				ExpiresAt:          now.Add(time.Hour),
+				HourlyCostMicros:   1_000_000,
+			},
+		},
+	}
+	repo := &fakeComputeRepo{pools: map[string][]*model.PoolState{"workspace-1": {state}}}
+	billing := &fakeManagedBilling{balanceDecision: billingDecision{OK: true, RequiredCents: 1, AvailableCents: 1000}}
+	service := &Service{computeRepo: repo, billing: billing}
+
+	if err := service.ReconcileManagedCompute(context.Background()); err != nil {
+		t.Fatalf("ReconcileManagedCompute() error = %v", err)
+	}
+	if got, want := len(billing.usage), 0; got != want {
+		t.Fatalf("managed usage records = %d, want %d", got, want)
+	}
+	if got, want := billing.balanceCalls, 1; got != want {
+		t.Fatalf("balance calls = %d, want %d", got, want)
+	}
+}
+
+func TestReconcileManagedComputeBillsExpiredReservationBeforeTerminating(t *testing.T) {
+	now := time.Now().UTC()
+	cursor := now.Add(-10 * time.Minute)
+	expiresAt := now.Add(-time.Minute)
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				BillingCursorAt:  cursor,
+				ExpiresAt:        expiresAt,
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	repo := &fakeComputeRepo{pools: map[string][]*model.PoolState{"workspace-1": {state}}}
+	billing := &fakeManagedBilling{balanceDecision: billingDecision{OK: true, RequiredCents: 1, AvailableCents: 1000}}
+	service := &Service{computeRepo: repo, billing: billing}
+
+	if err := service.ReconcileManagedCompute(context.Background()); err != nil {
+		t.Fatalf("ReconcileManagedCompute() error = %v", err)
+	}
+
+	if got, want := len(billing.usage), 1; got != want {
+		t.Fatalf("managed usage records = %d, want %d", got, want)
+	}
+	if got, want := billing.usage[0].DurationSeconds, float64(9*time.Minute/time.Second); got != want {
+		t.Fatalf("managed usage duration = %f, want %f", got, want)
+	}
+	if !state.Reservations[0].BillingCursorAt.Equal(expiresAt) {
+		t.Fatalf("billing cursor = %s, want %s", state.Reservations[0].BillingCursorAt, expiresAt)
+	}
+	if got, want := state.Reservations[0].Status, model.ReservationTerminating; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+}
+
+func TestReservationBillingWindowSkipsTerminatingReservation(t *testing.T) {
+	now := time.Now().UTC()
+	reservation := &model.Reservation{
+		ID:              "reservation-1",
+		Source:          model.SourceCLIReservation,
+		Status:          model.ReservationTerminating,
+		CreatedAt:       now.Add(-time.Hour),
+		BillingCursorAt: now.Add(-time.Minute),
+		ExpiresAt:       now.Add(time.Hour),
+	}
+
+	if _, _, ok := reservationBillingWindow(reservation, now); ok {
+		t.Fatal("terminating reservation should not have a billing window")
+	}
+}
+
+func TestReconcileManagedComputeDoesNotTerminateOnBillingError(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "pool-1"): {machine}},
+	}
+	service := &Service{
+		computeRepo: repo,
+		billing:     &fakeManagedBilling{balanceErr: errors.New("billing unavailable")},
+	}
+
+	if err := service.ReconcileManagedCompute(context.Background()); err != nil {
+		t.Fatalf("ReconcileManagedCompute() error = %v", err)
+	}
+
+	if got, want := state.Reservations[0].Status, model.ReservationActive; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+	if !machine.Schedulable {
+		t.Fatal("billing error marked the machine unschedulable")
+	}
+	if state.Reservations[0].TerminatingReason != "" {
+		t.Fatalf("billing error set terminating reason = %q", state.Reservations[0].TerminatingReason)
+	}
+}
+
+func TestReconcileManagedComputeKeepsSameSecondHeartbeatConnected(t *testing.T) {
+	reconcileAt := time.Date(2026, 6, 13, 17, 19, 47, 700*int(time.Millisecond), time.UTC)
+	heartbeatAt := reconcileAt.Truncate(time.Second).Add(650 * time.Millisecond)
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Executor:        types.DefaultAgentWorkerContainerMode,
+		Schedulable:     true,
+		LastJoinAt:      reconcileAt.Add(-time.Minute),
+		LastHeartbeatAt: heartbeatAt,
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	workerRepo := &fakeWorkerRepo{
+		worker: &types.Worker{
+			Id:        workerID,
+			Status:    types.WorkerStatusAvailable,
+			MachineId: machine.MachineID,
+			PoolName:  machine.PoolName,
+		},
+	}
+	service := &Service{
+		computeRepo: &fakeComputeRepo{
+			pools: map[string][]*model.PoolState{"workspace-1": {state}},
+			machines: map[string][]*model.AgentTokenState{
+				fakeComputeKey("workspace-1", "pool-1"): {machine},
+			},
+		},
+		workerRepo: workerRepo,
+	}
+
+	if err := service.reconcileManagedComputeAt(context.Background(), reconcileAt); err != nil {
+		t.Fatalf("reconcileManagedComputeAt() error = %v", err)
+	}
+	if got, want := workerRepo.worker.Status, types.WorkerStatusAvailable; got != want {
+		t.Fatalf("worker status = %q, want %q", got, want)
+	}
+	if got := workerRepo.status; got != "" {
+		t.Fatalf("worker status update = %q, want none", got)
+	}
+}
+
+func TestReconcileManagedComputeUsesFreshTimePerPool(t *testing.T) {
+	firstPoolTime := time.Date(2026, 6, 13, 17, 19, 47, 0, time.UTC)
+	secondPoolTime := firstPoolTime.Add(70 * time.Second)
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "live-pool",
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "live-pool",
+		MachineID:       "machine-1",
+		Executor:        types.DefaultAgentWorkerContainerMode,
+		Schedulable:     true,
+		LastJoinAt:      firstPoolTime.Add(-time.Minute),
+		LastHeartbeatAt: secondPoolTime.Add(-5 * time.Second),
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	workerRepo := &fakeWorkerRepo{
+		worker: &types.Worker{
+			Id:        workerID,
+			Status:    types.WorkerStatusAvailable,
+			MachineId: machine.MachineID,
+			PoolName:  machine.PoolName,
+		},
+	}
+	service := &Service{
+		computeRepo: &fakeComputeRepo{
+			pools: map[string][]*model.PoolState{
+				"workspace-1": {
+					{WorkspaceID: "workspace-1", Name: "slow-pool"},
+					state,
+				},
+			},
+			machines: map[string][]*model.AgentTokenState{
+				fakeComputeKey("workspace-1", "live-pool"): {machine},
+			},
+		},
+		workerRepo: workerRepo,
+	}
+	clockCalls := 0
+
+	if err := service.reconcileManagedComputeWithClock(context.Background(), func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return firstPoolTime
+		}
+		return secondPoolTime
+	}); err != nil {
+		t.Fatalf("reconcileManagedComputeWithClock() error = %v", err)
+	}
+	if got, want := workerRepo.worker.Status, types.WorkerStatusAvailable; got != want {
+		t.Fatalf("worker status = %q, want %q", got, want)
+	}
+	if got := workerRepo.status; got != "" {
+		t.Fatalf("worker status update = %q, want none", got)
+	}
+	if got, want := clockCalls, 2; got != want {
+		t.Fatalf("clock calls = %d, want %d", got, want)
+	}
+}
+
+func TestReconcileManagedComputeRemovesMachineForDeletedReservation(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:        "reservation-1",
+				Provider:  "shadeform",
+				Source:    model.SourceCLIReservation,
+				Status:    model.ReservationDeleted,
+				MachineID: "machine-1",
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "pool-1"): {machine}},
+	}
+	service := &Service{computeRepo: repo}
+
+	if err := service.ReconcileManagedCompute(context.Background()); err != nil {
+		t.Fatalf("ReconcileManagedCompute() error = %v", err)
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "pool-1")]); got != 0 {
+		t.Fatalf("machine count after reconcile = %d, want 0", got)
+	}
+	if !repo.savedPool {
+		t.Fatal("ReconcileManagedCompute() did not persist closed reservation cleanup")
+	}
+}
+
+func TestReleasePrivateMachineTransitionsManagedReservation(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:                    "reservation-1",
+				Provider:              "shadeform",
+				InstanceID:            "instance-1",
+				MachineID:             "machine-1",
+				Source:                model.SourceCLIReservation,
+				Status:                model.ReservationActive,
+				CreatedAt:             now.Add(-time.Hour),
+				ExpiresAt:             now.Add(time.Hour),
+				HourlyCostMicros:      1_000_000,
+				RegistrationTokenHash: "join-token-hash",
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools:      map[string][]*model.PoolState{"workspace-1": {state}},
+		machines:   map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "pool-1"): {machine}},
+		joinTokens: map[string]*model.JoinTokenState{"join-token-hash": {TokenHash: "join-token-hash", ExpiresAt: now.Add(time.Hour)}},
+	}
+	billing := &fakeManagedBilling{}
+	service := &Service{computeRepo: repo, billing: billing}
+
+	if err := service.releasePrivateMachine(context.Background(), machine); err != nil {
+		t.Fatalf("releasePrivateMachine() error = %v", err)
+	}
+
+	saved := repo.pools["workspace-1"][0]
+	if !repo.savedPool {
+		t.Fatal("releasePrivateMachine() did not persist the reservation transition")
+	}
+	if got, want := saved.Reservations[0].Status, model.ReservationTerminating; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+	if got, want := saved.Reservations[0].TerminatingReason, reconcileReasonMachineReleased; got != want {
+		t.Fatalf("terminating reason = %q, want %q", got, want)
+	}
+	if got, want := saved.Reservations[0].MachineID, "machine-1"; got != want {
+		t.Fatalf("reservation machine id = %q, want %q", got, want)
+	}
+	if !strings.Contains(saved.Reservations[0].LastError, "vendor \"shadeform\" is not configured") {
+		t.Fatalf("reservation last error = %q, want missing vendor error", saved.Reservations[0].LastError)
+	}
+	if machine.Schedulable {
+		t.Fatal("releasePrivateMachine() did not mark the machine unschedulable before deleting it")
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "pool-1")]); got != 0 {
+		t.Fatalf("machine count after release = %d, want 0", got)
+	}
+	if got, want := len(billing.usage), 1; got != want {
+		t.Fatalf("managed usage records = %d, want %d", got, want)
+	}
+	if token := repo.joinTokens["join-token-hash"]; token == nil || !token.Revoked {
+		t.Fatal("releasePrivateMachine() did not revoke the reservation join token")
+	}
+}
+
+func TestReleasePrivateMachineCleansMachineScopedRedisState(t *testing.T) {
+	ctx := context.Background()
+	rdb, err := repository.NewRedisClientForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	computeRepo := repository.NewComputeRedisRepository(rdb)
+	workerRepo := repository.NewWorkerRedisRepositoryForTest(rdb)
+	machine := &model.AgentTokenState{
+		TokenHash:       "agent-token-hash",
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastHeartbeatAt: time.Now().UTC(),
+	}
+	if err := computeRepo.SavePoolState(ctx, machine.WorkspaceID, &model.PoolState{
+		Name: machine.PoolName,
+		Mode: string(types.PoolModePrivate),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := computeRepo.SaveAgentTokenState(ctx, machine, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := computeRepo.SaveJoinTokenState(ctx, &model.JoinTokenState{
+		TokenHash:   "revoked-join-token",
+		WorkspaceID: machine.WorkspaceID,
+		PoolName:    machine.PoolName,
+		Revoked:     true,
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	workerID := model.AgentMachineWorkerID(machine.MachineID)
+	if err := workerRepo.AddWorker(&types.Worker{
+		Id:        workerID,
+		MachineId: machine.MachineID,
+		PoolName:  machine.PoolName,
+		Status:    types.WorkerStatusAvailable,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	networkPrefix := common.WorkerNetworkPrefix("beta9", machine.MachineID)
+	otherNetworkPrefix := common.WorkerNetworkPrefix("beta9", "machine-2")
+	for i := 0; i < 24; i++ {
+		if err := workerRepo.SetContainerIp(
+			networkPrefix,
+			fmt.Sprintf("network-slot:slot-%02d", i),
+			fmt.Sprintf("192.168.0.%d", i+2),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := workerRepo.SetContainerIp(otherNetworkPrefix, "network-slot:other", "192.168.1.2"); err != nil {
+		t.Fatal(err)
+	}
+
+	locality := machine.WorkspaceID + "/" + machine.PoolName
+	coordinator := cache.NewCoordinator(repository.NewCacheRedisRepository(rdb))
+	targetLogicalHostID := "cache-host-workspace-1-pool-1-machine-1-path"
+	for _, host := range []cache.CoordinatorHost{
+		{
+			LogicalHostID:  targetLogicalHostID,
+			RegistrationID: workerID,
+			PoolName:       machine.PoolName,
+			Locality:       locality,
+			NodeID:         machine.MachineID,
+			CachePathID:    "path",
+			PrivateAddr:    "10.0.0.1:2049",
+		},
+		{
+			LogicalHostID:  "cache-host-workspace-1-pool-1-machine-2-path",
+			RegistrationID: "worker-machine-2",
+			PoolName:       machine.PoolName,
+			Locality:       locality,
+			NodeID:         "machine-2",
+			CachePathID:    "path",
+			PrivateAddr:    "10.0.0.2:2049",
+		},
+	} {
+		if err := coordinator.RegisterHost(ctx, host, 30*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	routeRevisionKeys := []string{
+		common.RedisKeys.SchedulerBackendRouteMachineRevision(machine.WorkspaceID, machine.PoolName, machine.MachineID),
+		common.RedisKeys.SchedulerBackendRouteMachineIDRevision(machine.MachineID),
+	}
+	for _, key := range routeRevisionKeys {
+		if err := rdb.Set(ctx, key, "7", 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := &Service{
+		appConfig:   types.AppConfig{ClusterName: "beta9"},
+		computeRepo: computeRepo,
+		workerRepo:  workerRepo,
+		redisClient: rdb,
+	}
+	if err := service.releasePrivateMachine(ctx, machine); err != nil {
+		t.Fatal(err)
+	}
+
+	networkKeys, err := rdb.Keys(ctx, "worker:network:"+networkPrefix+"*")
+	if err != nil || len(networkKeys) != 0 {
+		t.Fatalf("released machine network keys = %v, %v; want none", networkKeys, err)
+	}
+	otherIP, err := workerRepo.GetContainerIp(otherNetworkPrefix, "network-slot:other")
+	if err != nil || otherIP != "192.168.1.2" {
+		t.Fatalf("other machine network allocation = %q, %v", otherIP, err)
+	}
+	cacheKeys, err := rdb.Keys(ctx, "cache:coordinator:host:"+targetLogicalHostID+"*")
+	if err != nil || len(cacheKeys) != 0 {
+		t.Fatalf("released machine cache keys = %v, %v; want none", cacheKeys, err)
+	}
+	hosts, err := coordinator.ListHosts(ctx, machine.PoolName, locality)
+	if err != nil || len(hosts) != 1 || hosts[0].NodeID != "machine-2" {
+		t.Fatalf("remaining cache hosts = %#v, %v; want only machine-2", hosts, err)
+	}
+	for _, key := range routeRevisionKeys {
+		value, err := rdb.Get(ctx, key).Result()
+		if err != nil || value != "7" {
+			t.Fatalf("route revision %q = %q, %v; want preserved", key, value, err)
+		}
+	}
+	joinToken, err := computeRepo.GetJoinTokenState(ctx, "revoked-join-token")
+	if err != nil || joinToken == nil || !joinToken.Revoked {
+		t.Fatalf("revoked join token = %#v, %v; want preserved", joinToken, err)
+	}
+}
+
+func TestTerminateReservationTreatsProviderNotFoundAsDeleted(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "codex-hetzner-latency",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "hetzner",
+				InstanceID:       "42",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	vendor := &fakeVendor{deleteErr: &model.HTTPStatusError{
+		Method:     http.MethodDelete,
+		Path:       "/servers/42",
+		StatusCode: http.StatusNotFound,
+		Body:       "not found",
+	}}
+	service := &Service{}
+
+	if !service.terminateReservation(
+		context.Background(),
+		"workspace-1",
+		state,
+		&state.Reservations[0],
+		map[string]model.Vendor{"hetzner": vendor},
+		reconcileReasonMachineReleased,
+		machineReleasedMessage,
+	) {
+		t.Fatal("terminateReservation() did not report a change")
+	}
+	if got, want := state.Reservations[0].Status, model.ReservationDeleted; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+	if got := state.Reservations[0].LastError; got != "" {
+		t.Fatalf("reservation last error = %q, want empty", got)
+	}
+	if got, want := vendor.deleted, []string{"42"}; !sameStrings(got, want) {
+		t.Fatalf("deleted reservations = %v, want %v", got, want)
+	}
+}
+
+func TestReleasePrivateMachineLinksSingleUnassignedManagedReservation(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:         "reservation-1",
+				Provider:   "shadeform",
+				InstanceID: "instance-1",
+				Source:     model.SourceCLIReservation,
+				Status:     model.ReservationActive,
+				CreatedAt:  now.Add(-time.Hour),
+				ExpiresAt:  now.Add(time.Hour),
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "pool-1"): {machine}},
+	}
+	service := &Service{computeRepo: repo}
+
+	if err := service.releasePrivateMachine(context.Background(), machine); err != nil {
+		t.Fatalf("releasePrivateMachine() error = %v", err)
+	}
+	if got, want := state.Reservations[0].Status, model.ReservationTerminating; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+	if got, want := state.Reservations[0].MachineID, "machine-1"; got != want {
+		t.Fatalf("reservation machine id = %q, want %q", got, want)
+	}
+	if machine.Schedulable {
+		t.Fatal("releasePrivateMachine() did not mark the machine unschedulable")
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "pool-1")]); got != 0 {
+		t.Fatalf("machine count after release = %d, want 0", got)
+	}
+}
+
+func TestReleasePrivateMachineRejectsAmbiguousUnassignedManagedReservations(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:         "reservation-1",
+				Provider:   "shadeform",
+				InstanceID: "instance-1",
+				Source:     model.SourceCLIReservation,
+				Status:     model.ReservationActive,
+				CreatedAt:  now.Add(-time.Hour),
+				ExpiresAt:  now.Add(time.Hour),
+			},
+			{
+				ID:         "reservation-2",
+				Provider:   "shadeform",
+				InstanceID: "instance-2",
+				Source:     model.SourceCLIReservation,
+				Status:     model.ReservationActive,
+				CreatedAt:  now.Add(-time.Hour),
+				ExpiresAt:  now.Add(time.Hour),
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "pool-1"): {machine}},
+	}
+	service := &Service{computeRepo: repo}
+
+	err := service.releasePrivateMachine(context.Background(), machine)
+	if err == nil || !strings.Contains(err.Error(), "managed reservation for machine \"machine-1\" is ambiguous") {
+		t.Fatalf("releasePrivateMachine() error = %v, want ambiguous reservation error", err)
+	}
+	if got, want := state.Reservations[0].Status, model.ReservationActive; got != want {
+		t.Fatalf("reservation[0] status = %q, want %q", got, want)
+	}
+	if got, want := state.Reservations[1].Status, model.ReservationActive; got != want {
+		t.Fatalf("reservation[1] status = %q, want %q", got, want)
+	}
+	if !machine.Schedulable {
+		t.Fatal("failed release should not mark the machine unschedulable")
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "pool-1")]); got != 1 {
+		t.Fatalf("machine count after failed release = %d, want 1", got)
+	}
+}
+
+func TestDeletePrivateMachineReleasesManagedReservationID(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID:      "workspace-1",
+		Name:             "pool-1",
+		Mode:             string(types.PoolModePrivate),
+		CreatedByTokenID: "token-owner",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				InstanceID:       "instance-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationPending,
+				CreatedAt:        now.Add(-time.Minute),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{"workspace-1": {state}},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.DeletePrivateMachine(
+		testAuthContext("workspace-1", "token-owner"),
+		&pb.DeleteMachineRequest{PoolName: "pool-1", MachineId: "reservation-1"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+	if !repo.savedPool {
+		t.Fatal("DeletePrivateMachine() did not persist the reservation transition")
+	}
+	if got, want := state.Reservations[0].Status, model.ReservationTerminating; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+	if got, want := state.Reservations[0].TerminatingReason, reconcileReasonMachineReleased; got != want {
+		t.Fatalf("terminating reason = %q, want %q", got, want)
+	}
+	if !strings.Contains(state.Reservations[0].LastError, "vendor \"shadeform\" is not configured") {
+		t.Fatalf("reservation last error = %q, want missing vendor error", state.Reservations[0].LastError)
+	}
+}
+
+func TestDeletePrivateMachineBYOCMissingMachineIsIdempotentAndCleansDeletedPool(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	resourceURL := awsCloudFormationStackURL("us-east-1", "beam-aws-cpu-test")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "aws-cpu",
+					Mode:             string(types.PoolModePrivate),
+					CreatedByTokenID: "owner-token",
+					Source:           model.SourceAWS,
+					Config:           &pb.PoolConfig{Name: "aws-cpu", Regions: []string{"us-east-1"}},
+					BYOC: &model.BYOCProviderState{
+						Provider:     "aws",
+						AccountID:    "123456789012",
+						Region:       "us-east-1",
+						ResourceName: "beam-aws-cpu-test",
+						ResourceURL:  resourceURL,
+						DestroyURL:   resourceURL,
+						Labels: map[string]string{
+							"instance_type":                   "i4i.xlarge",
+							"desired_nodes":                   "1",
+							"max_nodes":                       "1",
+							"target_sandboxes":                "20",
+							"sandboxes_per_node":              "20",
+							awsBYOCAutoScalingGroupNameLabel:  "beam-asg-aws-cpu-test",
+							awsBYOCControlRoleArnLabel:        "arn:aws:iam::123456789012:role/beam-control-aws-cpu-test",
+							awsBYOCControlRoleExternalIDLabel: "beam-byoc-test-external-id",
+						},
+					},
+				},
+			},
+		},
+	}
+	oldResourceDeleted := awsBYOCResourceDeleted
+	awsBYOCResourceDeleted = func(context.Context, awsBYOCResourceDeletedInput) (bool, error) {
+		return true, nil
+	}
+	defer func() {
+		awsBYOCResourceDeleted = oldResourceDeleted
+	}()
+
+	res, err := (&Service{computeRepo: repo}).DeletePrivateMachine(
+		ctx,
+		&pb.DeleteMachineRequest{PoolName: "aws-cpu", MachineId: "machine-already-gone"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+	if got := len(repo.pools["workspace-1"]); got != 0 {
+		t.Fatalf("stored pool count = %d, want 0", got)
+	}
+}
+
+func TestDeletePrivateMachineMissingPrivateMachineIsIdempotent(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "pool-1",
+					CreatedByTokenID: "owner-token",
+					Mode:             string(types.PoolModePrivate),
+				},
+			},
+		},
+	}
+
+	res, err := (&Service{computeRepo: repo}).DeletePrivateMachine(
+		ctx,
+		&pb.DeleteMachineRequest{PoolName: "pool-1", MachineId: "machine-already-deleted"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+}
+
+func TestDeletePrivateMachineAllowsAnotherTokenInWorkspace(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "current-token")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					Name:             "pool-1",
+					CreatedByTokenID: "creator-token",
+					Mode:             string(types.PoolModePrivate),
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "pool-1"): {
+				{WorkspaceID: "workspace-1", PoolName: "pool-1", MachineID: "machine-1"},
+			},
+			fakeComputeKey("workspace-2", "pool-1"): {
+				{WorkspaceID: "workspace-2", PoolName: "pool-1", MachineID: "machine-1"},
+			},
+		},
+	}
+
+	res, err := (&Service{computeRepo: repo}).DeletePrivateMachine(
+		ctx,
+		&pb.DeleteMachineRequest{PoolName: "pool-1", MachineId: "machine-1"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "pool-1")]); got != 0 {
+		t.Fatalf("stored machine count = %d, want 0", got)
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-2", "pool-1")]); got != 1 {
+		t.Fatalf("other workspace machine count = %d, want 1", got)
+	}
+}
+
+func TestDeletePrivateMachineReleasesManagedMachineID(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID:      "workspace-1",
+		Name:             "pool-1",
+		Mode:             string(types.PoolModePrivate),
+		CreatedByTokenID: "token-owner",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				InstanceID:       "instance-1",
+				MachineID:        "machine-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationPending,
+				CreatedAt:        now.Add(-time.Minute),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{"workspace-1": {state}},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.DeletePrivateMachine(
+		testAuthContext("workspace-1", "token-owner"),
+		&pb.DeleteMachineRequest{PoolName: "pool-1", MachineId: "machine-1"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+	if got, want := state.Reservations[0].Status, model.ReservationTerminating; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+}
+
+func TestDeletePrivateMachineReleasesManagedProviderInstanceID(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID:      "workspace-1",
+		Name:             "pool-1",
+		Mode:             string(types.PoolModePrivate),
+		CreatedByTokenID: "token-owner",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				InstanceID:       "instance-1",
+				MachineID:        "machine-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationPending,
+				CreatedAt:        now.Add(-time.Minute),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{"workspace-1": {state}},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.DeletePrivateMachine(
+		testAuthContext("workspace-1", "token-owner"),
+		&pb.DeleteMachineRequest{PoolName: "pool-1", MachineId: "instance-1"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+	if got, want := state.Reservations[0].Status, model.ReservationTerminating; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+}
+
+func TestDeletePrivateMachineByReservationIDCleansLinkedMachine(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID:      "workspace-1",
+		Name:             "pool-1",
+		Mode:             string(types.PoolModePrivate),
+		CreatedByTokenID: "token-owner",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				InstanceID:       "instance-1",
+				MachineID:        "machine-1",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				ExpiresAt:        now.Add(time.Hour),
+				HourlyCostMicros: 1_000_000,
+			},
+		},
+	}
+	machine := &model.AgentTokenState{
+		WorkspaceID:     "workspace-1",
+		PoolName:        "pool-1",
+		MachineID:       "machine-1",
+		Schedulable:     true,
+		LastHeartbeatAt: now,
+	}
+	repo := &fakeComputeRepo{
+		pools:    map[string][]*model.PoolState{"workspace-1": {state}},
+		machines: map[string][]*model.AgentTokenState{fakeComputeKey("workspace-1", "pool-1"): {machine}},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.DeletePrivateMachine(
+		testAuthContext("workspace-1", "token-owner"),
+		&pb.DeleteMachineRequest{PoolName: "pool-1", MachineId: "reservation-1"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+	if got, want := state.Reservations[0].Status, model.ReservationTerminating; got != want {
+		t.Fatalf("reservation status = %q, want %q", got, want)
+	}
+	if machine.Schedulable {
+		t.Fatal("DeletePrivateMachine() did not mark linked machine unschedulable")
+	}
+	if got := len(repo.machines[fakeComputeKey("workspace-1", "pool-1")]); got != 0 {
+		t.Fatalf("machine count after release = %d, want 0", got)
+	}
+}
+
+func TestDeletePrivateMachineDismissesFailedManagedReservation(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID:      "workspace-1",
+		Name:             "pool-1",
+		Mode:             string(types.PoolModePrivate),
+		CreatedByTokenID: "token-owner",
+		ReservedNodes:    1,
+		Reservations: []model.Reservation{
+			{
+				ID:                "reservation-1",
+				Provider:          "shadeform",
+				InstanceID:        "instance-1",
+				MachineID:         "machine-1",
+				Name:              "node-1",
+				Source:            model.SourceCLIReservation,
+				Status:            model.ReservationFailed,
+				CreatedAt:         now.Add(-time.Minute),
+				ExpiresAt:         now.Add(time.Hour),
+				LastStatusMessage: "provider failed to provision instance",
+			},
+		},
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{"workspace-1": {state}},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.DeletePrivateMachine(
+		testAuthContext("workspace-1", "token-owner"),
+		&pb.DeleteMachineRequest{PoolName: "pool-1", MachineId: "machine-1"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+	if !repo.savedPool {
+		t.Fatal("DeletePrivateMachine() did not persist the failed reservation removal")
+	}
+	if got := len(state.Reservations); got != 0 {
+		t.Fatalf("reservation count after release = %d, want 0", got)
+	}
+	if got, want := state.ReservedNodes, uint32(0); got != want {
+		t.Fatalf("reserved nodes = %d, want %d", got, want)
+	}
+}
+
+func TestDeletePrivateMachineDismissesFailedUnlinkedManagedReservation(t *testing.T) {
+	now := time.Now().UTC()
+	state := &model.PoolState{
+		WorkspaceID:      "workspace-1",
+		Name:             "pool-1",
+		Mode:             string(types.PoolModePrivate),
+		CreatedByTokenID: "token-owner",
+		ReservedNodes:    1,
+		Reservations: []model.Reservation{
+			{
+				ID:                "reservation-1",
+				Provider:          "shadeform",
+				InstanceID:        "instance-1",
+				Name:              "node-1",
+				Source:            model.SourceCLIReservation,
+				Status:            model.ReservationFailed,
+				CreatedAt:         now.Add(-time.Minute),
+				ExpiresAt:         now.Add(time.Hour),
+				LastStatusMessage: "provider failed to provision instance",
+			},
+		},
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{"workspace-1": {state}},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.DeletePrivateMachine(
+		testAuthContext("workspace-1", "token-owner"),
+		&pb.DeleteMachineRequest{PoolName: "pool-1", MachineId: "reservation-1"},
+	)
+	if err != nil {
+		t.Fatalf("DeletePrivateMachine() error = %v", err)
+	}
+	if res == nil || !res.Ok {
+		t.Fatalf("DeletePrivateMachine() response = %#v", res)
+	}
+	if !repo.savedPool {
+		t.Fatal("DeletePrivateMachine() did not persist the failed reservation removal")
+	}
+	if got := len(state.Reservations); got != 0 {
+		t.Fatalf("reservation count after release = %d, want 0", got)
+	}
+	if got, want := state.ReservedNodes, uint32(0); got != want {
+		t.Fatalf("reserved nodes = %d, want %d", got, want)
+	}
+}
+
+func TestAssignManagedReservationToMachineUsesJoinTokenHash(t *testing.T) {
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:                    "reservation-1",
+				Provider:              "shadeform",
+				Source:                model.SourceCLIReservation,
+				Status:                model.ReservationPending,
+				RegistrationTokenHash: "token-hash",
+			},
+		},
+	}
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{"workspace-1": {state}},
+	}
+	service := &Service{computeRepo: repo}
+
+	err := service.assignManagedReservationToMachine(
+		context.Background(),
+		state,
+		&model.JoinTokenState{TokenHash: "token-hash"},
+		&model.AgentTokenState{WorkspaceID: "workspace-1", PoolName: "pool-1", MachineID: "machine-1"},
+	)
+	if err != nil {
+		t.Fatalf("assignManagedReservationToMachine() error = %v", err)
+	}
+
+	if !repo.savedPool {
+		t.Fatal("assignManagedReservationToMachine() did not persist the pool state")
+	}
+	if got, want := state.Reservations[0].MachineID, "machine-1"; got != want {
+		t.Fatalf("reservation machine id = %q, want %q", got, want)
+	}
+}
+
+func TestAssignManagedReservationToMachineRejectsClosedManagedJoinToken(t *testing.T) {
+	state := &model.PoolState{
+		WorkspaceID: "workspace-1",
+		Name:        "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:                    "reservation-1",
+				Provider:              "shadeform",
+				Source:                model.SourceCLIReservation,
+				Status:                model.ReservationDeleted,
+				MachineID:             "machine-1",
+				RegistrationTokenHash: "join-token-hash",
+			},
+		},
+	}
+	token := &model.JoinTokenState{
+		TokenHash: "join-token-hash",
+		MachineID: "machine-1",
+	}
+	machine := &model.AgentTokenState{MachineID: "machine-1"}
+
+	err := (&Service{}).assignManagedReservationToMachine(context.Background(), state, token, machine)
+	if err == nil {
+		t.Fatal("assignManagedReservationToMachine() accepted a closed managed reservation")
+	}
+}
+
+func TestAssignManagedReservationToMachineRequiresRepository(t *testing.T) {
+	state := &model.PoolState{Reservations: []model.Reservation{{
+		Source:                model.SourceCLIReservation,
+		Status:                model.ReservationPending,
+		RegistrationTokenHash: "join-token-hash",
+	}}}
+	token := &model.JoinTokenState{TokenHash: "join-token-hash"}
+	machine := &model.AgentTokenState{MachineID: "machine-1"}
+
+	err := (&Service{}).assignManagedReservationToMachine(context.Background(), state, token, machine)
+	if err == nil || !strings.Contains(err.Error(), "compute repository is unavailable") {
+		t.Fatalf("assignManagedReservationToMachine() error = %v", err)
+	}
+	if state.Reservations[0].MachineID != "" {
+		t.Fatal("reservation was mutated without a repository")
+	}
+}
+
+func testAuthContext(workspaceID, tokenID string) context.Context {
+	return auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{ExternalId: workspaceID},
+		Token: &types.Token{
+			ExternalId: tokenID,
+			TokenType:  types.TokenTypeWorkspace,
+		},
+	})
+}
+
+func poolNames(pools []*pb.PrivatePool) []string {
+	names := make([]string, 0, len(pools))
+	for _, pool := range pools {
+		if pool != nil {
+			names = append(names, pool.Name)
+		}
+	}
+	return names
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := map[string]int{}
+	for _, value := range a {
+		counts[value]++
+	}
+	for _, value := range b {
+		counts[value]--
+		if counts[value] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func managedUsageTestState(now, cursor, expiresAt time.Time, hourlyCostMicros int64) *model.PoolState {
+	return &model.PoolState{
+		Name: "pool-1",
+		Reservations: []model.Reservation{
+			{
+				ID:               "reservation-1",
+				Provider:         "shadeform",
+				Source:           model.SourceCLIReservation,
+				Status:           model.ReservationActive,
+				CreatedAt:        now.Add(-time.Hour),
+				BillingCursorAt:  cursor,
+				ExpiresAt:        expiresAt,
+				HourlyCostMicros: hourlyCostMicros,
+			},
+		},
+	}
+}
+
+type fakeComputeRepo struct {
+	pools      map[string][]*model.PoolState
+	machines   map[string][]*model.AgentTokenState
+	joinTokens map[string]*model.JoinTokenState
+	listings   map[string][]*model.MarketplaceListingState
+	rentals    map[string][]*model.MarketplaceRentalState
+	sshStates  map[string]*model.MachineSSHState
+	sshMu      sync.Mutex
+	demand     map[string]*model.FailoverDemand
+	spendCents float64
+	savedPool  bool
+}
+
+func (r *fakeComputeRepo) PushFailoverDemand(ctx context.Context, demand *model.FailoverDemand, ttl time.Duration) error {
+	if r.demand == nil {
+		r.demand = map[string]*model.FailoverDemand{}
+	}
+	r.demand[demand.GPU] = demand
+	return nil
+}
+
+func (r *fakeComputeRepo) ListFailoverDemand(ctx context.Context) ([]*model.FailoverDemand, error) {
+	out := []*model.FailoverDemand{}
+	for _, demand := range r.demand {
+		out = append(out, demand)
+	}
+	return out, nil
+}
+
+func (r *fakeComputeRepo) DeleteFailoverDemand(ctx context.Context, gpu string) error {
+	delete(r.demand, gpu)
+	return nil
+}
+
+func (r *fakeComputeRepo) RecordOnDemandSpend(ctx context.Context, at time.Time, cents float64) error {
+	r.spendCents += cents
+	return nil
+}
+
+func (r *fakeComputeRepo) OnDemandSpendCents(ctx context.Context, window time.Duration) (float64, error) {
+	return r.spendCents, nil
+}
+
+func (r *fakeComputeRepo) LockMachineRentals(ctx context.Context, machineID string) error {
+	return nil
+}
+
+func (r *fakeComputeRepo) UnlockMachineRentals(machineID string) error {
+	return nil
+}
+
+func (r *fakeComputeRepo) SaveMarketplaceRental(ctx context.Context, state *model.MarketplaceRentalState) error {
+	if r.rentals == nil {
+		r.rentals = map[string][]*model.MarketplaceRentalState{}
+	}
+	kept := r.rentals[state.BuyerWorkspaceID][:0]
+	for _, rental := range r.rentals[state.BuyerWorkspaceID] {
+		if rental.ID != state.ID {
+			kept = append(kept, rental)
+		}
+	}
+	r.rentals[state.BuyerWorkspaceID] = append(kept, state)
+	return nil
+}
+
+func (r *fakeComputeRepo) GetMarketplaceRental(ctx context.Context, buyerWorkspaceID, rentalID string) (*model.MarketplaceRentalState, error) {
+	for _, rental := range r.rentals[buyerWorkspaceID] {
+		if rental.ID == rentalID {
+			return rental, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *fakeComputeRepo) ListMarketplaceRentals(ctx context.Context, buyerWorkspaceID string) ([]*model.MarketplaceRentalState, error) {
+	return r.rentals[buyerWorkspaceID], nil
+}
+
+func (r *fakeComputeRepo) ListMarketplaceRentalsForMachine(ctx context.Context, machineID string) ([]*model.MarketplaceRentalState, error) {
+	out := []*model.MarketplaceRentalState{}
+	for _, rentals := range r.rentals {
+		for _, rental := range rentals {
+			if rental.MachineID == machineID {
+				out = append(out, rental)
+			}
+		}
+	}
+	return out, nil
+}
+
+func (r *fakeComputeRepo) ListAllMarketplaceRentals(ctx context.Context) ([]*model.MarketplaceRentalState, error) {
+	out := []*model.MarketplaceRentalState{}
+	for _, rentals := range r.rentals {
+		out = append(out, rentals...)
+	}
+	return out, nil
+}
+
+func (r *fakeComputeRepo) DeleteMarketplaceRental(ctx context.Context, state *model.MarketplaceRentalState) error {
+	kept := r.rentals[state.BuyerWorkspaceID][:0]
+	for _, rental := range r.rentals[state.BuyerWorkspaceID] {
+		if rental.ID != state.ID {
+			kept = append(kept, rental)
+		}
+	}
+	r.rentals[state.BuyerWorkspaceID] = kept
+	return nil
+}
+
+func (r *fakeComputeRepo) WithPoolStateLock(ctx context.Context, workspaceID, name string, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+func (r *fakeComputeRepo) PruneAgentMachineIndex(ctx context.Context, workspaceID, poolName string) error {
+	return nil
+}
+
+func (r *fakeComputeRepo) WithMachineSSHStateLock(ctx context.Context, workspaceID, poolName, machineID string, fn func(context.Context) error) error {
+	r.sshMu.Lock()
+	defer r.sshMu.Unlock()
+	return fn(ctx)
+}
+
+func (r *fakeComputeRepo) SaveMachineSSHState(ctx context.Context, state *model.MachineSSHState) error {
+	if r.sshStates == nil {
+		r.sshStates = map[string]*model.MachineSSHState{}
+	}
+	r.sshStates[fakeComputeSSHKey(state.WorkspaceID, state.PoolName, state.MachineID)] = state
+	return nil
+}
+
+func (r *fakeComputeRepo) GetMachineSSHState(ctx context.Context, workspaceID, poolName, machineID string) (*model.MachineSSHState, error) {
+	return r.sshStates[fakeComputeSSHKey(workspaceID, poolName, machineID)], nil
+}
+
+func (r *fakeComputeRepo) DeleteMachineSSHState(ctx context.Context, workspaceID, poolName, machineID string) error {
+	delete(r.sshStates, fakeComputeSSHKey(workspaceID, poolName, machineID))
+	return nil
+}
+
+func fakeComputeSSHKey(workspaceID, poolName, machineID string) string {
+	return workspaceID + "\x00" + poolName + "\x00" + machineID
+}
+
+func (r *fakeComputeRepo) SavePoolState(ctx context.Context, workspaceID string, state *model.PoolState) error {
+	r.savedPool = true
+	if state == nil {
+		return nil
+	}
+	if r.pools == nil {
+		r.pools = map[string][]*model.PoolState{}
+	}
+	state.WorkspaceID = workspaceID
+	for i, pool := range r.pools[workspaceID] {
+		if pool != nil && pool.Name == state.Name {
+			r.pools[workspaceID][i] = state
+			return nil
+		}
+	}
+	r.pools[workspaceID] = append(r.pools[workspaceID], state)
+	return nil
+}
+
+func (r *fakeComputeRepo) GetPoolState(ctx context.Context, workspaceID, name string) (*model.PoolState, error) {
+	for _, pool := range r.pools[workspaceID] {
+		if pool != nil && pool.Name == name {
+			return pool, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *fakeComputeRepo) ListPoolStates(ctx context.Context, workspaceID string, limit int) ([]*model.PoolState, error) {
+	pools := append([]*model.PoolState(nil), r.pools[workspaceID]...)
+	if limit > 0 && len(pools) > limit {
+		pools = pools[:limit]
+	}
+	return pools, nil
+}
+
+func (r *fakeComputeRepo) ListAllPoolStates(ctx context.Context, limit int) ([]*model.PoolState, error) {
+	pools := []*model.PoolState{}
+	for workspaceID, states := range r.pools {
+		for _, state := range states {
+			if state != nil && state.WorkspaceID == "" {
+				state.WorkspaceID = workspaceID
+			}
+			pools = append(pools, state)
+			if limit > 0 && len(pools) >= limit {
+				return pools, nil
+			}
+		}
+	}
+	return pools, nil
+}
+
+func (r *fakeComputeRepo) DeletePoolState(ctx context.Context, workspaceID, name string) error {
+	states := r.pools[workspaceID]
+	kept := states[:0]
+	for _, state := range states {
+		if state == nil || state.Name != name {
+			kept = append(kept, state)
+		}
+	}
+	if len(kept) == 0 {
+		delete(r.pools, workspaceID)
+		return nil
+	}
+	r.pools[workspaceID] = kept
+	return nil
+}
+
+func (r *fakeComputeRepo) SaveJoinTokenState(ctx context.Context, state *model.JoinTokenState, ttl time.Duration) error {
+	if state == nil {
+		return nil
+	}
+	if r.joinTokens == nil {
+		r.joinTokens = map[string]*model.JoinTokenState{}
+	}
+	r.joinTokens[state.TokenHash] = state
+	return nil
+}
+
+func (r *fakeComputeRepo) GetJoinTokenState(ctx context.Context, tokenHash string) (*model.JoinTokenState, error) {
+	return r.joinTokens[tokenHash], nil
+}
+
+func (r *fakeComputeRepo) SaveAgentTokenState(ctx context.Context, state *model.AgentTokenState, ttl time.Duration) error {
+	if state == nil {
+		return nil
+	}
+	if r.machines == nil {
+		r.machines = map[string][]*model.AgentTokenState{}
+	}
+	key := fakeComputeKey(state.WorkspaceID, state.PoolName)
+	for i, machine := range r.machines[key] {
+		if machine != nil && machine.MachineID == state.MachineID {
+			r.machines[key][i] = state
+			return nil
+		}
+	}
+	r.machines[key] = append(r.machines[key], state)
+	return nil
+}
+
+func (r *fakeComputeRepo) GetAgentTokenState(ctx context.Context, tokenHash string) (*model.AgentTokenState, error) {
+	for _, machines := range r.machines {
+		for _, machine := range machines {
+			if machine != nil && machine.TokenHash == tokenHash {
+				return machine, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func (r *fakeComputeRepo) GetAgentMachineState(ctx context.Context, workspaceID, poolName, machineID string) (*model.AgentTokenState, error) {
+	for _, machine := range r.machines[fakeComputeKey(workspaceID, poolName)] {
+		if machine != nil && machine.MachineID == machineID {
+			return machine, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *fakeComputeRepo) GetAgentMachineStateForWorkspace(ctx context.Context, workspaceID, machineID string) (*model.AgentTokenState, error) {
+	for key, machines := range r.machines {
+		if !strings.HasPrefix(key, workspaceID+"\x00") {
+			continue
+		}
+		for _, machine := range machines {
+			if machine != nil && machine.MachineID == machineID {
+				return machine, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func (r *fakeComputeRepo) ListAgentTokenStates(ctx context.Context, workspaceID, poolName string) ([]*model.AgentTokenState, error) {
+	return append([]*model.AgentTokenState(nil), r.machines[fakeComputeKey(workspaceID, poolName)]...), nil
+}
+
+func (r *fakeComputeRepo) DeleteAgentMachineState(ctx context.Context, workspaceID, poolName, machineID string) error {
+	key := fakeComputeKey(workspaceID, poolName)
+	machines := r.machines[key]
+	kept := machines[:0]
+	for _, machine := range machines {
+		if machine == nil || machine.MachineID != machineID {
+			kept = append(kept, machine)
+		}
+	}
+	if len(kept) == 0 {
+		delete(r.machines, key)
+		return nil
+	}
+	r.machines[key] = kept
+	return nil
+}
+
+func (r *fakeComputeRepo) SaveAgentWorkerSlotState(ctx context.Context, state *model.AgentWorkerSlotState) error {
+	return nil
+}
+
+func (r *fakeComputeRepo) ListAgentWorkerSlotStates(ctx context.Context, workspaceID, poolName, machineID string) ([]*model.AgentWorkerSlotState, error) {
+	return nil, nil
+}
+
+func (r *fakeComputeRepo) DeleteAgentWorkerSlotState(ctx context.Context, workspaceID, poolName, machineID, workerID string) error {
+	return nil
+}
+
+func (r *fakeComputeRepo) SaveMarketplaceListing(ctx context.Context, state *model.MarketplaceListingState) error {
+	if state == nil {
+		return nil
+	}
+	if r.listings == nil {
+		r.listings = map[string][]*model.MarketplaceListingState{}
+	}
+	for i, listing := range r.listings[state.SellerWorkspaceID] {
+		if listing != nil && listing.ID == state.ID {
+			r.listings[state.SellerWorkspaceID][i] = state
+			return nil
+		}
+	}
+	r.listings[state.SellerWorkspaceID] = append(r.listings[state.SellerWorkspaceID], state)
+	return nil
+}
+
+func (r *fakeComputeRepo) GetMarketplaceListing(ctx context.Context, sellerWorkspaceID, listingID string) (*model.MarketplaceListingState, error) {
+	for _, listing := range r.listings[sellerWorkspaceID] {
+		if listing != nil && listing.ID == listingID {
+			return listing, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *fakeComputeRepo) GetMarketplaceListingByID(ctx context.Context, listingID string) (*model.MarketplaceListingState, error) {
+	for _, listings := range r.listings {
+		for _, listing := range listings {
+			if listing != nil && listing.ID == listingID {
+				return listing, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func (r *fakeComputeRepo) ListMarketplaceListings(ctx context.Context, sellerWorkspaceID string, limit int) ([]*model.MarketplaceListingState, error) {
+	listings := append([]*model.MarketplaceListingState(nil), r.listings[sellerWorkspaceID]...)
+	if limit > 0 && len(listings) > limit {
+		listings = listings[:limit]
+	}
+	return listings, nil
+}
+
+func (r *fakeComputeRepo) ListAllMarketplaceListings(ctx context.Context, limit int) ([]*model.MarketplaceListingState, error) {
+	listings := []*model.MarketplaceListingState{}
+	for _, states := range r.listings {
+		for _, state := range states {
+			listings = append(listings, state)
+			if limit > 0 && len(listings) >= limit {
+				return listings, nil
+			}
+		}
+	}
+	return listings, nil
+}
+
+func (r *fakeComputeRepo) DeleteMarketplaceListing(ctx context.Context, sellerWorkspaceID, listingID string) error {
+	states := r.listings[sellerWorkspaceID]
+	kept := states[:0]
+	for _, state := range states {
+		if state == nil || state.ID != listingID {
+			kept = append(kept, state)
+		}
+	}
+	if len(kept) == 0 {
+		delete(r.listings, sellerWorkspaceID)
+		return nil
+	}
+	r.listings[sellerWorkspaceID] = kept
+	return nil
+}
+
+func fakeComputeKey(workspaceID, poolName string) string {
+	return workspaceID + "\x00" + poolName
+}
+
+func TestManagedBillingURLMatchesInternalAPIActionRoutes(t *testing.T) {
+	base := "https://api.stage.beam.cloud/v2/payment/managed-compute/"
+	tests := map[string]string{
+		"launch-check/": "https://api.stage.beam.cloud/v2/payment/managed-compute/launch-check/",
+		"balance/":      "https://api.stage.beam.cloud/v2/payment/managed-compute/balance/",
+		"usage/":        "https://api.stage.beam.cloud/v2/payment/managed-compute/usage/",
+	}
+
+	for path, want := range tests {
+		if got := joinBillingURL(base, path); got != want {
+			t.Fatalf("joinBillingURL(%q, %q) = %q, want %q", base, path, got, want)
+		}
+	}
+}
+
+type fakeManagedBilling struct {
+	launchDecision       billingDecision
+	launchErr            error
+	launchCalls          int
+	launchRequest        billingCreditRequest
+	balanceDecision      billingDecision
+	balanceErr           error
+	balanceCalls         int
+	balanceSawUsageCount int
+	usage                []managedUsage
+	usageErr             error
+}
+
+func (b *fakeManagedBilling) CheckLaunchCredit(_ context.Context, req billingCreditRequest) (billingDecision, error) {
+	b.launchCalls++
+	b.launchRequest = req
+	return b.launchDecision, b.launchErr
+}
+
+func (b *fakeManagedBilling) CheckBalance(context.Context, string, string) (billingDecision, error) {
+	b.balanceCalls++
+	b.balanceSawUsageCount = len(b.usage)
+	return b.balanceDecision, b.balanceErr
+}
+
+func (b *fakeManagedBilling) RecordManagedUsage(_ context.Context, usage managedUsage) error {
+	b.usage = append(b.usage, usage)
+	return b.usageErr
+}
+
+type fakeUsageMetricsRepo struct {
+	counters []fakeUsageCounter
+	err      error
+}
+
+type fakeUsageCounter struct {
+	name     string
+	metadata map[string]interface{}
+	value    float64
+}
+
+func (r *fakeUsageMetricsRepo) Init(string) error {
+	return nil
+}
+
+func (r *fakeUsageMetricsRepo) IncrementCounter(name string, metadata map[string]interface{}, value float64) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.counters = append(r.counters, fakeUsageCounter{name: name, metadata: metadata, value: value})
+	return nil
+}
+
+func (r *fakeUsageMetricsRepo) SetGauge(name string, metadata map[string]interface{}, value float64) error {
+	if r.err != nil {
+		return r.err
+	}
+	return nil
+}
+
+type fakeWorkerRepo struct {
+	repository.WorkerRepository
+	worker  *types.Worker
+	workers []*types.Worker
+	status  types.WorkerStatus
+}
+
+func (r *fakeWorkerRepo) AddWorker(worker *types.Worker) error {
+	r.worker = worker
+	return nil
+}
+
+func (r *fakeWorkerRepo) GetWorkerById(workerID string) (*types.Worker, error) {
+	if r.worker == nil || r.worker.Id != workerID {
+		return nil, &types.ErrWorkerNotFound{WorkerId: workerID}
+	}
+	return r.worker, nil
+}
+
+func (r *fakeWorkerRepo) GetAllWorkersInPool(poolName string) ([]*types.Worker, error) {
+	workers := r.workers
+	if len(workers) == 0 && r.worker != nil {
+		workers = []*types.Worker{r.worker}
+	}
+	out := make([]*types.Worker, 0, len(workers))
+	for _, worker := range workers {
+		if worker != nil && worker.PoolName == poolName {
+			out = append(out, worker)
+		}
+	}
+	return out, nil
+}
+
+func (r *fakeWorkerRepo) UpdateWorkerStatus(workerID string, status types.WorkerStatus) error {
+	if r.worker == nil || r.worker.Id != workerID {
+		return &types.ErrWorkerNotFound{WorkerId: workerID}
+	}
+	r.worker.Status = status
+	r.status = status
+	return nil
+}
+
+func (r *fakeWorkerRepo) RemoveWorker(workerID string) error {
+	if r.worker == nil || r.worker.Id != workerID {
+		return &types.ErrWorkerNotFound{WorkerId: workerID}
+	}
+	r.worker = nil
+	return nil
+}
+
+func (r *fakeWorkerRepo) RemoveWorkerNetworkState(context.Context, string) error {
+	return nil
+}
+
+type fakeContainerRepo struct {
+	repository.ContainerRepository
+	containers        []types.ContainerState
+	stopped           []string
+	deletedRoutes     []string
+	routesByMachine   map[string][]types.BackendRoute
+	routesByMachineID map[string][]types.BackendRoute
+}
+
+func (r *fakeContainerRepo) GetActiveContainersByWorkerId(string) ([]types.ContainerState, error) {
+	return append([]types.ContainerState(nil), r.containers...), nil
+}
+
+func (r *fakeContainerRepo) UpdateContainerStatus(containerID string, status types.ContainerStatus, _ int64) error {
+	if status == types.ContainerStatusStopping {
+		r.stopped = append(r.stopped, containerID)
+	}
+	return nil
+}
+
+func (r *fakeContainerRepo) DeleteBackendRoutesByMachine(ctx context.Context, workspaceID, poolName, machineID string) error {
+	r.deletedRoutes = append(r.deletedRoutes, workspaceID+"/"+poolName+"/"+machineID)
+	return nil
+}
+
+func (r *fakeContainerRepo) ListBackendRoutesByMachine(ctx context.Context, workspaceID, poolName, machineID string) ([]types.BackendRoute, error) {
+	return append([]types.BackendRoute(nil), r.routesByMachine[workspaceID+"/"+poolName+"/"+machineID]...), nil
+}
+
+func (r *fakeContainerRepo) ListBackendRoutesByMachineID(ctx context.Context, machineID string) ([]types.BackendRoute, error) {
+	return append([]types.BackendRoute(nil), r.routesByMachineID[machineID]...), nil
+}
+
+func TestAgentRoutesUseMachineIndex(t *testing.T) {
+	buyerRoute := types.BackendRoute{
+		RouteID:     "route-buyer",
+		WorkspaceID: "buyer-1",
+		PoolName:    "marketplace-listing-1",
+		MachineID:   "machine-1",
+		Kind:        types.BackendRouteKindContainer,
+		State:       types.BackendRouteStateOpening,
+	}
+	repo := &fakeContainerRepo{
+		routesByMachineID: map[string][]types.BackendRoute{
+			"machine-1": {
+				buyerRoute,
+				{RouteID: "other-pool", WorkspaceID: "buyer-1", PoolName: "other-pool", MachineID: "machine-1"},
+				{RouteID: "other-machine", WorkspaceID: "buyer-1", PoolName: "marketplace-listing-1", MachineID: "machine-2"},
+			},
+		},
+	}
+	service := &Service{containerRepo: repo}
+
+	routes, err := service.agentRoutesForMachine(context.Background(), &model.AgentTokenState{
+		WorkspaceID: "seller-1",
+		PoolName:    "marketplace-listing-1",
+		MachineID:   "machine-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].RouteId != buyerRoute.RouteID {
+		t.Fatalf("routes = %#v, want only route for the agent's machine and pool", routes)
+	}
+}
+
+func TestAgentCanManageWorkloadRouteOnOwnMachine(t *testing.T) {
+	agentState := &model.AgentTokenState{
+		WorkspaceID: "seller-1",
+		PoolName:    "marketplace-listing-1",
+		MachineID:   "machine-1",
+	}
+	buyerRoute := types.BackendRoute{WorkspaceID: "buyer-1", PoolName: "marketplace-listing-1", MachineID: "machine-1"}
+	if !agentCanManageRoute(agentState, buyerRoute) {
+		t.Fatal("agent could not manage workload route on its own machine")
+	}
+	for _, route := range []types.BackendRoute{
+		{WorkspaceID: "buyer-1", PoolName: "other-pool", MachineID: "machine-1"},
+		{WorkspaceID: "buyer-1", PoolName: "marketplace-listing-1", MachineID: "machine-2"},
+	} {
+		if agentCanManageRoute(agentState, route) {
+			t.Fatalf("agent managed out-of-scope route: %#v", route)
+		}
+	}
+}
+
+func TestAgentWorkerSlotStateCarriesMarketplaceModeAndRuntime(t *testing.T) {
+	config := types.AppConfig{}
+	config.Worker.ImageName = "beta9-worker"
+	config.Worker.ImageRegistry = "registry.example.com"
+	config.Worker.ImageTag = "same-tag"
+
+	marketplaceState := &model.AgentTokenState{
+		WorkspaceID:          "seller-1",
+		PoolName:             "marketplace-listing-1",
+		MachineID:            "machine-1",
+		Mode:                 string(types.PoolModeMarketplace),
+		MarketplaceListingID: "listing-1",
+		SellerWorkspaceID:    "seller-1",
+	}
+	worker := &types.Worker{Id: "worker-1", TotalCpu: 4000, TotalMemory: 8192, Gpu: "A10G", TotalGpuCount: 1}
+	slot := agentWorkerSlotState(config, marketplaceState, worker, types.WorkerPoolConfig{}, "token-id", "token-hash")
+	wireSlot := agentWorkerSlotToProto(slot, "worker-token")
+	if !wireSlot.PrioritySet || wireSlot.Priority != 0 {
+		t.Fatalf("wire priority = %d (set=%v), want explicit zero", wireSlot.Priority, wireSlot.PrioritySet)
+	}
+	if slot.Mode != string(types.PoolModeMarketplace) {
+		t.Fatalf("slot mode = %q, want marketplace", slot.Mode)
+	}
+	// The slot carries the machine's marketplace identity so the worker can
+	// attribute buyer usage without billing fields on container requests.
+	if slot.MarketplaceListingID != "listing-1" || slot.SellerWorkspaceID != "seller-1" {
+		t.Fatalf("slot marketplace identity = %q/%q, want listing-1/seller-1", slot.MarketplaceListingID, slot.SellerWorkspaceID)
+	}
+	if slot.ContainerRuntime != types.ContainerRuntimeGvisor.String() {
+		t.Fatalf("slot runtime = %q, want gvisor for supported marketplace GPU", slot.ContainerRuntime)
+	}
+	if slot.WorkerImage != "registry.example.com/beta9-worker:same-tag" {
+		t.Fatalf("marketplace slot worker image = %q, want configured image", slot.WorkerImage)
+	}
+
+	worker.Gpu = "V100"
+	slot = agentWorkerSlotState(config, marketplaceState, worker, types.WorkerPoolConfig{}, "token-id", "token-hash")
+	if slot.ContainerRuntime != types.ContainerRuntimeRunc.String() {
+		t.Fatalf("slot runtime = %q, want runc fallback for V100", slot.ContainerRuntime)
+	}
+
+	privateState := &model.AgentTokenState{
+		WorkspaceID: "workspace-1",
+		PoolName:    "private-pool",
+		MachineID:   "machine-2",
+	}
+	slot = agentWorkerSlotState(config, privateState, worker, types.WorkerPoolConfig{}, "token-id", "token-hash")
+	if slot.Mode != string(types.PoolModePrivate) {
+		t.Fatalf("slot mode = %q, want private default", slot.Mode)
+	}
+	if slot.ContainerRuntime != types.ContainerRuntimeRunc.String() {
+		t.Fatalf("slot runtime = %q, want runc default", slot.ContainerRuntime)
+	}
+	if slot.WorkerImage != "registry.example.com/beta9-worker:same-tag" {
+		t.Fatalf("private slot worker image = %q, want configured image", slot.WorkerImage)
+	}
+	if slot.CPUAffinityEnforced != nil {
+		t.Fatal("private slot must retain agent-level CPU affinity configuration")
+	}
+	privateSlotJSON, err := json.Marshal(slot)
+	if err != nil || strings.Contains(string(privateSlotJSON), "cpu_affinity_enforced") {
+		t.Fatalf("private slot unexpectedly changed its generation input: %s, err=%v", privateSlotJSON, err)
+	}
+
+	managedState := &model.AgentTokenState{
+		WorkspaceID:           "admin-workspace",
+		PoolName:              "managed-pool",
+		MachineID:             "machine-3",
+		ManagedPoolInstanceID: "instance-1",
+		NetworkSlotPoolSize:   8,
+	}
+	worker.Runtime = types.ContainerRuntimeGvisor.String()
+	worker.Priority = 900
+	defaultManagedSlot := agentWorkerSlotState(config, managedState, worker, types.WorkerPoolConfig{}, "token-id", "token-hash")
+	if defaultManagedSlot.CPUAffinityEnforced == nil || *defaultManagedSlot.CPUAffinityEnforced {
+		t.Fatal("managed slot must carry an explicit disabled CPU affinity default")
+	}
+	managedSlotJSON, err := json.Marshal(defaultManagedSlot)
+	if err != nil || !strings.Contains(string(managedSlotJSON), `"cpu_affinity_enforced":false`) {
+		t.Fatalf("managed slot omitted its disabled CPU affinity generation input: %s, err=%v", managedSlotJSON, err)
+	}
+	cacheEnabled := true
+	diskEnabled := true
+	networkPreallocation := false
+	slot = agentWorkerSlotState(config, managedState, worker, types.WorkerPoolConfig{
+		ContainerRuntime:          types.ContainerRuntimeRunc.String(),
+		CPUAffinityEnforced:       true,
+		ContainerStartConcurrency: 64,
+		NetworkSlotPoolSize:       128,
+		NetworkPreallocation:      &networkPreallocation,
+		GPUVirtualized:            true,
+		Priority:                  10,
+		CRIUEnabled:               false,
+		TmpSizeLimit:              "50Gi",
+		ConfigGroup:               "raid-cache",
+		StoragePath:               "/mnt/raid/storage",
+		ImagesPath:                "/mnt/raid/images",
+		DurableDisksPath:          "/mnt/raid/disks",
+		Cache: types.WorkerPoolCacheConfig{
+			Enabled: &cacheEnabled,
+			Disk: types.WorkerPoolCacheDiskConfig{
+				Enabled:      &diskEnabled,
+				HostPath:     "/mnt/raid/cache",
+				MountPath:    "/var/lib/beta9/cache",
+				MaxUsagePct:  0.9,
+				MinFreeBytes: 1024,
+			},
+		},
+	}, "token-id", "token-hash")
+	if slot.ContainerRuntime != types.ContainerRuntimeRunc.String() || slot.CPUAffinityEnforced == nil || !*slot.CPUAffinityEnforced || slot.ContainerStartConcurrency != 64 || slot.NetworkSlotPoolSize != 128 || slot.Priority != 10 {
+		t.Fatalf("managed slot did not use live pool config: %#v", slot)
+	}
+	wireSlot = agentWorkerSlotToProto(slot, "worker-token")
+	if !wireSlot.CpuAffinityEnforced {
+		t.Fatal("managed slot did not carry CPU affinity configuration to the agent")
+	}
+	if wireSlot.PoolConfig == nil ||
+		wireSlot.PoolConfig.NetworkPreallocation ||
+		!wireSlot.PoolConfig.GpuVirtualized ||
+		wireSlot.PoolConfig.CriuEnabled ||
+		wireSlot.PoolConfig.StoragePath != "/mnt/raid/storage" ||
+		wireSlot.PoolConfig.ImagesPath != "/mnt/raid/images" ||
+		wireSlot.PoolConfig.DurableDisksPath != "/mnt/raid/disks" ||
+		wireSlot.PoolConfig.ConfigGroup != "raid-cache" {
+		t.Fatalf("managed slot did not carry pool runtime config: %#v", wireSlot.PoolConfig)
+	}
+	if wireSlot.PoolConfig.Cache == nil || wireSlot.PoolConfig.Cache.Disk == nil ||
+		wireSlot.PoolConfig.Cache.Disk.HostPath != "/mnt/raid/cache" ||
+		wireSlot.PoolConfig.Cache.Disk.MountPath != "/var/lib/beta9/cache" ||
+		wireSlot.PoolConfig.Cache.Disk.MinFreeBytes != 1024 {
+		t.Fatalf("managed slot did not carry cache config: %#v", wireSlot.PoolConfig.Cache)
+	}
+}
+
+func TestAgentBillingConfigOnlyForMarketplacePools(t *testing.T) {
+	service := &Service{
+		appConfig: types.AppConfig{
+			ManagedCompute: types.ManagedComputeConfig{
+				Billing: types.ManagedComputeBillingConfig{
+					Endpoint:  "https://api.example.com/v2/payment/managed-compute/",
+					AuthToken: "usage-token",
+				},
+			},
+			Monitoring: types.MonitoringConfig{
+				ContainerCostHookConfig: types.ContainerCostHookConfig{
+					Endpoint: "https://api.example.com/v2/cost/",
+					Token:    "cost-token",
+				},
+			},
+		},
+	}
+
+	marketplacePool := &model.PoolState{Name: "marketplace-listing-1", Mode: string(types.PoolModeMarketplace)}
+	billing := service.agentBillingConfig(marketplacePool)
+	if billing == nil {
+		t.Fatal("marketplace pools should receive billing config")
+	}
+	if billing.UsageEndpoint != "https://api.example.com/v2/payment/managed-compute/" || billing.UsageToken != "usage-token" {
+		t.Fatalf("billing usage config = %+v, want endpoint and token", billing)
+	}
+	if billing.CostHookEndpoint != "https://api.example.com/v2/cost/" || billing.CostHookToken != "cost-token" {
+		t.Fatalf("billing cost hook config = %+v, want endpoint and token", billing)
+	}
+	if billing.BillableMarginPct != types.ManagedComputeDefaultBillableMarginPct {
+		t.Fatalf("billable margin = %f, want default", billing.BillableMarginPct)
+	}
+
+	privatePool := &model.PoolState{Name: "private-pool", Mode: string(types.PoolModePrivate)}
+	if service.agentBillingConfig(privatePool) != nil {
+		t.Fatal("private pools must never receive billing credentials")
+	}
+
+	unconfigured := &Service{appConfig: types.AppConfig{}}
+	if unconfigured.agentBillingConfig(marketplacePool) != nil {
+		t.Fatal("billing config should be omitted when no endpoint is configured")
+	}
+}
+
+func TestListMachineContainersReturnsActiveContainers(t *testing.T) {
+	ctx := testAuthContext("workspace-1", "owner-token")
+	repo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"workspace-1": {
+				{
+					WorkspaceID:      "workspace-1",
+					Name:             "marketplace-listing-1",
+					Mode:             string(types.PoolModeMarketplace),
+					Config:           &pb.PoolConfig{Name: "marketplace-listing-1"},
+					CreatedByTokenID: "owner-token",
+				},
+			},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("workspace-1", "marketplace-listing-1"): {
+				{
+					WorkspaceID: "workspace-1",
+					PoolName:    "marketplace-listing-1",
+					MachineID:   "machine-1",
+					Schedulable: true,
+				},
+			},
+		},
+	}
+	containerRepo := &fakeContainerRepo{
+		containers: []types.ContainerState{
+			{
+				ContainerId: "container-1",
+				StubId:      "stub-1",
+				Status:      types.ContainerStatusRunning,
+				WorkspaceId: "buyer-1",
+				Gpu:         "RTX5090",
+				GpuCount:    1,
+				Cpu:         1000,
+				Memory:      1024,
+				ScheduledAt: 100,
+			},
+			{
+				ContainerId: "container-2",
+				StubId:      "stub-2",
+				Status:      types.ContainerStatusPending,
+				WorkspaceId: "buyer-2",
+				ScheduledAt: 200,
+			},
+		},
+	}
+	service := &Service{computeRepo: repo, containerRepo: containerRepo}
+
+	res, err := service.ListMachineContainers(ctx, &pb.ListMachineContainersRequest{
+		PoolName:  "marketplace-listing-1",
+		MachineId: "machine-1",
+	})
+	if err != nil {
+		t.Fatalf("ListMachineContainers() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListMachineContainers() not ok: %s", res.ErrMsg)
+	}
+	if len(res.Containers) != 2 {
+		t.Fatalf("container count = %d, want 2", len(res.Containers))
+	}
+	// Most recently scheduled first.
+	if res.Containers[0].ContainerId != "container-2" || res.Containers[1].ContainerId != "container-1" {
+		t.Fatalf("container order = %s, %s; want container-2 first", res.Containers[0].ContainerId, res.Containers[1].ContainerId)
+	}
+	if res.Containers[1].WorkspaceId != "buyer-1" || res.Containers[1].Gpu != "RTX5090" {
+		t.Fatalf("container fields = %+v, want buyer workspace and gpu mapped", res.Containers[1])
+	}
+
+	missing, err := service.ListMachineContainers(ctx, &pb.ListMachineContainersRequest{
+		PoolName:  "marketplace-listing-1",
+		MachineId: "machine-unknown",
+	})
+	if err != nil {
+		t.Fatalf("ListMachineContainers() error = %v", err)
+	}
+	if missing.Ok {
+		t.Fatal("ListMachineContainers() should reject unknown machines")
+	}
+}
+
+func TestListMachineContainersClusterAdminPrefersManagedPool(t *testing.T) {
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{ExternalId: "selected-workspace"},
+		Token: &types.Token{
+			Active:    true,
+			TokenType: types.TokenTypeClusterAdmin,
+		},
+	})
+	computeRepo := &fakeComputeRepo{
+		pools: map[string][]*model.PoolState{
+			"selected-workspace": {{Name: "shared-name"}},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("admin-workspace", "shared-name"): {{
+				WorkspaceID: "admin-workspace",
+				PoolName:    "shared-name",
+				MachineID:   "managed-machine",
+			}},
+		},
+	}
+	managedRepo := &fakeComputeRepo{pools: map[string][]*model.PoolState{
+		"admin-workspace": {{Name: "shared-name"}},
+	}}
+	service := &Service{
+		backendRepo:     &fakeManagedPoolBackendRepo{},
+		computeRepo:     computeRepo,
+		managedPoolRepo: &fakeManagedPoolRepo{repo: managedRepo},
+	}
+
+	response, err := service.ListMachineContainers(ctx, &pb.ListMachineContainersRequest{
+		PoolName:  "shared-name",
+		MachineId: "managed-machine",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Ok {
+		t.Fatalf("managed pool was shadowed by selected workspace: %s", response.ErrMsg)
+	}
+}
+
+func TestListMachineContainersReturnsManagedPoolStoreError(t *testing.T) {
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{ExternalId: "selected-workspace"},
+		Token: &types.Token{
+			Active:    true,
+			TokenType: types.TokenTypeClusterAdmin,
+		},
+	})
+	service := &Service{
+		backendRepo: &fakeManagedPoolBackendRepo{},
+		computeRepo: &fakeComputeRepo{pools: map[string][]*model.PoolState{
+			"selected-workspace": {{Name: "shared-name"}},
+		}},
+		managedPoolRepo: &fakeManagedPoolRepo{
+			repo:   &fakeComputeRepo{},
+			getErr: errors.New("managed pool store unavailable"),
+		},
+	}
+
+	response, err := service.ListMachineContainers(ctx, &pb.ListMachineContainersRequest{
+		PoolName:  "shared-name",
+		MachineId: "machine-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Ok || response.ErrMsg != "managed pool store unavailable" {
+		t.Fatalf("response = %+v, want managed pool store error", response)
+	}
+}
+
+// Full seller flow: publish a listing, generate the join command, then join
+// machines. The join must enforce the listing's declared GPU type — machines
+// without that GPU are rejected — while raw nvidia-smi names are accepted.
+func TestMarketplaceJoinEnforcesListingGPUType(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	created, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "rtx-5090-rig",
+		Gpu:         "RTX5090",
+		GpuCount:    2,
+		Public:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateMarketplaceListing() error = %v", err)
+	}
+	if !created.Ok {
+		t.Fatalf("CreateMarketplaceListing() not ok: %s", created.ErrMsg)
+	}
+
+	command, err := service.GetMarketplaceJoinCommand(ctx, &pb.GetMarketplaceJoinCommandRequest{
+		ListingId: created.Listing.Id,
+	})
+	if err != nil {
+		t.Fatalf("GetMarketplaceJoinCommand() error = %v", err)
+	}
+	if !command.Ok {
+		t.Fatalf("GetMarketplaceJoinCommand() not ok: %s", command.ErrMsg)
+	}
+
+	// Raw nvidia-smi GPU names must normalize onto the listing's GPU type.
+	res, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          command.Token,
+		MachineFingerprint: "fingerprint-match",
+		Gpu:                []string{"NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 5090"},
+		GpuCount:           2,
+		CpuCount:           16,
+		MemoryMb:           65536,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("JoinAgent() rejected a matching machine: %s", res.ErrMsg)
+	}
+
+	// A machine with a different GPU must be rejected.
+	res, err = service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          command.Token,
+		MachineFingerprint: "fingerprint-wrong-gpu",
+		Gpu:                []string{"Tesla T4"},
+		GpuCount:           1,
+		CpuCount:           8,
+		MemoryMb:           16384,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("JoinAgent() accepted a machine without the listed GPU type")
+	}
+	if !strings.Contains(res.ErrMsg, `requires GPU type "RTX5090"`) {
+		t.Fatalf("JoinAgent() error = %q, want listing GPU mismatch", res.ErrMsg)
+	}
+
+	// A machine with no GPUs at all must also be rejected.
+	res, err = service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          command.Token,
+		MachineFingerprint: "fingerprint-no-gpu",
+		CpuCount:           8,
+		MemoryMb:           16384,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("JoinAgent() accepted a CPU-only machine into a GPU listing")
+	}
+}
+
+func TestMarketplaceJoinCommandAllowsAnotherWorkspaceToken(t *testing.T) {
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	created, err := service.CreateMarketplaceListing(
+		testAuthContext("seller-1", "listing-owner-token"),
+		&pb.CreateMarketplaceListingRequest{
+			DisplayName: "v100-rig",
+			Gpu:         "V100",
+			GpuCount:    1,
+			Public:      true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("CreateMarketplaceListing() error = %v", err)
+	}
+	if !created.Ok {
+		t.Fatalf("CreateMarketplaceListing() not ok: %s", created.ErrMsg)
+	}
+
+	command, err := service.GetMarketplaceJoinCommand(
+		testAuthContext("seller-1", "different-owner-token"),
+		&pb.GetMarketplaceJoinCommandRequest{ListingId: created.Listing.Id},
+	)
+	if err != nil {
+		t.Fatalf("GetMarketplaceJoinCommand() error = %v", err)
+	}
+	if !command.Ok {
+		t.Fatalf("GetMarketplaceJoinCommand() not ok: %s", command.ErrMsg)
+	}
+
+	res, err := service.JoinAgent(context.Background(), &pb.JoinAgentRequest{
+		JoinToken:          command.Token,
+		MachineFingerprint: "fingerprint",
+		Gpu:                []string{"Tesla V100-SXM2-16GB"},
+		GpuCount:           1,
+		CpuCount:           8,
+		MemoryMb:           24576,
+		Schedulable:        true,
+	})
+	if err != nil {
+		t.Fatalf("JoinAgent() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("JoinAgent() rejected token from alternate owner token: %s", res.ErrMsg)
+	}
+}
+
+func TestListMarketplaceOffersAggregatesMachineSpecs(t *testing.T) {
+	now := time.Now().UTC()
+	listing := &model.MarketplaceListingState{
+		ID:                "listing-1",
+		SellerWorkspaceID: "seller-1",
+		DisplayName:       "rtx-5090-east",
+		GPU:               "RTX5090",
+		GPUCount:          2,
+		Source:            "operator",
+		Public:            true,
+		Status:            model.MarketplaceListingStatusActive,
+		PoolName:          model.MarketplacePoolName("listing-1"),
+		Region:            "us-east",
+		CreatedAt:         now.Add(-time.Hour),
+	}
+	repo := &fakeComputeRepo{
+		listings: map[string][]*model.MarketplaceListingState{
+			"seller-1": {listing},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("seller-1", listing.PoolName): {
+				{
+					MachineID:       "machine-ready",
+					Schedulable:     true,
+					LastJoinAt:      now.Add(-time.Hour),
+					LastHeartbeatAt: now,
+					CPUCount:        32,
+					MemoryMB:        131072,
+					GPUCount:        2,
+					Metrics: model.AgentMachineMetrics{
+						DiskTotalMB:  2 * 1024 * 1024,
+						FreeGPUCount: 2,
+					},
+				},
+				{
+					MachineID:        "machine-offline",
+					Schedulable:      true,
+					LastJoinAt:       now.Add(-2 * time.Hour),
+					LastHeartbeatAt:  now.Add(-time.Hour),
+					LastDisconnectAt: now.Add(-30 * time.Minute),
+					CPUCount:         64,
+					MemoryMB:         262144,
+					Metrics: model.AgentMachineMetrics{
+						DiskTotalMB:  4 * 1024 * 1024,
+						FreeGPUCount: 1,
+					},
+				},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.ListMarketplaceOffers(context.Background(), &pb.ListMarketplaceOffersRequest{})
+	if err != nil {
+		t.Fatalf("ListMarketplaceOffers() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListMarketplaceOffers() not ok: %s", res.ErrMsg)
+	}
+	if len(res.Offers) != 1 {
+		t.Fatalf("offer count = %d, want 1", len(res.Offers))
+	}
+
+	offer := res.Offers[0]
+	if offer.Region != "us-east" {
+		t.Fatalf("offer region = %q, want us-east", offer.Region)
+	}
+	if offer.MachineCount != 2 || offer.ReadyMachineCount != 1 {
+		t.Fatalf("machine counts = %d/%d, want 1/2 ready", offer.ReadyMachineCount, offer.MachineCount)
+	}
+	// Offline machine specs must not leak into the offer.
+	if offer.CpuCores != 32 {
+		t.Fatalf("cpu cores = %d, want 32", offer.CpuCores)
+	}
+	if offer.MemoryMb != 131072 {
+		t.Fatalf("memory mb = %d, want 131072", offer.MemoryMb)
+	}
+	if offer.DiskGb != 2048 {
+		t.Fatalf("disk gb = %d, want 2048", offer.DiskGb)
+	}
+	if offer.FreeGpuCount != 2 {
+		t.Fatalf("free gpu count = %d, want 2", offer.FreeGpuCount)
+	}
+	// One fresh connected machine (score ~1.0) and one disconnected (0), so
+	// the listing-level reliability should land near 0.5.
+	if offer.Reliability < 0.45 || offer.Reliability > 0.5 {
+		t.Fatalf("reliability = %f, want ~0.5", offer.Reliability)
+	}
+	if offer.CreatedAt == nil {
+		t.Fatal("offer created_at is nil")
+	}
+}
+
+func TestListMarketplaceOffersUsesLiveWorkerFreeGPUCount(t *testing.T) {
+	now := time.Now().UTC()
+	listing := &model.MarketplaceListingState{
+		ID:                "listing-1",
+		SellerWorkspaceID: "seller-1",
+		DisplayName:       "v100-west",
+		GPU:               "V100",
+		GPUCount:          8,
+		Source:            "operator",
+		Public:            true,
+		Status:            model.MarketplaceListingStatusActive,
+		PoolName:          model.MarketplacePoolName("listing-1"),
+		Region:            "us-west",
+		CreatedAt:         now.Add(-time.Hour),
+	}
+	repo := &fakeComputeRepo{
+		listings: map[string][]*model.MarketplaceListingState{
+			"seller-1": {listing},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("seller-1", listing.PoolName): {
+				{
+					MachineID:       "machine-ready",
+					Schedulable:     true,
+					LastJoinAt:      now.Add(-time.Hour),
+					LastHeartbeatAt: now,
+					CPUCount:        88,
+					MemoryMB:        451439,
+					GPUCount:        8,
+					Metrics: model.AgentMachineMetrics{
+						FreeGPUCount: 0,
+					},
+				},
+			},
+		},
+	}
+	workerRepo := &fakeWorkerRepo{
+		workers: []*types.Worker{
+			{
+				Id:            "worker-ready",
+				PoolName:      listing.PoolName,
+				MachineId:     "machine-ready",
+				Status:        types.WorkerStatusAvailable,
+				Gpu:           "V100",
+				TotalGpuCount: 8,
+				FreeGpuCount:  8,
+			},
+		},
+	}
+	service := &Service{computeRepo: repo, workerRepo: workerRepo}
+
+	res, err := service.ListMarketplaceOffers(context.Background(), &pb.ListMarketplaceOffersRequest{})
+	if err != nil {
+		t.Fatalf("ListMarketplaceOffers() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListMarketplaceOffers() not ok: %s", res.ErrMsg)
+	}
+	if len(res.Offers) != 1 {
+		t.Fatalf("offer count = %d, want 1", len(res.Offers))
+	}
+	if res.Offers[0].FreeGpuCount != 8 {
+		t.Fatalf("free gpu count = %d, want live worker count 8", res.Offers[0].FreeGpuCount)
+	}
+}
+
+// Unlisted (non-public) listings behave like unlisted videos: excluded from
+// marketplace search, but anyone with the direct link can fetch them.
+func TestUnlistedListingsHiddenFromSearchButServedByDirectLink(t *testing.T) {
+	now := time.Now().UTC()
+	unlisted := &model.MarketplaceListingState{
+		ID:                "listing-unlisted",
+		SellerWorkspaceID: "seller-1",
+		DisplayName:       "secret-rig",
+		GPU:               "RTX5090",
+		GPUCount:          2,
+		Public:            false,
+		Status:            model.MarketplaceListingStatusActive,
+		PoolName:          model.MarketplacePoolName("listing-unlisted"),
+		Region:            "us-east",
+	}
+	repo := &fakeComputeRepo{
+		listings: map[string][]*model.MarketplaceListingState{
+			"seller-1": {unlisted},
+		},
+		machines: map[string][]*model.AgentTokenState{
+			fakeComputeKey("seller-1", unlisted.PoolName): {
+				{
+					MachineID:       "machine-1",
+					Schedulable:     true,
+					LastJoinAt:      now.Add(-time.Hour),
+					LastHeartbeatAt: now,
+					CPUCount:        32,
+					MemoryMB:        131072,
+					GPUCount:        2,
+				},
+			},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	// Hidden from search even with ready machines.
+	search, err := service.ListMarketplaceOffers(context.Background(), &pb.ListMarketplaceOffersRequest{})
+	if err != nil {
+		t.Fatalf("ListMarketplaceOffers() error = %v", err)
+	}
+	if len(search.Offers) != 0 {
+		t.Fatalf("search offer count = %d, want unlisted listings hidden", len(search.Offers))
+	}
+
+	// Served via the direct link.
+	direct, err := service.GetMarketplaceOffer(context.Background(), &pb.GetMarketplaceOfferRequest{ListingId: "listing-unlisted"})
+	if err != nil {
+		t.Fatalf("GetMarketplaceOffer() error = %v", err)
+	}
+	if !direct.Ok || direct.Offer == nil {
+		t.Fatalf("GetMarketplaceOffer() = %+v, want unlisted offer served", direct)
+	}
+	if direct.Offer.Public {
+		t.Fatal("offer public flag = true, want false for unlisted listings")
+	}
+	if direct.Offer.ReadyMachineCount != 1 {
+		t.Fatalf("ready machines = %d, want 1", direct.Offer.ReadyMachineCount)
+	}
+
+	// Inactive listings are not served even with the link.
+	unlisted.Status = model.MarketplaceListingStatusInactive
+	gone, err := service.GetMarketplaceOffer(context.Background(), &pb.GetMarketplaceOfferRequest{ListingId: "listing-unlisted"})
+	if err != nil {
+		t.Fatalf("GetMarketplaceOffer() error = %v", err)
+	}
+	if gone.Ok {
+		t.Fatal("GetMarketplaceOffer() served an inactive listing")
+	}
+}
+
+func TestListMarketplaceOffersSkipsListingsWithoutReadyMachines(t *testing.T) {
+	listing := &model.MarketplaceListingState{
+		ID:                "listing-1",
+		SellerWorkspaceID: "seller-1",
+		DisplayName:       "no-machines",
+		GPU:               "A100-80",
+		GPUCount:          1,
+		Public:            true,
+		Status:            model.MarketplaceListingStatusActive,
+		PoolName:          model.MarketplacePoolName("listing-1"),
+	}
+	repo := &fakeComputeRepo{
+		listings: map[string][]*model.MarketplaceListingState{
+			"seller-1": {listing},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.ListMarketplaceOffers(context.Background(), &pb.ListMarketplaceOffersRequest{})
+	if err != nil {
+		t.Fatalf("ListMarketplaceOffers() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("ListMarketplaceOffers() not ok: %s", res.ErrMsg)
+	}
+	if len(res.Offers) != 0 {
+		t.Fatalf("offer count = %d, want 0", len(res.Offers))
+	}
+}
+
+func TestCreateMarketplaceListingStoresRegion(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "rtx-5090-east",
+		Gpu:         "RTX5090",
+		GpuCount:    2,
+		Public:      true,
+		Region:      " us-east ",
+	})
+	if err != nil {
+		t.Fatalf("CreateMarketplaceListing() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("CreateMarketplaceListing() not ok: %s", res.ErrMsg)
+	}
+	if res.Listing.Region != "us-east" {
+		t.Fatalf("listing region = %q, want us-east (trimmed)", res.Listing.Region)
+	}
+
+	stored, err := repo.GetMarketplaceListing(ctx, "seller-1", res.Listing.Id)
+	if err != nil {
+		t.Fatalf("GetMarketplaceListing() error = %v", err)
+	}
+	if stored == nil || stored.Region != "us-east" {
+		t.Fatalf("stored listing region = %+v, want us-east", stored)
+	}
+}
+
+// Pool names are deterministic and seller-scoped — derived from the GPU type
+// by default, or a name the seller picks — so one seller keeps cache locality
+// without colliding with another seller's workers.
+func TestCreateMarketplaceListingPoolNaming(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	byGPU, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "a100 rig",
+		Gpu:         "A100-40",
+		GpuCount:    1,
+	})
+	if err != nil || !byGPU.Ok {
+		t.Fatalf("CreateMarketplaceListing() = %v, %s", err, byGPU.GetErrMsg())
+	}
+	if want := model.MarketplacePoolNameForSeller("seller-1", "A100-40"); byGPU.Listing.PoolName != want {
+		t.Fatalf("pool = %q, want %q", byGPU.Listing.PoolName, want)
+	}
+
+	// Seller override; "marketplace-" is never doubled, casing/spaces normalize.
+	named, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "west rack",
+		Gpu:         "A100-40",
+		GpuCount:    1,
+		PoolName:    "Marketplace West Rack",
+	})
+	if err != nil || !named.Ok {
+		t.Fatalf("CreateMarketplaceListing() = %v, %s", err, named.GetErrMsg())
+	}
+	if want := model.MarketplacePoolNameForSeller("seller-1", "Marketplace West Rack"); named.Listing.PoolName != want {
+		t.Fatalf("pool = %q, want %q", named.Listing.PoolName, want)
+	}
+	if named.Listing.PoolName == model.MarketplacePoolNameForSeller("seller-2", "Marketplace West Rack") {
+		t.Fatal("marketplace pool names must differ across sellers")
+	}
+}
+
+// Listings can share one pool (shared machine caches) as long as they sell the
+// same GPU type, and the pool only tears down with its last listing.
+func TestMarketplaceListingsSharePool(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	first, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "public a100",
+		Gpu:         "A100-40",
+		GpuCount:    1,
+		PoolName:    "west-rack",
+		Public:      true,
+	})
+	if err != nil || !first.Ok {
+		t.Fatalf("CreateMarketplaceListing() = %v, %s", err, first.GetErrMsg())
+	}
+	second, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "unlisted a100",
+		Gpu:         "A100-40",
+		GpuCount:    1,
+		PoolName:    "west-rack",
+	})
+	if err != nil || !second.Ok {
+		t.Fatalf("CreateMarketplaceListing() = %v, %s", err, second.GetErrMsg())
+	}
+	if first.Listing.PoolName != second.Listing.PoolName {
+		t.Fatalf("pools differ: %q vs %q", first.Listing.PoolName, second.Listing.PoolName)
+	}
+
+	// A different GPU type cannot join the pool: it schedules as one GPU class.
+	mismatch, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "t4 batch",
+		Gpu:         "T4",
+		GpuCount:    1,
+		PoolName:    "west-rack",
+	})
+	if err != nil {
+		t.Fatalf("CreateMarketplaceListing() error = %v", err)
+	}
+	if mismatch.Ok || !strings.Contains(mismatch.ErrMsg, "hosts A100-40 listings") {
+		t.Fatalf("mismatched GPU listing = %+v, want pool GPU conflict error", mismatch)
+	}
+
+	// Updates must respect the shared-pool GPU invariant too: switching one
+	// listing's GPU would leave the pool scheduling two GPU classes.
+	updated, err := service.UpdateMarketplaceListing(ctx, &pb.UpdateMarketplaceListingRequest{
+		ListingId: second.Listing.Id,
+		Gpu:       "T4",
+	})
+	if err != nil {
+		t.Fatalf("UpdateMarketplaceListing() error = %v", err)
+	}
+	if updated.Ok || !strings.Contains(updated.ErrMsg, "hosts A100-40 listings") {
+		t.Fatalf("GPU update on shared pool = %+v, want pool GPU conflict error", updated)
+	}
+
+	// Deleting one listing keeps the shared pool alive for the other.
+	if res, err := service.DeleteMarketplaceListing(ctx, &pb.DeleteMarketplaceListingRequest{ListingId: first.Listing.Id}); err != nil || !res.Ok {
+		t.Fatalf("DeleteMarketplaceListing() = %v, %s", err, res.GetErrMsg())
+	}
+	if state, err := repo.GetPoolState(ctx, "seller-1", first.Listing.PoolName); err != nil || state == nil {
+		t.Fatalf("shared pool state = %+v, %v; want pool preserved while a listing remains", state, err)
+	}
+
+	// The last listing tears the pool down.
+	if res, err := service.DeleteMarketplaceListing(ctx, &pb.DeleteMarketplaceListingRequest{ListingId: second.Listing.Id}); err != nil || !res.Ok {
+		t.Fatalf("DeleteMarketplaceListing() = %v, %s", err, res.GetErrMsg())
+	}
+	if state, err := repo.GetPoolState(ctx, "seller-1", first.Listing.PoolName); err != nil || state != nil {
+		t.Fatalf("pool state after last listing = %+v, %v; want deleted", state, err)
+	}
+}
+
+// Rentals lock GPUs on one machine: capacity checks respect existing rentals,
+// and release returns the GPUs.
+func TestMarketplaceRentalLifecycle(t *testing.T) {
+	sellerCtx := testAuthContext("seller-1", "seller-token")
+	buyerCtx := testAuthContext("buyer-1", "buyer-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	created, err := service.CreateMarketplaceListing(sellerCtx, &pb.CreateMarketplaceListingRequest{
+		DisplayName:          "a100 rack",
+		Gpu:                  "A100-40",
+		GpuCount:             8,
+		Public:               true,
+		PricePerGpuHourCents: 250,
+	})
+	if err != nil || !created.Ok {
+		t.Fatalf("CreateMarketplaceListing() = %v, %s", err, created.GetErrMsg())
+	}
+	listing := created.Listing
+
+	if err := repo.SaveAgentTokenState(context.Background(), &model.AgentTokenState{
+		WorkspaceID: "seller-1",
+		PoolName:    listing.PoolName,
+		MachineID:   "machine-1",
+		GPUCount:    8,
+		Schedulable: true,
+		LastJoinAt:  time.Now(),
+	}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	rental, err := service.CreateMarketplaceRental(buyerCtx, &pb.CreateMarketplaceRentalRequest{
+		ListingId: listing.Id,
+		MachineId: "machine-1",
+		GpuCount:  2,
+	})
+	if err != nil || !rental.Ok {
+		t.Fatalf("CreateMarketplaceRental() = %v, %s", err, rental.GetErrMsg())
+	}
+	if rental.Rental.GpuCount != 2 || rental.Rental.MachineId != "machine-1" {
+		t.Fatalf("rental = %+v, want 2 GPUs on machine-1", rental.Rental)
+	}
+	if rental.Rental.ListingName != "a100 rack" {
+		t.Fatalf("rental listing name = %q, want display name", rental.Rental.ListingName)
+	}
+	if rental.Rental.PricePerGpuHourCents != 250 {
+		t.Fatalf("rental price = %d, want listing price snapshotted", rental.Rental.PricePerGpuHourCents)
+	}
+
+	// Only 6 GPUs remain unrented; 7 must be rejected.
+	over, err := service.CreateMarketplaceRental(buyerCtx, &pb.CreateMarketplaceRentalRequest{
+		ListingId: listing.Id,
+		MachineId: "machine-1",
+		GpuCount:  7,
+	})
+	if err != nil {
+		t.Fatalf("CreateMarketplaceRental() error = %v", err)
+	}
+	if over.Ok || !strings.Contains(over.ErrMsg, "only 6 are unrented") {
+		t.Fatalf("over-rental = %+v, want capacity rejection", over)
+	}
+
+	listed, err := service.ListMarketplaceRentals(buyerCtx, &pb.ListMarketplaceRentalsRequest{})
+	if err != nil || !listed.Ok || len(listed.Rentals) != 1 {
+		t.Fatalf("ListMarketplaceRentals() = %v, %+v", err, listed)
+	}
+
+	// Launch validation: bad kind, missing image, pod without command.
+	for name, req := range map[string]*pb.LaunchRentalWorkloadRequest{
+		"bad kind":       {RentalId: rental.Rental.Id, Kind: "vm", ImageId: "image-1"},
+		"missing image":  {RentalId: rental.Rental.Id, Kind: "pod", Command: []string{"python"}},
+		"pod no command": {RentalId: rental.Rental.Id, Kind: "pod", ImageId: "image-1"},
+	} {
+		res, err := service.LaunchRentalWorkload(buyerCtx, req)
+		if err != nil {
+			t.Fatalf("%s: LaunchRentalWorkload() error = %v", name, err)
+		}
+		if res.Ok {
+			t.Fatalf("%s: launch succeeded, want validation error", name)
+		}
+	}
+
+	// Another buyer cannot launch on this rental.
+	otherBuyer := testAuthContext("buyer-2", "other-token")
+	stolen, err := service.LaunchRentalWorkload(otherBuyer, &pb.LaunchRentalWorkloadRequest{
+		RentalId: rental.Rental.Id,
+		Kind:     "shell",
+		ImageId:  "image-1",
+	})
+	if err != nil {
+		t.Fatalf("LaunchRentalWorkload() error = %v", err)
+	}
+	if stolen.Ok || stolen.ErrMsg != rentalErrNotFound {
+		t.Fatalf("cross-buyer launch = %+v, want rental not found", stolen)
+	}
+
+	restrictedBuyer := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{ExternalId: "buyer-1"},
+		Token: &types.Token{
+			ExternalId: "runtime-token",
+			TokenType:  types.TokenTypeWorkspaceRestricted,
+		},
+	})
+	denied, err := service.LaunchRentalWorkload(restrictedBuyer, &pb.LaunchRentalWorkloadRequest{
+		RentalId: rental.Rental.Id,
+		Kind:     "shell",
+		ImageId:  "image-1",
+	})
+	if err != nil {
+		t.Fatalf("restricted LaunchRentalWorkload() error = %v", err)
+	}
+	if denied.Ok || denied.ErrMsg != marketplaceErrMissingAuth {
+		t.Fatalf("restricted launch = %+v, want authorization error", denied)
+	}
+
+	// Release returns the capacity.
+	deleted, err := service.DeleteMarketplaceRental(buyerCtx, &pb.DeleteMarketplaceRentalRequest{RentalId: rental.Rental.Id})
+	if err != nil || !deleted.Ok {
+		t.Fatalf("DeleteMarketplaceRental() = %v, %s", err, deleted.GetErrMsg())
+	}
+	relisted, err := service.ListMarketplaceRentals(buyerCtx, &pb.ListMarketplaceRentalsRequest{})
+	if err != nil || len(relisted.Rentals) != 0 {
+		t.Fatalf("rentals after release = %+v, want none", relisted.Rentals)
+	}
+	freed, err := service.CreateMarketplaceRental(buyerCtx, &pb.CreateMarketplaceRentalRequest{
+		ListingId: listing.Id,
+		MachineId: "machine-1",
+		GpuCount:  8,
+	})
+	if err != nil || !freed.Ok {
+		t.Fatalf("full-machine rental after release = %v, %s", err, freed.GetErrMsg())
+	}
+}
+
+// Rentals bill wall-clock while held — idle time included — via gateway-emitted
+// usage intervals; the billing cursor advances after each emission.
+func TestEmitRentalUsageBillsHeldTime(t *testing.T) {
+	var got clients.MarketplaceUsageRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode usage: %v", err)
+		}
+		w.Write([]byte(`{"ok": true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	start := time.Now().Add(-10 * time.Minute).UTC()
+	repo := &fakeComputeRepo{}
+	if err := repo.SaveMarketplaceRental(context.Background(), &model.MarketplaceRentalState{
+		ID:                   "rental-1",
+		BuyerWorkspaceID:     "buyer-1",
+		SellerWorkspaceID:    "seller-1",
+		ListingID:            "listing-1",
+		MachineID:            "machine-1",
+		GPU:                  "A100-40",
+		GPUCount:             2,
+		PricePerGPUHourCents: 120,
+		CreatedAt:            start,
+		LastBilledAt:         start,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	service := &Service{
+		computeRepo: repo,
+		rentalUsage: clients.NewMarketplaceUsageClient(types.ManagedComputeBillingConfig{Endpoint: server.URL}),
+	}
+
+	now := time.Now().UTC()
+	service.emitRentalUsage(context.Background(), now)
+
+	if got.UsageKind != marketplaceRentalUsageKind || got.BuyerWorkspaceID != "buyer-1" || got.ListingID != "listing-1" {
+		t.Fatalf("usage = %+v, want rental attribution", got)
+	}
+	if got.DurationSeconds < 9*60 || got.DurationSeconds > 11*60 {
+		t.Fatalf("duration = %f, want ~10 minutes of held time", got.DurationSeconds)
+	}
+	// 2 GPUs x 120¢/GPU/hr x ~10min ≈ 40¢.
+	if got.BuyerCostCents < 39 || got.BuyerCostCents > 41 {
+		t.Fatalf("cost = %f cents, want ~40 for 2 GPUs at 120¢/hr over 10min", got.BuyerCostCents)
+	}
+	rental, _ := repo.GetMarketplaceRental(context.Background(), "buyer-1", "rental-1")
+	if !rental.LastBilledAt.Equal(now) {
+		t.Fatalf("billing cursor = %v, want advanced to %v", rental.LastBilledAt, now)
+	}
+}
+
+// Marketplace listings must never take over a pool that exists in another mode.
+func TestMarketplaceListingRejectsNonMarketplacePool(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	if err := repo.SavePoolState(ctx, "seller-1", &model.PoolState{
+		Name: model.MarketplacePoolNameForSeller("seller-1", "web"),
+		Mode: string(types.PoolModePrivate),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "web rig",
+		Gpu:         "A100-40",
+		GpuCount:    1,
+		PoolName:    "web",
+	})
+	if err != nil {
+		t.Fatalf("CreateMarketplaceListing() error = %v", err)
+	}
+	if res.Ok || !strings.Contains(res.ErrMsg, "non-marketplace pool") {
+		t.Fatalf("listing over private pool = %+v, want rejection", res)
+	}
+}
+
+func TestMarketplacePoolStateRollsBackFailedRegistration(t *testing.T) {
+	ctx := context.Background()
+	repo := &fakeComputeRepo{}
+	poolName := model.MarketplacePoolNameForSeller("seller-1", "a100")
+	manager := scheduler.NewWorkerPoolManager()
+	manager.SetPool(poolName, types.WorkerPoolConfig{Mode: types.PoolModeLocal}, nil)
+	service := &Service{
+		computeRepo: repo,
+		scheduler:   scheduler.NewSchedulerForCapacityChecks(nil, repo, manager),
+	}
+
+	err := service.ensureMarketplacePoolState(ctx, &model.MarketplaceListingState{
+		ID: "listing-1", SellerWorkspaceID: "seller-1", PoolName: poolName, GPU: "A100-40", Status: model.MarketplaceListingStatusActive,
+	}, "owner-token")
+	if err == nil {
+		t.Fatal("ensureMarketplacePoolState() unexpectedly registered over a configured controller")
+	}
+	if state, err := repo.GetPoolState(ctx, "seller-1", poolName); err != nil || state != nil {
+		t.Fatalf("partial marketplace pool state = %+v, %v; want rollback", state, err)
+	}
+}
+
+func TestMarketplaceListingRollsBackFailedRegistration(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	poolName := model.MarketplacePoolNameForSeller("seller-1", "a100")
+	manager := scheduler.NewWorkerPoolManager()
+	manager.SetPool(poolName, types.WorkerPoolConfig{Mode: types.PoolModeLocal}, nil)
+	service := &Service{
+		computeRepo: repo,
+		scheduler:   scheduler.NewSchedulerForCapacityChecks(nil, repo, manager),
+	}
+
+	res, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "a100 listing",
+		PoolName:    "a100",
+		Gpu:         "A100-40",
+		GpuCount:    1,
+	})
+	if err != nil {
+		t.Fatalf("CreateMarketplaceListing() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("CreateMarketplaceListing() unexpectedly succeeded")
+	}
+	listingID := model.MarketplaceListingID("seller-1", "a100 listing")
+	if listing, err := repo.GetMarketplaceListing(ctx, "seller-1", listingID); err != nil || listing != nil {
+		t.Fatalf("partial marketplace listing = %+v, %v; want rollback", listing, err)
+	}
+	if state, err := repo.GetPoolState(ctx, "seller-1", poolName); err != nil || state != nil {
+		t.Fatalf("partial marketplace pool = %+v, %v; want rollback", state, err)
+	}
+}
+
+func TestMarketplaceUpdateRestoresListingAndPoolAfterFailedRegistration(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	poolName := model.MarketplacePoolNameForSeller("seller-1", "gpu")
+	now := time.Now().UTC()
+	listing := &model.MarketplaceListingState{
+		ID:                "listing-1",
+		SellerWorkspaceID: "seller-1",
+		DisplayName:       "gpu listing",
+		GPU:               "A100-40",
+		GPUCount:          1,
+		Source:            defaultMarketplaceSource,
+		Status:            model.MarketplaceListingStatusActive,
+		PoolName:          poolName,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	if err := repo.SaveMarketplaceListing(ctx, listing); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SavePoolState(ctx, "seller-1", marketplacePoolState(listing, "owner-token", now, now)); err != nil {
+		t.Fatal(err)
+	}
+	manager := scheduler.NewWorkerPoolManager()
+	manager.SetPool(poolName, types.WorkerPoolConfig{Mode: types.PoolModeLocal}, nil)
+	service := &Service{
+		computeRepo: repo,
+		scheduler:   scheduler.NewSchedulerForCapacityChecks(nil, repo, manager),
+	}
+
+	res, err := service.UpdateMarketplaceListing(ctx, &pb.UpdateMarketplaceListingRequest{
+		ListingId: listing.ID,
+		Gpu:       "H100",
+	})
+	if err != nil {
+		t.Fatalf("UpdateMarketplaceListing() error = %v", err)
+	}
+	if res.Ok {
+		t.Fatal("UpdateMarketplaceListing() unexpectedly succeeded")
+	}
+	restoredListing, err := repo.GetMarketplaceListing(ctx, "seller-1", listing.ID)
+	if err != nil || restoredListing == nil || restoredListing.GPU != "A100-40" {
+		t.Fatalf("restored listing = %+v, %v; want A100-40", restoredListing, err)
+	}
+	restoredPool, err := repo.GetPoolState(ctx, "seller-1", poolName)
+	if err != nil || restoredPool == nil || restoredPool.Config == nil || !sameStrings(restoredPool.Config.Gpu, []string{"A100-40"}) {
+		t.Fatalf("restored pool = %+v, %v; want A100-40", restoredPool, err)
+	}
+}
+
+func TestMarketplaceListingRuntimeFollowsGPU(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	repo := &fakeComputeRepo{}
+	service := &Service{computeRepo: repo}
+
+	created, err := service.CreateMarketplaceListing(ctx, &pb.CreateMarketplaceListingRequest{
+		DisplayName: "a10g-marketplace",
+		Gpu:         "A10G",
+		GpuCount:    1,
+		Public:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateMarketplaceListing() error = %v", err)
+	}
+	if !created.Ok {
+		t.Fatalf("CreateMarketplaceListing() not ok: %s", created.ErrMsg)
+	}
+	if created.Listing.Runtime != types.ContainerRuntimeGvisor.String() {
+		t.Fatalf("listing runtime = %q, want gvisor for A10G", created.Listing.Runtime)
+	}
+	pool, err := repo.GetPoolState(ctx, "seller-1", created.Listing.PoolName)
+	if err != nil {
+		t.Fatalf("GetPoolState() error = %v", err)
+	}
+	if pool == nil || pool.Config == nil || !sameStrings(pool.Config.Gpu, []string{"A10G"}) {
+		t.Fatalf("pool gpu config = %+v, want A10G", pool)
+	}
+
+	updated, err := service.UpdateMarketplaceListing(ctx, &pb.UpdateMarketplaceListingRequest{
+		ListingId: created.Listing.Id,
+		Gpu:       "Tesla V100-SXM2-16GB",
+	})
+	if err != nil {
+		t.Fatalf("UpdateMarketplaceListing() error = %v", err)
+	}
+	if !updated.Ok {
+		t.Fatalf("UpdateMarketplaceListing() not ok: %s", updated.ErrMsg)
+	}
+	if updated.Listing.Gpu != "V100" {
+		t.Fatalf("listing gpu = %q, want V100", updated.Listing.Gpu)
+	}
+	if updated.Listing.Runtime != types.ContainerRuntimeRunc.String() {
+		t.Fatalf("listing runtime = %q, want runc fallback for V100", updated.Listing.Runtime)
+	}
+
+	pool, err = repo.GetPoolState(ctx, "seller-1", updated.Listing.PoolName)
+	if err != nil {
+		t.Fatalf("GetPoolState() error = %v", err)
+	}
+	if pool == nil || pool.Config == nil || !sameStrings(pool.Config.Gpu, []string{"V100"}) {
+		t.Fatalf("pool gpu config = %+v, want V100", pool)
+	}
+}
+
+func TestUpdateMarketplaceListingUpdatesRegion(t *testing.T) {
+	ctx := testAuthContext("seller-1", "owner-token")
+	listing := &model.MarketplaceListingState{
+		ID:                "listing-1",
+		SellerWorkspaceID: "seller-1",
+		DisplayName:       "rtx-5090",
+		GPU:               "RTX5090",
+		GPUCount:          1,
+		Public:            true,
+		Status:            model.MarketplaceListingStatusActive,
+		PoolName:          model.MarketplacePoolName("listing-1"),
+		Region:            "us-east",
+	}
+	repo := &fakeComputeRepo{
+		listings: map[string][]*model.MarketplaceListingState{
+			"seller-1": {listing},
+		},
+	}
+	service := &Service{computeRepo: repo}
+
+	res, err := service.UpdateMarketplaceListing(ctx, &pb.UpdateMarketplaceListingRequest{
+		ListingId: "listing-1",
+		Region:    "eu-west",
+	})
+	if err != nil {
+		t.Fatalf("UpdateMarketplaceListing() error = %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("UpdateMarketplaceListing() not ok: %s", res.ErrMsg)
+	}
+	if res.Listing.Region != "eu-west" {
+		t.Fatalf("listing region = %q, want eu-west", res.Listing.Region)
+	}
+}

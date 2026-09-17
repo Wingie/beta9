@@ -33,16 +33,13 @@ func AuthMiddleware(backendRepo repository.BackendRepository, workspaceRepo repo
 			var token *types.Token
 			var workspace *types.Workspace
 			var err error
-
 			token, workspace, err = workspaceRepo.AuthorizeToken(tokenKey)
 			if err != nil {
 				token, workspace, err = backendRepo.AuthorizeToken(c.Request().Context(), tokenKey)
 				if err != nil {
 					return echo.NewHTTPError(http.StatusUnauthorized)
 				}
-
-				err = workspaceRepo.SetAuthorizationToken(token, workspace)
-				if err != nil {
+				if err := workspaceRepo.SetAuthorizationToken(token, workspace); err != nil {
 					return echo.NewHTTPError(http.StatusInternalServerError)
 				}
 			}
@@ -50,7 +47,6 @@ func AuthMiddleware(backendRepo repository.BackendRepository, workspaceRepo repo
 			if !token.Active || token.DisabledByClusterAdmin {
 				return echo.NewHTTPError(http.StatusUnauthorized)
 			}
-
 			authInfo := &AuthInfo{
 				Token:     token,
 				Workspace: workspace,
@@ -143,7 +139,7 @@ func WithStrictWorkspaceAuth(next func(ctx echo.Context) error) func(ctx echo.Co
 func WithClusterAdminAuth(next func(ctx echo.Context) error) func(ctx echo.Context) error {
 	return func(ctx echo.Context) error {
 		cc, ok := ctx.(*HttpAuthContext)
-		if !ok {
+		if !ok || cc.AuthInfo == nil || cc.AuthInfo.Token == nil {
 			return echo.NewHTTPError(http.StatusUnauthorized)
 		}
 

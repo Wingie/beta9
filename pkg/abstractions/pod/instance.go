@@ -8,18 +8,84 @@ import (
 	"time"
 
 	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
+	"github.com/beam-cloud/beta9/pkg/common"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 )
 
 type podInstance struct {
 	*abstractions.AutoscaledInstance
-	buffer *PodProxyBuffer
+	buffer                    *PodProxyBuffer
+	durableDiskPlacementRepos abstractions.DurableDiskPlacementRepos
+}
+
+func (i *podInstance) ConsumeContainerEvent(event types.ContainerEvent) {
+	i.AutoscaledInstance.ConsumeContainerEvent(event)
+	if i.buffer == nil || i.ContainerRepo == nil || event.ContainerId == "" {
+		return
+	}
+	if event.Change < 0 {
+		i.buffer.retireAvailableContainer(event.ContainerId)
+		return
+	}
+
+	state, err := i.ContainerRepo.GetContainerState(event.ContainerId)
+	if err != nil {
+		i.buffer.signalDiscovery()
+		return
+	}
+	if state.Status == types.ContainerStatusStopping {
+		i.buffer.retireAvailableContainer(event.ContainerId)
+	}
+}
+
+func (i *podInstance) ensureReadyForRequest() error {
+	if err := i.Sync(); err != nil {
+		return err
+	}
+
+	state, err := i.State()
+	if err != nil {
+		return err
+	}
+	if state.RunningContainers+state.PendingContainers > 0 {
+		return nil
+	}
+
+	desiredContainers := 1
+	if i.Stub.Type == types.StubType(types.StubTypePodDeployment) {
+		desiredContainers = desiredPodDeploymentContainers(
+			i.StubConfig,
+			1,
+			i.AppConfig.GatewayService.StubLimits.MaxReplicas,
+		)
+	}
+	if desiredContainers <= 0 {
+		return nil
+	}
+
+	err = i.HandleScalingEvent(desiredContainers)
+	if common.IsRedisLockNotObtained(err) {
+		if i.Autoscaler != nil {
+			i.Autoscaler.Trigger()
+		}
+		return nil
+	}
+	return err
 }
 
 func (i *podInstance) startContainers(containersToRun int) error {
+	poolSelector := i.StubConfig.PoolSelector()
+	if err := abstractions.ConfigureDurableDiskPlacement(i.Ctx, i.durableDiskPlacementRepos, i.Workspace, i.StubConfig); err != nil {
+		return err
+	}
+	if poolSelector != i.StubConfig.PoolSelector() && i.Stub != nil && i.BackendRepo != nil {
+		if err := i.BackendRepo.UpdateStubConfig(i.Ctx, i.Stub.Id, i.StubConfig); err != nil {
+			return err
+		}
+	}
+
 	secrets, err := abstractions.ConfigureContainerRequestSecrets(i.Workspace, *i.StubConfig)
 	if err != nil {
 		return err
@@ -56,13 +122,16 @@ func (i *podInstance) startContainers(containersToRun int) error {
 	}
 
 	for c := 0; c < containersToRun; c++ {
+		if err := i.CheckConcurrencyLimit(); err != nil {
+			return err
+		}
+
 		containerId := i.genContainerId()
 		mounts, err := abstractions.ConfigureContainerRequestMounts(
 			containerId,
-			i.Stub.Object.ExternalId,
+			i.Stub,
 			i.Workspace,
 			*i.StubConfig,
-			i.Stub.ExternalId,
 		)
 		if err != nil {
 			return err
@@ -84,22 +153,38 @@ func (i *podInstance) startContainers(containersToRun int) error {
 			Mounts:            mounts,
 			Stub:              *i.Stub,
 			CheckpointEnabled: checkpointEnabled,
+			CheckpointTrigger: i.StubConfig.CheckpointTrigger,
 			Ports:             ports,
-			BlockNetwork:      i.StubConfig.BlockNetwork,
-			AllowList:         i.StubConfig.AllowList,
-			DockerEnabled:     i.StubConfig.DockerEnabled,
+			PoolSelector:      i.StubConfig.PoolSelector(),
+			Hostname:          i.StubConfig.Hostname,
+		}
+		if err := abstractions.ConfigureContainerRequestNetwork(runRequest, *i.StubConfig); err != nil {
+			return err
 		}
 
-		ttl := time.Duration(i.StubConfig.KeepWarmSeconds) * time.Second
-		key := Keys.podKeepWarmLock(i.Workspace.Name, i.Stub.ExternalId, runRequest.ContainerId)
-		if ttl <= 0 {
-			i.Rdb.Set(context.Background(), key, 1, 0)
-		} else {
-			i.Rdb.SetEx(context.Background(), key, 1, ttl)
+		if i.StubConfig.KeepWarmSeconds != 0 {
+			setPodKeepWarmLock(
+				context.Background(),
+				i.ContainerRepo,
+				i.Workspace.Name,
+				i.Stub.ExternalId,
+				runRequest.ContainerId,
+				i.StubConfig.KeepWarmSeconds,
+			)
 		}
 
 		err = i.Scheduler.Run(runRequest)
 		if err != nil {
+			if i.StubConfig.KeepWarmSeconds != 0 {
+				setPodKeepWarmLock(
+					context.Background(),
+					i.ContainerRepo,
+					i.Workspace.Name,
+					i.Stub.ExternalId,
+					runRequest.ContainerId,
+					0,
+				)
+			}
 			log.Error().Str("instance_name", i.Name).Err(err).Msg("unable to run container")
 			return err
 		}
@@ -119,22 +204,53 @@ func (i *podInstance) stopContainers(containersToStop int) error {
 		return err
 	}
 
-	for c := 0; c < containersToStop && len(containerIds) > 0; c++ {
+	stopped := 0
+	for stopped < containersToStop && len(containerIds) > 0 {
 		idx := rnd.Intn(len(containerIds))
 		containerId := containerIds[idx]
+		containerIds = append(containerIds[:idx], containerIds[idx+1:]...)
+
+		if !i.retireContainerForStop(containerId) {
+			continue
+		}
 
 		err := i.Scheduler.Stop(&types.StopContainerArgs{ContainerId: containerId, Force: true, Reason: types.StopContainerReasonScheduler})
 		if err != nil {
+			if i.buffer != nil {
+				i.buffer.cancelContainerRetirement(containerId)
+			}
 			log.Error().Str("instance_name", i.Name).Err(err).Msg("unable to stop container")
 			return err
 		}
-
-		// Remove the containerId from the containerIds slice to avoid
-		// sending multiple stop requests to the same container
-		containerIds = append(containerIds[:idx], containerIds[idx+1:]...)
+		stopped++
 	}
 
 	return nil
+}
+
+func (i *podInstance) retireContainerForStop(containerId string) bool {
+	if i.buffer == nil {
+		return true
+	}
+
+	// Retire the proxy route before stopping the backend so a new request is
+	// queued for a replacement instead of reusing an idle connection.
+	i.buffer.retireAvailableContainer(containerId)
+	if !i.IsActive {
+		return true
+	}
+	if i.buffer.containerConnectionCount(containerId) > 0 {
+		i.buffer.cancelContainerRetirement(containerId)
+		return false
+	}
+
+	connections, err := i.buffer.sharedContainerConnectionCount(containerId)
+	if err != nil || connections > 0 {
+		i.buffer.cancelContainerRetirement(containerId)
+		return false
+	}
+
+	return true
 }
 
 func (i *podInstance) stoppableContainers() ([]string, error) {
@@ -142,40 +258,55 @@ func (i *podInstance) stoppableContainers() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	stopAll := !i.IsActive
+	if !stopAll && i.FailedContainerThreshold > 0 {
+		failedContainers, err := i.ContainerRepo.GetFailedContainersByStubId(i.Stub.ExternalId)
+		if err != nil {
+			return nil, err
+		}
+		stopAll = len(failedContainers) >= i.FailedContainerThreshold
+	}
 
-	// Create a slice to hold the keys
 	keys := make([]string, 0, len(containers))
 	for _, container := range containers {
-		if container.Status == types.ContainerStatusStopping || container.Status == types.ContainerStatusPending {
+		if container.Status == types.ContainerStatusStopping {
 			continue
 		}
 
-		// When deployment is stopped, all containers should be stopped even if they have keep warm
-		if !i.IsActive {
+		// Circuit breaking must cancel pending replacements and ignore keep-warm.
+		if stopAll {
 			keys = append(keys, container.ContainerId)
+			continue
+		}
+		if container.Status == types.ContainerStatusPending {
 			continue
 		}
 
 		// Skip containers with keep warm locks
-		keepWarmVal, err := i.Rdb.Get(context.TODO(), Keys.podKeepWarmLock(i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)).Int()
-		if err != nil && err != redis.Nil {
+		keepWarm, err := i.ContainerRepo.PodKeepWarmLockExists(context.TODO(), i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)
+		if err != nil {
 			log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting keep warm lock for container")
 			continue
 		}
 
-		keepWarm := keepWarmVal > 0
 		if keepWarm {
 			continue
 		}
 
-		connectionsVal, err := i.Rdb.Get(context.TODO(), Keys.podContainerConnections(i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)).Int()
-		if err != nil && err != redis.Nil {
-			log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting connections for container")
+		if i.buffer != nil && i.buffer.pendingKeepWarmLockExists(container.ContainerId) {
 			continue
 		}
 
-		connections := connectionsVal > 0
-		if connections {
+		if i.buffer != nil && i.buffer.containerConnectionCount(container.ContainerId) > 0 {
+			continue
+		}
+
+		connectionsVal, err := sharedPodContainerConnections(context.TODO(), i.Rdb, i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)
+		if err != nil {
+			log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting connections for container")
+			continue
+		}
+		if connectionsVal > 0 {
 			continue
 		}
 

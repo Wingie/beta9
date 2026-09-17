@@ -2,399 +2,173 @@ package agent
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
-	"os/signal"
 	"strings"
-	"syscall"
-	"time"
 
-	"github.com/rs/zerolog/log"
+	"github.com/beam-cloud/beta9/pkg/compute"
+	"github.com/beam-cloud/beta9/pkg/types"
 )
 
-const AgentVersion = "0.2.0"
+var ErrInterrupted = errors.New("agent interrupted")
 
-// Agent represents the Beta9 agent
-type Agent struct {
-	config        *AgentConfig
-	keepaliveLoop *KeepaliveLoop
-	jobMonitor    *JobMonitor
-	state         *AgentState
-	tui           *TUI
-	useTUI        bool
-	ctx           context.Context
-	cancel        context.CancelFunc
-	ollama        *OllamaManager  // Inference server manager
-	control       *ControlServer  // Control API server
-}
-
-// New creates a new agent instance (legacy, no TUI)
-func New(config *AgentConfig) *Agent {
-	return NewWithTUI(config, false)
-}
-
-// NewWithTUI creates a new agent instance with optional TUI
-func NewWithTUI(config *AgentConfig, useTUI bool) *Agent {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	state := NewAgentState(
-		config.MachineID,
-		config.PoolName,
-		config.GatewayURL(),
-	)
-
-	var tui *TUI
-	if useTUI {
-		tui = NewTUI()
-	}
-
-	// Initialize OllamaManager with Tailscale IP (or hostname)
-	tailscaleIP := config.Hostname
-	if tailscaleIP == "" {
-		tailscaleIP = detectTailscaleIP()
-	}
-	ollama := NewOllamaManager(tailscaleIP, DefaultOllamaPort)
-
-	agent := &Agent{
-		config: config,
-		state:  state,
-		tui:    tui,
-		useTUI: useTUI,
-		ctx:    ctx,
-		cancel: cancel,
-		ollama: ollama,
-	}
-
-	// Initialize control server (will be started in Run)
-	agent.control = NewControlServer(agent, DefaultControlPort)
-
-	return agent
-}
-
-// detectTailscaleIP attempts to detect the Tailscale IP
-func detectTailscaleIP() string {
-	// Try environment variable first
-	if ip := os.Getenv("TAILSCALE_IP"); ip != "" {
-		return ip
-	}
-
-	// Try running tailscale ip command
-	cmd := exec.Command("tailscale", "ip", "-4")
-	output, err := cmd.Output()
-	if err == nil {
-		ip := strings.TrimSpace(string(output))
-		if ip != "" {
-			return ip
-		}
-	}
-
-	return "localhost"
-}
-
-// Run starts the agent lifecycle
-func (a *Agent) Run() error {
-	if a.useTUI {
-		return a.runWithTUI()
-	}
-	return a.runWithLogs()
-}
-
-// runWithTUI runs the agent with TUI dashboard
-func (a *Agent) runWithTUI() error {
-	// Enter full-screen mode (alternate screen buffer)
-	a.tui.EnterFullScreen()
-
-	// Validate config
-	if err := a.config.Validate(); err != nil {
+func RunJoin(ctx context.Context, opts types.AgentJoinOptions) error {
+	var err error
+	if opts, err = normalizeJoinOptions(opts); err != nil {
 		return err
 	}
 
-	// Setup signal handlers
-	a.setupSignalHandlers()
-
-	// Note: OllamaManager is initialized but NOT started here
-	// Ollama only starts when control API receives "start-inference" command
-
-	// Start control server (for receiving start-inference commands)
-	if err := a.control.Start(a.ctx); err != nil {
+	lock, err := acquireAgentLock()
+	if err != nil {
 		return err
 	}
-	a.state.AddLog(fmt.Sprintf("Control API listening on :%d", DefaultControlPort))
+	defer lock.release()
 
-	// Step 1: Register machine
-	a.state.Status = "REGISTERING"
-	a.renderTUI()
-
-	result := RegisterMachine(a.ctx, a.config)
-	if result.Error != nil {
-		a.state.Status = "ERROR"
-		a.renderTUI()
-		return result.Error
-	}
-
-	a.state.Status = "REGISTERED"
-	a.renderTUI()
-
-	// Handle --once mode
-	if a.config.Once {
-		success := SendSingleKeepalive(a.ctx, a.config)
-		a.state.UpdateHeartbeat(success)
-		a.renderTUI()
-		time.Sleep(2 * time.Second)
-		return nil
-	}
-
-	// Step 2: Start job monitor
-	a.jobMonitor = NewJobMonitor(a.state)
-	a.jobMonitor.RefreshPods(a.ctx)
-	a.jobMonitor.Start(a.ctx)
-
-	// Step 3: Start keepalive loop
-	a.keepaliveLoop = NewKeepaliveLoopWithState(a.config, a.state)
-	a.keepaliveLoop.Start(a.ctx)
-
-	// Step 4: TUI refresh loop
-	return a.tuiLoop()
-}
-
-// runWithLogs runs the agent with traditional log output
-func (a *Agent) runWithLogs() error {
-	log.Info().
-		Str("version", AgentVersion).
-		Str("machine_id", a.config.MachineID).
-		Str("pool", a.config.PoolName).
-		Str("gateway", a.config.GatewayURL()).
-		Bool("debug", a.config.Debug).
-		Bool("dry_run", a.config.DryRun).
-		Msg("Beta9 Agent starting")
-
-	// Validate config
-	if err := a.config.Validate(); err != nil {
+	client := NewClient(opts.GatewayURL)
+	res, err := resolveAgentIdentity(ctx, client, opts)
+	if err != nil {
 		return err
 	}
-
-	// Setup signal handlers
-	a.setupSignalHandlers()
-
-	// Note: OllamaManager is initialized but NOT started here
-	// Ollama only starts when control API receives "start-inference" command
-
-	// Start control server (for receiving start-inference commands)
-	if err := a.control.Start(a.ctx); err != nil {
-		return err
+	if !res.Ok || res.AgentToken == "" {
+		return fmt.Errorf("join failed: %s", firstNonEmpty(res.ErrMsg, "gateway did not return an agent token"))
 	}
-	a.state.AddLog(fmt.Sprintf("Control API listening on :%d", DefaultControlPort))
-
-	// Step 1: Register machine
-	log.Info().Msg("Registering machine with gateway...")
-	result := RegisterMachine(a.ctx, a.config)
-	if result.Error != nil {
-		return result.Error
-	}
-
-	log.Info().Msg("Machine registered successfully")
-	if result.Config != nil && len(result.Config) > 0 {
-		log.Debug().Interface("config", result.Config).Msg("Gateway config received")
-	}
-
-	// Step 2: Handle --once mode
-	if a.config.Once {
-		log.Info().Msg("Running in --once mode, sending single keepalive...")
-		success := SendSingleKeepalive(a.ctx, a.config)
-		if success {
-			log.Info().Msg("Single keepalive sent successfully")
-		} else {
-			log.Warn().Msg("Single keepalive failed (may be expected if endpoint not fully deployed)")
-		}
-		log.Info().Msg("Agent complete (--once mode)")
-		return nil
-	}
-
-	// Step 3: Start keepalive loop
-	log.Info().Msg("Starting keepalive loop...")
-	a.keepaliveLoop = NewKeepaliveLoop(a.config)
-	a.keepaliveLoop.Start(a.ctx)
-
-	// Step 4: Monitor health
-	return a.monitorHealth()
-}
-
-// tuiLoop renders the TUI periodically
-func (a *Agent) tuiLoop() error {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return nil
-		case <-ticker.C:
-			a.renderTUI()
-
-			// Check health
-			if a.keepaliveLoop != nil && !a.keepaliveLoop.IsHealthy() {
-				return &ErrKeepaliveFailed{
-					StatusCode: 0,
-					Body:       "too many consecutive failures",
-				}
-			}
+	res.Bootstrap = normalizeBootstrapForAgentRuntime(opts.GatewayURL, res.Bootstrap)
+	if err := saveRuntimeState(opts.GatewayURL, res); err != nil {
+		fmt.Fprintf(opts.Stderr, "failed to save agent state: %v\n", err)
+	} else if opts.JoinTokenFile != "" {
+		if err := os.Remove(opts.JoinTokenFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(opts.Stderr, "failed to remove consumed join token: %v\n", err)
 		}
 	}
-}
 
-// renderTUI renders the current state to terminal
-func (a *Agent) renderTUI() {
-	if a.tui == nil {
-		return
+	grpcClient, grpcConn, err := newGatewayGRPCClient(opts.GatewayURL, res.Bootstrap.GatewayGRPCHost, res.Bootstrap.GatewayGRPCPort, res.Bootstrap.GatewayGRPCTLS)
+	if err != nil {
+		return fmt.Errorf("gateway grpc client: %w", err)
+	}
+	defer grpcConn.Close()
+
+	telemetry := newAgentTelemetry(grpcClient, res.AgentToken, res.Bootstrap, opts.CacheDir, opts.Stderr)
+	go telemetry.run(ctx)
+	agentStdout := telemetry.teeLogWriter(opts.Stdout, types.AgentTelemetrySourceAgent, "", types.EventLogStreamStdout)
+	defer agentStdout.Close()
+	agentStderr := telemetry.teeLogWriter(opts.Stderr, types.AgentTelemetrySourceAgent, "", types.EventLogStreamStderr)
+	defer agentStderr.Close()
+
+	statusf(agentStdout, "Connected to pool %q", res.PoolName)
+	statusf(agentStdout, "Registered machine %q", res.MachineID)
+	if !res.Schedulable && len(res.Preflight) > 0 {
+		statusf(agentStdout, "Machine is not schedulable: %s", preflightFailureSummary(res.Preflight))
+	}
+	verbosef(agentStdout, "transport=%s executor=%s fallback=%s\n", res.Bootstrap.Transport, res.Bootstrap.Executor, res.Bootstrap.Fallback)
+
+	workers := newWorkerRuntimeManager(res.Bootstrap, opts, opts.Stdout, opts.Stderr, agentStdout, agentStderr, telemetry)
+	telemetry.setStatsProvider(workers.stats)
+	defer workers.stopAll()
+
+	registryForwarder, err := startLocalRegistryForwarder(ctx, agentStderr)
+	if err != nil {
+		fmt.Fprintf(agentStderr, "local registry forwarder disabled: %v\n", err)
+	} else if registryForwarder != nil {
+		defer registryForwarder.Close()
 	}
 
-	// Update metrics from keepalive if available
-	if a.keepaliveLoop != nil {
-		metrics := a.keepaliveLoop.GetLastMetrics()
-		a.state.UpdateMetrics(
-			metrics.CpuUtilizationPct,
-			metrics.MemoryUtilizationPct,
-			metrics.FreeGpuCount,
-		)
-	}
-
-	// Move cursor to home position (don't clear - just overwrite)
-	a.tui.MoveCursorHome()
-	output := a.tui.Render(a.state)
-	os.Stdout.WriteString(output)
-	// Clear any leftover lines from previous render
-	a.tui.ClearToEnd()
-}
-
-func (a *Agent) setupSignalHandlers() {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		sig := <-sigCh
-		if !a.useTUI {
-			log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
+	transport := normalizeTransport(firstNonEmpty(opts.TransportOverride, res.Bootstrap.Transport))
+	if err := runRouteProxy(ctx, grpcClient, res.AgentToken, res.MachineID, transport, workers, telemetry, agentStdout, agentStderr); err != nil {
+		if agentInterrupted(ctx, err) {
+			statusf(agentStdout, "Disconnecting machine %q", res.MachineID)
+			return ErrInterrupted
 		}
-		a.Shutdown()
-	}()
-}
-
-func (a *Agent) monitorHealth() error {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			log.Info().Msg("Agent context cancelled")
-			return nil
-		case <-ticker.C:
-			if !a.keepaliveLoop.IsHealthy() {
-				log.Error().
-					Msg("Keepalive loop unhealthy (too many consecutive failures), exiting...")
-				return &ErrKeepaliveFailed{
-					StatusCode: 0,
-					Body:       "too many consecutive failures",
-				}
-			}
-		}
+		return fmt.Errorf("route proxy stopped: %w", err)
 	}
-}
-
-// Shutdown gracefully stops the agent
-func (a *Agent) Shutdown() {
-	if !a.useTUI {
-		log.Info().Msg("Shutting down agent...")
-	}
-
-	if a.jobMonitor != nil {
-		a.jobMonitor.Stop()
-	}
-	if a.keepaliveLoop != nil {
-		a.keepaliveLoop.Stop()
-	}
-	if a.control != nil {
-		a.control.Stop()
-	}
-	if a.ollama != nil {
-		a.ollama.Stop()
-	}
-	a.cancel()
-
-	if a.useTUI && a.tui != nil {
-		a.tui.ExitFullScreen()
-	}
-
-	if !a.useTUI {
-		log.Info().Msg("Agent shutdown complete")
-	}
-}
-
-// StartInference starts the inference server (called by control API)
-func (a *Agent) StartInference() error {
-	if a.ollama == nil {
-		return nil
-	}
-
-	if a.ollama.IsRunning() {
-		log.Info().Msg("Inference server already running")
-		a.state.AddLog("Inference: already running")
-		return nil
-	}
-
-	log.Info().Msg("Starting inference server...")
-	a.state.AddLog("Inference: starting Ollama...")
-	a.state.UpdateInference("starting", a.ollama.TailscaleIP(), DefaultOllamaPort, nil)
-
-	if err := a.ollama.Start(a.ctx); err != nil {
-		log.Error().Err(err).Msg("Failed to start inference server")
-		a.state.AddLog("Inference: FAILED - " + err.Error())
-		a.state.UpdateInference("error", "", 0, nil)
-		return err
-	}
-
-	if a.ollama.IsRunning() {
-		log.Info().
-			Int("port", DefaultOllamaPort).
-			Str("tailscale_ip", a.ollama.TailscaleIP()).
-			Msg("Inference server ready")
-		a.state.AddLog("Inference: ready on :" + fmt.Sprintf("%d", DefaultOllamaPort))
-		a.state.UpdateInference("running", a.ollama.TailscaleIP(), DefaultOllamaPort, nil)
-	}
-
 	return nil
 }
 
-// StopInference stops the inference server (called by control API)
-func (a *Agent) StopInference() {
-	if a.ollama != nil && a.ollama.IsRunning() {
-		log.Info().Msg("Stopping inference server...")
-		a.state.AddLog("Inference: stopping...")
-		a.ollama.Stop()
-		a.state.AddLog("Inference: stopped")
-		a.state.UpdateInference("stopped", "", 0, nil)
-	}
+func agentInterrupted(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled)
 }
 
-// IsInferenceRunning returns whether the inference server is running
-func (a *Agent) IsInferenceRunning() bool {
-	return a.ollama != nil && a.ollama.IsRunning()
+func normalizeJoinOptions(opts types.AgentJoinOptions) (types.AgentJoinOptions, error) {
+	opts.GatewayURL = strings.TrimRight(strings.TrimSpace(opts.GatewayURL), "/")
+	opts.JoinToken = strings.TrimSpace(opts.JoinToken)
+	opts.JoinTokenFile = strings.TrimSpace(opts.JoinTokenFile)
+	if opts.JoinToken == "" && opts.JoinTokenFile != "" {
+		data, err := os.ReadFile(opts.JoinTokenFile)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return types.AgentJoinOptions{}, fmt.Errorf("read join token file: %w", err)
+		}
+		opts.JoinToken = strings.TrimSpace(string(data))
+	}
+	if opts.GatewayURL == "" {
+		return types.AgentJoinOptions{}, fmt.Errorf("gateway is required")
+	}
+	if opts.Stdout == nil {
+		opts.Stdout = io.Discard
+	}
+	if opts.Stderr == nil {
+		opts.Stderr = io.Discard
+	}
+	return opts, nil
 }
 
-// GenerateMachineID creates a random 8-character hex machine ID
-func GenerateMachineID() string {
-	bytes := make([]byte, 4)
-	if _, err := rand.Read(bytes); err != nil {
-		// Fallback to timestamp-based ID if crypto/rand fails
-		return hex.EncodeToString([]byte{
-			byte(time.Now().UnixNano() >> 24),
-			byte(time.Now().UnixNano() >> 16),
-			byte(time.Now().UnixNano() >> 8),
-			byte(time.Now().UnixNano()),
-		})
+func resolveAgentIdentity(ctx context.Context, client *Client, opts types.AgentJoinOptions) (*joinResponse, error) {
+	savedState, stateErr := loadRuntimeState(opts.GatewayURL)
+	if stateErr != nil {
+		fmt.Fprintf(opts.Stderr, "failed to load saved agent state: %v\n", stateErr)
 	}
-	return hex.EncodeToString(bytes)
+	if opts.JoinToken == "" {
+		if savedState == nil {
+			return nil, fmt.Errorf("join-token is required")
+		}
+		return savedState, nil
+	}
+
+	res, err := join(ctx, client, opts)
+	if err == nil && res != nil && res.Ok {
+		return res, nil
+	}
+	if res != nil && savedState != nil {
+		return savedState, nil
+	}
+	if res != nil {
+		return nil, fmt.Errorf("join failed: %s", res.ErrMsg)
+	}
+	if err != nil {
+		// Fall back to the saved identity only when the gateway could not be
+		// reached; a 4xx rejection means the token was revoked or invalid.
+		if savedState != nil && !joinRejected(err) {
+			logJoinFallback(opts.Stderr, err)
+			return savedState, nil
+		}
+		return nil, fmt.Errorf("join failed: %w", err)
+	}
+	return nil, fmt.Errorf("join failed")
+}
+
+func joinRejected(err error) bool {
+	var statusErr *compute.HTTPStatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode >= 400 && statusErr.StatusCode < 500
+}
+
+func logJoinFallback(stderr io.Writer, err error) {
+	fmt.Fprintf(stderr, "join failed, resuming saved agent identity: %v\n", err)
+}
+
+func preflightFailureSummary(checks []check) string {
+	failed := make([]string, 0, len(checks))
+	for _, check := range checks {
+		if check.Ok || check.Severity != types.AgentPreflightSeverityError {
+			continue
+		}
+		if check.Message == "" {
+			failed = append(failed, check.Name)
+			continue
+		}
+		failed = append(failed, fmt.Sprintf("%s (%s)", check.Name, check.Message))
+	}
+	if len(failed) == 0 {
+		return "waiting for schedulable capacity"
+	}
+	return strings.Join(failed, ", ")
 }

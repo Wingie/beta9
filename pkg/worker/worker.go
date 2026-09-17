@@ -4,16 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"math"
 	"net/http"
 	_ "net/http/pprof" // Import for side effects
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	blobcache "github.com/beam-cloud/blobcache-v2/pkg"
+	"github.com/beam-cloud/beta9/pkg/cache"
+	"github.com/beam-cloud/beta9/pkg/clients"
+	"github.com/beam-cloud/beta9/pkg/disk"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/rs/zerolog/log"
 
@@ -28,39 +35,86 @@ import (
 )
 
 const (
-	containerLogsPath              string        = "/var/log/worker"
+	containerLogsPath              string        = types.AgentLogsPath
 	defaultWorkerSpindownTimeS     float64       = 300 // 5 minutes
 	defaultCacheWaitTime           time.Duration = 30 * time.Second
 	containerStatusUpdateInterval  time.Duration = 30 * time.Second
 	containerRequestStreamInterval time.Duration = 100 * time.Millisecond
+	containerRequestAckTimeout     time.Duration = 5 * time.Second
+	completedRequestRetryTimeout   time.Duration = 30 * time.Second
+	completedRequestRetryInterval  time.Duration = 200 * time.Millisecond
+	workerEventStreamReconnectMin  time.Duration = time.Second
+	workerEventStreamReconnectMax  time.Duration = 5 * time.Second
+	defaultRuncStartConcurrency    int           = types.DefaultRuncStartConcurrency
+	defaultGvisorStartConcurrency  int           = types.DefaultGvisorStartConcurrency
+	defaultWorkerStopGracePeriodS  int64         = 30
+	shutdownDrainPollInterval      time.Duration = 100 * time.Millisecond
+	shutdownDrainMax               time.Duration = 5 * time.Second
+	shutdownForceWait              time.Duration = 5 * time.Second
+	shutdownCleanupReserve         time.Duration = 5 * time.Second
+	workerShutdownRPCTimeout       time.Duration = 5 * time.Second
+	containerStartupTimeout        time.Duration = 15 * time.Minute
+	stuckContainerAbortDelay       time.Duration = 2 * time.Minute
+	gvisorShmemTHPPath                           = "/sys/kernel/mm/transparent_hugepage/shmem_enabled"
+
+	// A draining worker is drained once it has no containers and this long
+	// has passed since both its disable and its last request, so a container
+	// placed just before the disable landed is not orphaned.
+	workerDrainGrace time.Duration = 10 * time.Second
+	// Minimum spacing between DisableWorker retries for a worker past maxAge.
+	workerDrainRetryInterval time.Duration = 30 * time.Second
 )
+
+func ensureGVisorShmemTHP(path string) (bool, error) {
+	policy, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+
+	current := string(policy)
+	if !strings.Contains(current, "[never]") && !strings.Contains(current, "[deny]") {
+		return false, nil
+	}
+	if err := os.WriteFile(path, []byte("advise"), 0644); err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 type Worker struct {
 	workerId                string
 	workerToken             string
+	workerGeneration        string
 	poolName                string
+	machineID               string
 	poolConfig              types.WorkerPoolConfig
 	cpuLimit                int64
 	memoryLimit             int64
 	gpuType                 string
 	gpuCount                uint32
+	gpuVirtualized          bool
 	podAddr                 string
 	podHostName             string
+	routeLocalTargetHost    string
 	imageMountPath          string
 	runtime                 runtime.Runtime
 	runcRuntime             runtime.Runtime
 	gvisorRuntime           runtime.Runtime
 	containerServer         *ContainerRuntimeServer
+	cacheManager            *WorkerCacheManager
 	fileCacheManager        *FileCacheManager
 	criuManager             CRIUManager
-	containerNetworkManager *ContainerNetworkManager
+	containerNetworkManager ContainerNetwork
 	containerGPUManager     GPUManager
+	containerThunderManager GPUManager
 	containerMountManager   *ContainerMountManager
-	redisClient             *common.RedisClient
 	imageClient             *ImageClient
-	eventBus                *common.EventBus
 	containerInstances      *common.SafeMap[*ContainerInstance]
+	containerCancels        *common.SafeMap[context.CancelFunc]
 	containerLock           sync.Mutex
+	checkpointCreateLocks   sync.Map
+	containerStartSem       chan struct{}
+	containerStartLimit     int
 	containerWg             sync.WaitGroup
 	containerLogger         *ContainerLogger
 	workerUsageMetrics      *WorkerUsageMetrics
@@ -71,11 +125,37 @@ type Worker struct {
 	backendRepoClient       pb.BackendRepositoryServiceClient
 	eventRepo               repo.EventRepository
 	storageManager          *WorkspaceStorageManager
+	diskManager             *disk.Manager
+	qcowChains              sync.Map // live published qcow chain (rows + manifests) per volume key
 	userDataStorage         storage.Storage
-	checkpointStorage       storage.Storage
-	ctx                     context.Context
-	cancel                  func()
-	config                  types.AppConfig
+	persistent              bool
+	// poolHeadroom is the gateway's answer on the last keepalive: this worker
+	// holds the pool's minimum free capacity and must not idle out.
+	poolHeadroom atomic.Bool
+	startedAt    time.Time
+	// headroomMaxAge bounds how long headroom alone keeps an idle worker up;
+	// maxAge bounds the whole lifetime, busy or not. Zero is no bound. The
+	// drain fields are only touched from the request-stream loop.
+	headroomMaxAge   time.Duration
+	maxAge           time.Duration
+	draining         bool
+	drainStartedAt   time.Time
+	nextDrainAttempt time.Time
+	routeTransport   string
+	ctx              context.Context
+	cancel           func()
+	config           types.AppConfig
+}
+
+func (w *Worker) gpuVirtualizedForRequest(request *types.ContainerRequest) bool {
+	return w != nil && w.gpuVirtualized && request != nil && request.RequiresGPU()
+}
+
+func (w *Worker) gpuManagerForRequest(request *types.ContainerRequest) GPUManager {
+	if w.gpuVirtualizedForRequest(request) {
+		return w.containerThunderManager
+	}
+	return w.containerGPUManager
 }
 
 type ContainerInstance struct {
@@ -91,18 +171,246 @@ type ContainerInstance struct {
 	LogBuffer                  *common.LogBuffer
 	Request                    *types.ContainerRequest
 	StopReason                 types.StopContainerReason
+	RuntimeStarted             bool
+	RuntimePid                 int
+	RuntimeStartedAt           int64
 	SandboxProcessManager      *goproc.GoProcClient
 	SandboxProcessManagerReady bool
+	processManagerReadyMu      sync.RWMutex
+	DeferredCPUQuota           *specs.LinuxCPU
+	CPUSet                     string
+	RestoreCPUAffinityDeferred bool
+	ProcessManagerReadyOnce    sync.Once
+	ProcessManagerReadyChan    chan struct{}
 	ContainerIp                string
+	containerAddressMu         sync.RWMutex
+	ContainerAddressMap        map[int32]string
 	Runtime                    runtime.Runtime
-	OOMWatcher                 runtime.OOMWatcher
+	terminalCheckpointCreated  atomic.Bool
+	StopEscalationStarted      atomic.Bool
+	StuckMountRecoveryStarted  atomic.Bool
+	statusHeartbeatMu          sync.Mutex
+	stateMu                    sync.RWMutex
+	oomWatcherMu               sync.Mutex
+	oomWatcher                 runtime.OOMWatcher
+	oomWatcherFactory          func(func()) runtime.OOMWatcher
+	oomWatcherOnOOM            func() error
+	oomTerminationAttempted    bool
+	oomTerminationErr          error
+	oomWatcherGeneration       uint64
+	oomWatcherSuspended        bool
+	oomWatcherClosed           bool
+}
+
+func (i *ContainerInstance) lifecycleState() (int, types.StopContainerReason) {
+	i.stateMu.RLock()
+	defer i.stateMu.RUnlock()
+	return i.ExitCode, i.StopReason
+}
+
+func (i *ContainerInstance) setExitCode(exitCode int) {
+	i.stateMu.Lock()
+	defer i.stateMu.Unlock()
+	i.ExitCode = exitCode
+}
+
+func (i *ContainerInstance) setStopReason(reason types.StopContainerReason) {
+	i.stateMu.Lock()
+	defer i.stateMu.Unlock()
+	i.StopReason = reason
+}
+
+func (i *ContainerInstance) runtimeStartState() (bool, int) {
+	i.stateMu.RLock()
+	defer i.stateMu.RUnlock()
+	return i.RuntimeStarted, i.RuntimePid
+}
+
+func (i *ContainerInstance) markRuntimeStarted(pid int) {
+	i.stateMu.Lock()
+	defer i.stateMu.Unlock()
+	i.RuntimeStarted = true
+	i.RuntimePid = pid
+	i.RuntimeStartedAt = time.Now().Unix()
+}
+
+func (i *ContainerInstance) resetRuntimeStarted() {
+	i.stateMu.Lock()
+	defer i.stateMu.Unlock()
+	i.RuntimeStarted = false
+	i.RuntimePid = 0
+	i.RuntimeStartedAt = 0
+}
+
+func (i *ContainerInstance) installOOMWatcher(factory func(func()) runtime.OOMWatcher, onOOM func() error) {
+	if factory == nil {
+		return
+	}
+
+	i.oomWatcherMu.Lock()
+	if i.oomWatcherClosed {
+		i.oomWatcherMu.Unlock()
+		return
+	}
+	previous := i.oomWatcher
+	i.oomWatcher = nil
+	i.oomWatcherFactory = factory
+	i.oomWatcherOnOOM = onOOM
+	if !i.oomWatcherSuspended {
+		i.startOOMWatcherLocked()
+	}
+	i.oomWatcherMu.Unlock()
+
+	if previous != nil {
+		previous.Stop()
+	}
+}
+
+func (i *ContainerInstance) startOOMWatcherLocked() {
+	i.oomWatcherGeneration++
+	generation := i.oomWatcherGeneration
+	i.oomWatcher = i.oomWatcherFactory(func() {
+		i.oomWatcherMu.Lock()
+		defer i.oomWatcherMu.Unlock()
+		if !i.oomWatcherClosed && !i.oomWatcherSuspended && i.oomWatcherGeneration == generation && i.oomWatcherOnOOM != nil {
+			i.oomTerminationAttempted = true
+			i.oomTerminationErr = i.oomWatcherOnOOM()
+		}
+	})
+}
+
+func (i *ContainerInstance) oomTerminationResult() (bool, error) {
+	i.oomWatcherMu.Lock()
+	defer i.oomWatcherMu.Unlock()
+	return i.oomTerminationAttempted, i.oomTerminationErr
+}
+
+func (i *ContainerInstance) suspendOOMWatcher() func() {
+	i.oomWatcherMu.Lock()
+	if i.oomWatcherClosed {
+		i.oomWatcherMu.Unlock()
+		return func() {}
+	}
+	i.oomWatcherSuspended = true
+	i.oomWatcherGeneration++
+	generation := i.oomWatcherGeneration
+	watcher := i.oomWatcher
+	i.oomWatcher = nil
+	i.oomWatcherMu.Unlock()
+
+	if watcher != nil {
+		watcher.Stop()
+	}
+
+	return func() {
+		i.oomWatcherMu.Lock()
+		if i.oomWatcherClosed || !i.oomWatcherSuspended || i.oomWatcherGeneration != generation {
+			i.oomWatcherMu.Unlock()
+			return
+		}
+		i.oomWatcherSuspended = false
+		if i.oomWatcherFactory != nil {
+			i.startOOMWatcherLocked()
+		}
+		i.oomWatcherMu.Unlock()
+	}
+}
+
+func (i *ContainerInstance) stopOOMWatcher() {
+	i.oomWatcherMu.Lock()
+	i.oomWatcherClosed = true
+	i.oomWatcherSuspended = true
+	i.oomWatcherGeneration++
+	i.oomWatcherFactory = nil
+	i.oomWatcherOnOOM = nil
+	watcher := i.oomWatcher
+	i.oomWatcher = nil
+	i.oomWatcherMu.Unlock()
+
+	if watcher != nil {
+		watcher.Stop()
+	}
+}
+
+func (i *ContainerInstance) hasOOMWatcher() bool {
+	i.oomWatcherMu.Lock()
+	defer i.oomWatcherMu.Unlock()
+	return i.oomWatcher != nil
+}
+
+func (i *ContainerInstance) setContainerAddressMap(addressMap map[int32]string) {
+	if i == nil {
+		return
+	}
+	i.containerAddressMu.Lock()
+	defer i.containerAddressMu.Unlock()
+	i.ContainerAddressMap = cloneContainerAddressMap(addressMap)
+}
+
+func (i *ContainerInstance) containerAddress(port int32) string {
+	if i == nil {
+		return ""
+	}
+	i.containerAddressMu.RLock()
+	defer i.containerAddressMu.RUnlock()
+	return i.ContainerAddressMap[port]
 }
 
 type ContainerOptions struct {
-	BundlePath   string
-	HostBindPort int
-	BindPorts    []int
-	InitialSpec  *specs.Spec
+	BundlePath                  string
+	HostBindPort                int
+	BindPorts                   []int
+	StartupPortBindings         []PortBinding
+	InitialSpec                 *specs.Spec
+	StartupStartedAt            time.Time
+	CheckpointFilesystemRestore *checkpointFilesystemRestore
+	// AddressesRegistered is the address-map publication started as soon as
+	// host ports were reserved; RUNNING waits on it, and so does teardown.
+	AddressesRegistered *addressRegistration
+}
+
+// addressRegistration is the in-flight publication of a container's address
+// map. Any number of parties may wait on it: the runtime start joins it before
+// RUNNING is published, and teardown joins it so a publication cannot land
+// after the container state it belongs to has been deleted.
+type addressRegistration struct {
+	done chan struct{}
+	err  error
+}
+
+func newAddressRegistration(publish func() error) *addressRegistration {
+	r := &addressRegistration{done: make(chan struct{})}
+	go func() {
+		r.err = publish()
+		close(r.done)
+	}()
+	return r
+}
+
+// wait blocks until the publication has finished or ctx ends. A nil
+// registration is one that was never started and reports no error.
+func (r *addressRegistration) wait(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	select {
+	case <-r.done:
+		return r.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitForTeardown joins the publication before the container's state is
+// deleted, so a late publication cannot outlive that deletion. It is bounded:
+// a stalled gateway must not hold up teardown.
+func (r *addressRegistration) waitForTeardown() {
+	if r == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), containerRepositoryRetryTimeout)
+	defer cancel()
+	_ = r.wait(ctx)
 }
 
 type stopContainerEvent struct {
@@ -110,47 +418,56 @@ type stopContainerEvent struct {
 	Kill        bool
 }
 
-func NewWorker() (*Worker, error) {
+func NewWorker() (_ *Worker, err error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
 
 	containerInstances := common.NewSafeMap[*ContainerInstance]()
 
-	gpuType := os.Getenv("GPU_TYPE")
-	workerId := os.Getenv("WORKER_ID")
-	workerToken := os.Getenv("WORKER_TOKEN")
-	workerPoolName := os.Getenv("WORKER_POOL_NAME")
-	podHostName := os.Getenv("HOSTNAME")
+	gpuType := os.Getenv(types.WorkerGPUEnv)
+	workerId := os.Getenv(types.WorkerIDEnv)
+	workerToken := os.Getenv(types.WorkerTokenEnv)
+	workerGeneration := os.Getenv(types.WorkerGenerationEnv)
+	workerPoolName := os.Getenv(types.WorkerPoolEnv)
+	machineID := os.Getenv(types.WorkerMachineEnv)
+	podHostName := os.Getenv(types.WorkerHostnameEnv)
+	persistent := envBool(types.WorkerPersistentEnv)
+	routeTransport := firstNonEmptyWorkerValue(os.Getenv(types.WorkerRouteTransportEnv))
+	if routeTransport == "" && persistent {
+		routeTransport = types.BackendRouteTransportTSNet
+	}
+	routeLocalTargetHost := firstNonEmptyWorkerValue(os.Getenv(types.WorkerRouteTargetEnv))
 
 	podAddr, err := GetPodAddr()
 	if err != nil {
 		return nil, err
 	}
 
-	gpuCount, err := strconv.ParseInt(os.Getenv("GPU_COUNT"), 10, 64)
+	gpuCount, err := strconv.ParseInt(os.Getenv(types.WorkerGPUCountEnv), 10, 64)
 	if err != nil {
 		return nil, err
 	}
 
-	cpuLimit, err := strconv.ParseInt(os.Getenv("CPU_LIMIT"), 10, 64)
+	cpuLimit, err := strconv.ParseInt(os.Getenv(types.WorkerCPUEnv), 10, 64)
 	if err != nil {
 		return nil, err
 	}
 
-	memoryLimit, err := strconv.ParseInt(os.Getenv("MEMORY_LIMIT"), 10, 64)
+	memoryLimit, err := strconv.ParseInt(os.Getenv(types.WorkerMemoryEnv), 10, 64)
 	if err != nil {
 		return nil, err
 	}
+	gpuVirtualized := envBool(types.WorkerGPUVirtualizedEnv)
 
 	configManager, err := common.NewConfigManager[types.AppConfig]()
 	if err != nil {
 		return nil, err
 	}
 	config := configManager.GetConfig()
-
-	redisClient, err := common.NewRedisClient(config.Database.Redis, common.WithClientName("Beta9Worker"))
-	if err != nil {
-		return nil, err
-	}
 
 	containerRepoClient, err := NewContainerRepositoryClient(context.TODO(), config, workerToken)
 	if err != nil {
@@ -167,24 +484,33 @@ func NewWorker() (*Worker, error) {
 		return nil, err
 	}
 
-	eventRepo := repo.NewTCPEventClientRepo(config.Monitoring.FluentBit.Events)
-
-	var cacheClient *blobcache.BlobCacheClient = nil
-	if config.Worker.BlobCacheEnabled {
-		cacheClient, err = blobcache.NewBlobCacheClient(ctx, config.BlobCache)
-		if err == nil {
-			err = cacheClient.WaitForHosts(defaultCacheWaitTime)
-		}
-
+	var thunderClient pb.ThunderServiceClient
+	if gpuVirtualized {
+		thunderClient, err = NewThunderServiceClient(context.TODO(), config, workerToken)
 		if err != nil {
-			log.Warn().Err(err).Msg("cache unavailable, performance may be degraded")
-			cacheClient = nil
+			return nil, err
 		}
 	}
+
+	eventRepo := repo.NewWorkerEventClientRepo(config, workerRepoClient, workerId)
 
 	poolConfig, poolFound := config.Worker.Pools[workerPoolName]
 	if !poolFound {
 		return nil, errors.New("invalid worker pool name")
+	}
+
+	ensureWritableSysfs()
+
+	var cacheManager *WorkerCacheManager
+	var cacheClient *cache.Client
+	if config.Cache.Enabled && config.Worker.CacheEnabled {
+		cacheManager = NewWorkerCacheManager(ctx, config, poolConfig, workerRepoClient, eventRepo, containerInstances, workerId, workerPoolName, podAddr)
+		cacheClient, err = cacheManager.Start()
+		if err != nil {
+			log.Warn().Err(err).Msg("cache unavailable, performance may be degraded")
+			cacheClient = nil
+			cacheManager = nil
+		}
 	}
 
 	// Create container runtimes based on pool configuration
@@ -219,6 +545,12 @@ func NewWorker() (*Worker, error) {
 	case types.ContainerRuntimeRunc.String():
 		defaultRuntime = runcRuntime
 	case types.ContainerRuntimeGvisor.String():
+		if changed, err := ensureGVisorShmemTHP(gvisorShmemTHPPath); err != nil {
+			log.Warn().Err(err).Msg("failed to enable shmem transparent huge pages for gVisor")
+		} else if changed {
+			log.Info().Msg("enabled shmem transparent huge pages for gVisor")
+		}
+
 		// Get gVisor configuration from pool config
 		gvisorRoot := poolConfig.ContainerRuntimeConfig.GVisorRoot
 		if gvisorRoot == "" {
@@ -231,11 +563,12 @@ func NewWorker() (*Worker, error) {
 		}
 
 		gvisorRuntime, err = runtime.New(runtime.Config{
-			Type:          types.ContainerRuntimeGvisor.String(),
-			RunscPath:     "runsc",
-			RunscRoot:     gvisorRoot,
-			RunscPlatform: gvisorPlatform,
-			Debug:         config.DebugMode,
+			Type:           types.ContainerRuntimeGvisor.String(),
+			RunscPath:      "runsc",
+			RunscRoot:      gvisorRoot,
+			RunscPlatform:  gvisorPlatform,
+			RunscExtraArgs: poolConfig.ContainerRuntimeConfig.GVisorExtraArgs,
+			Debug:          config.DebugMode,
 		})
 		if err != nil {
 			log.Warn().Err(err).Msg("failed to create gvisor runtime, falling back to runc")
@@ -252,6 +585,8 @@ func NewWorker() (*Worker, error) {
 		defaultRuntime = runcRuntime
 	}
 
+	containerStartLimit := containerStartLimitForPoolRuntime(poolConfig, config.Worker.ContainerRuntime, defaultRuntime.Name(), cpuLimit)
+
 	userDataStorage, err := storage.NewStorage(config.Storage, cacheClient)
 	if err != nil {
 		return nil, err
@@ -263,31 +598,41 @@ func NewWorker() (*Worker, error) {
 	}
 
 	fileCacheManager := NewFileCacheManager(config, cacheClient)
-	imageClient, err := NewImageClient(config, workerId, workerRepoClient, fileCacheManager)
+	imageClient, err := NewImageClient(config, workerId, workerPoolName, workerRepoClient, fileCacheManager)
 	if err != nil {
 		return nil, err
 	}
+	imageClient.eventRepo = eventRepo
+	if cacheManager != nil {
+		imageClient.contentReporter = cacheManager.ContentReporter()
+	}
 
 	var criuManager CRIUManager = nil
-	var checkpointStorage storage.Storage = nil
 	if pool, ok := config.Worker.Pools[workerPoolName]; ok && pool.CRIUEnabled {
-		criuManager, err = InitializeCRIUManager(ctx, config.Worker.CRIU)
-		if err != nil {
-			log.Warn().Str("worker_id", workerId).Msgf("C/R unavailable, failed to create CRIU manager: %v", err)
+		if cacheManager == nil {
+			log.Warn().Str("worker_id", workerId).Msg("C/R unavailable, cache is required for checkpoints")
+		} else {
+			criuManager, err = InitializeCRIUManager(ctx, config.Worker.CRIU, cacheManager.CheckpointRoot())
+			if err != nil {
+				log.Warn().Str("worker_id", workerId).Msgf("C/R unavailable, failed to create CRIU manager: %v", err)
+			}
 		}
 	}
 
-	containerNetworkManager, err := NewContainerNetworkManager(ctx, workerId, workerRepoClient, containerRepoClient, config, containerInstances)
+	baseContainerNetworkManager, err := NewContainerNetworkManager(ctx, workerId, workerPoolName, workerRepoClient, containerRepoClient, eventRepo, config, containerInstances, poolConfig, containerStartLimit)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
+	containerNetworkManager := newContainerNetwork(baseContainerNetworkManager, podAddr, persistent, machineID, routeTransport, routeLocalTargetHost)
 
 	worker := &Worker{
 		ctx:                     ctx,
 		workerId:                workerId,
 		workerToken:             workerToken,
+		workerGeneration:        workerGeneration,
 		poolName:                workerPoolName,
+		machineID:               machineID,
 		poolConfig:              poolConfig,
 		cancel:                  cancel,
 		config:                  config,
@@ -296,25 +641,32 @@ func NewWorker() (*Worker, error) {
 		memoryLimit:             memoryLimit,
 		gpuType:                 gpuType,
 		gpuCount:                uint32(gpuCount),
+		gpuVirtualized:          gpuVirtualized,
 		runtime:                 defaultRuntime,
 		runcRuntime:             runcRuntime,
 		gvisorRuntime:           gvisorRuntime,
+		cacheManager:            cacheManager,
 		storageManager:          storageManager,
 		fileCacheManager:        fileCacheManager,
-		containerGPUManager:     NewContainerNvidiaManager(uint32(gpuCount)),
+		containerGPUManager:     NewContainerNvidiaManager(uint32(gpuCount), defaultRuntime.Name()),
+		containerThunderManager: NewContainerThunderManager(thunderClient),
 		containerNetworkManager: containerNetworkManager,
-		containerMountManager:   NewContainerMountManager(config),
-		redisClient:             redisClient,
+		containerMountManager:   NewContainerMountManager(config, poolConfig),
 		podAddr:                 podAddr,
+		routeLocalTargetHost:    routeLocalTargetHost,
 		imageClient:             imageClient,
 		criuManager:             criuManager,
 		podHostName:             podHostName,
-		eventBus:                nil,
 		containerInstances:      containerInstances,
+		containerCancels:        common.NewSafeMap[context.CancelFunc](),
 		containerLock:           sync.Mutex{},
+		containerStartSem:       make(chan struct{}, containerStartLimit),
+		containerStartLimit:     containerStartLimit,
 		containerWg:             sync.WaitGroup{},
 		containerLogger: &ContainerLogger{
 			containerInstances: containerInstances,
+			eventRepo:          eventRepo,
+			workerID:           workerId,
 			logLinesPerHour:    config.Worker.ContainerLogLinesPerHour,
 		},
 		containerRepoClient: containerRepoClient,
@@ -324,7 +676,18 @@ func NewWorker() (*Worker, error) {
 		completedRequests:   make(chan *types.ContainerRequest, 1000),
 		stopContainerChan:   make(chan stopContainerEvent, 1000),
 		userDataStorage:     userDataStorage,
-		checkpointStorage:   checkpointStorage,
+		persistent:          persistent,
+		startedAt:           time.Now(),
+		headroomMaxAge:      jitteredWorkerAge(config.Worker.HeadroomWorkerMaxAge, workerId),
+		maxAge:              jitteredWorkerAge(config.Worker.MaxAge, workerId),
+		routeTransport:      routeTransport,
+	}
+
+	// Recover qcow volumes left behind by a previous worker process before any
+	// container can attach: live volumes are adopted, crashed ones cleaned up.
+	worker.diskManager = disk.NewManager(disk.Config{})
+	if err := worker.diskManager.Recover(ctx); err != nil {
+		log.Warn().Err(err).Msg("failed to recover qcow durable disk volumes")
 	}
 
 	containerServer, err := NewContainerRuntimeServer(&ContainerRuntimeServerOpts{
@@ -334,7 +697,13 @@ func NewWorker() (*Worker, error) {
 		ImageClient:             imageClient,
 		ContainerRepoClient:     containerRepoClient,
 		ContainerNetworkManager: containerNetworkManager,
+		EventRepo:               eventRepo,
+		WorkerID:                workerId,
+		BackendRoute:            worker.backendRouteFor,
 		CreateCheckpoint:        worker.createCheckpoint,
+		SnapshotDisks: func(ctx context.Context, request *types.ContainerRequest) ([]*types.DiskSnapshot, error) {
+			return worker.syncDurableDiskMounts(ctx, request, durableDiskSyncExplicit)
+		},
 	})
 	if err != nil {
 		cancel()
@@ -347,7 +716,14 @@ func NewWorker() (*Worker, error) {
 		return nil, err
 	}
 
-	workerMetrics, err := NewWorkerUsageMetrics(ctx, workerId, config.Monitoring, gpuType)
+	usageRecorder := clients.NewManagedComputeContainerUsageRecorder(config.ManagedCompute, clients.WorkerIdentity{
+		WorkerID:  workerId,
+		PoolName:  workerPoolName,
+		MachineID: machineID,
+		Runtime:   defaultRuntime.Name(),
+	})
+
+	workerMetrics, err := NewWorkerUsageMetrics(ctx, workerId, config, gpuType, poolConfig.Mode, usageRecorder)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -370,6 +746,7 @@ func (s *Worker) Run() error {
 	go s.processStopContainerEvents()
 
 	lastContainerRequest := time.Now()
+	reconnectDelay := containerRequestStreamInterval
 
 	// Listen for container requests
 containerRequestStream:
@@ -378,23 +755,52 @@ containerRequestStream:
 			WorkerId: s.workerId,
 		})
 		if err != nil {
-			if s.ctx.Err() == context.Canceled {
+			if s.ctx.Err() != nil {
 				break
 			}
 
-			time.Sleep(containerRequestStreamInterval)
+			log.Warn().Err(err).Str("worker_id", s.workerId).Msg("worker container request stream failed to connect")
+			if !waitForReconnect(s.ctx, reconnectDelay) {
+				break
+			}
+			reconnectDelay = nextReconnectDelay(reconnectDelay, workerEventStreamReconnectMax)
 			continue
 		}
+		log.Info().Str("worker_id", s.workerId).Msg("worker container request stream connected")
 
 		for {
 			response, err := stream.Recv()
 			if err != nil {
+				if s.ctx.Err() == nil {
+					log.Warn().Err(err).Str("worker_id", s.workerId).Msg("worker container request stream disconnected")
+				}
 				break
 			}
+			if !response.Ok {
+				log.Warn().Str("worker_id", s.workerId).Str("error", response.ErrorMsg).Msg("worker container request stream returned error")
+				break
+			}
+			reconnectDelay = containerRequestStreamInterval
 
 			if response.ContainerRequest != nil {
 				lastContainerRequest = time.Now()
 				request := types.NewContainerRequestFromProto(response.ContainerRequest)
+				request.DeliveryToken = response.DeliveryToken
+				if request.MachineId == "" {
+					request.MachineId = s.machineID
+				}
+				log.Info().
+					Str("worker_id", s.workerId).
+					Str("container_id", request.ContainerId).
+					Str("gpu", request.Gpu).
+					Uint32("gpu_count", request.GpuCount).
+					Bool("gpu_virtualized", s.gpuVirtualizedForRequest(request)).
+					Msg("worker received container request")
+				if !request.Timestamp.IsZero() {
+					s.recordContainerLifecycle(s.ctx, request, containerLifecycleFromDuration(types.ContainerLifecycleWorkerQueueReceive, request, request.Timestamp, time.Since(request.Timestamp), true, map[string]string{
+						"worker_id": s.workerId,
+					}))
+				}
 				s.handleContainerRequest(request)
 			}
 
@@ -402,193 +808,601 @@ containerRequestStream:
 				break containerRequestStream
 			}
 		}
+		if !waitForReconnect(s.ctx, reconnectDelay) {
+			break
+		}
+		reconnectDelay = nextReconnectDelay(reconnectDelay, workerEventStreamReconnectMax)
 	}
 
 	return s.shutdown()
 }
 
-// handleContainerRequest handles an individual container request, spawning a new runc container
-func (s *Worker) handleContainerRequest(request *types.ContainerRequest) {
-	containerId := request.ContainerId
-
-	s.containerLock.Lock()
-	_, exists := s.containerInstances.Get(containerId)
-	if !exists {
-		log.Info().Str("container_id", containerId).Msg("running container")
-
-		ctx, cancel := context.WithCancel(s.ctx)
-
-		if request.IsBuildRequest() {
-			go s.checkForStoppedBuilds(ctx, cancel, containerId)
-		}
-
-		// If isolated workspace storage is available, mount it
-		if request.StorageAvailable() {
-			log.Info().Str("container_id", containerId).Msg("mounting workspace storage")
-
-			_, err := s.storageManager.Mount(request.Workspace.Name, request.Workspace.Storage)
-			if err != nil {
-				log.Error().Str("container_id", containerId).Str("workspace_id", request.Workspace.ExternalId).Err(err).Msg("unable to mount workspace storage")
-				return
-			}
-		}
-
-		if err := s.RunContainer(ctx, request); err != nil {
-			s.containerLock.Unlock()
-
-			log.Error().Str("container_id", containerId).Err(err).Msg("unable to run container")
-
-			// Set a non-zero exit code for the container (both in memory, and in repo)
-			exitCode := 1
-
-			serr, ok := err.(*types.ExitCodeError)
-			if ok {
-				exitCode = int(serr.ExitCode)
-			}
-
-			_, err = handleGRPCResponse(s.containerRepoClient.SetContainerExitCode(context.Background(), &pb.SetContainerExitCodeRequest{
-				ContainerId: containerId,
-				ExitCode:    int32(exitCode),
-			}))
-			if err != nil {
-				log.Error().Str("container_id", containerId).Err(err).Msg("failed to set exit code")
-			}
-
-			s.clearContainer(containerId, request, exitCode)
-			return
-		}
-
-		s.containerLock.Unlock()
-	}
-
+func containerStartLimitForRuntime(runtimeType string) int {
+	return containerStartLimitForRuntimeWithDefaults(runtimeType, defaultRuncStartConcurrency, defaultGvisorStartConcurrency)
 }
 
-// checkForStoppedBuilds checks if a build has been cancelled and cancels the context if it has.
-// If not it will listen for a stop build event.
-func (s *Worker) checkForStoppedBuilds(ctx context.Context, cancel context.CancelFunc, containerId string) {
-	containerState, err := handleGRPCResponse(s.containerRepoClient.GetContainerState(context.Background(), &pb.GetContainerStateRequest{ContainerId: containerId}))
+func containerStartLimitForRuntimeWithDefaults(runtimeType string, runcLimit, gvisorLimit int) int {
+	return containerStartLimitWithEnvOverride(defaultContainerStartLimitForRuntime(runtimeType, runcLimit, gvisorLimit))
+}
+
+func defaultContainerStartLimitForRuntime(runtimeType string, runcLimit, gvisorLimit int) int {
+	limit := runcLimit
+	if runtimeType == types.ContainerRuntimeGvisor.String() {
+		limit = gvisorLimit
+	}
+
+	return limit
+}
+
+func containerStartLimitForPoolRuntime(poolConfig types.WorkerPoolConfig, globalRuntime, runtimeType string, workerCPU int64) int {
+	limit := types.WorkerStartConcurrencyForPool(poolConfig, globalRuntime, runtimeType, workerCPU)
+	return containerStartLimitWithEnvOverride(limit)
+}
+
+func containerStartLimitWithEnvOverride(limit int) int {
+	raw := os.Getenv(types.WorkerStartConcurrencyEnv)
+	if raw == "" {
+		return limit
+	}
+
+	parsed, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Error().Str("container_id", containerId).Err(err).Msg("failed to get container state")
+		log.Warn().Str("value", raw).Err(err).Msg("invalid " + types.WorkerStartConcurrencyEnv)
+		return limit
+	}
+	if parsed <= 0 {
+		return limit
+	}
+
+	return parsed
+}
+
+func (s *Worker) reserveContainerInstance(request *types.ContainerRequest) bool {
+	s.containerLock.Lock()
+	defer s.containerLock.Unlock()
+
+	if _, exists := s.containerInstances.Get(request.ContainerId); exists {
+		return false
+	}
+
+	instance := &ContainerInstance{
+		Id:        request.ContainerId,
+		StubId:    request.StubId,
+		ExitCode:  -1,
+		LogBuffer: common.NewLogBuffer(),
+		Request:   request,
+		Runtime:   s.runtime,
+		CPUSet:    s.allocateContainerCPUSet(request),
+	}
+	if request.Stub.Type.Kind() == types.StubTypeSandbox {
+		instance.initializeProcessManagerReadiness()
+	}
+	s.containerInstances.Set(request.ContainerId, instance)
+
+	return true
+}
+
+// handleContainerRequest handles an individual container request.
+func (s *Worker) handleContainerRequest(request *types.ContainerRequest) {
+	if !s.reserveContainerInstance(request) {
 		return
 	}
 
-	if types.ContainerStatus(containerState.State.Status) == types.ContainerStatusStopping {
-		log.Info().Str("container_id", containerId).Msg("incoming container state is stopping, cancelling context")
-		cancel()
+	go s.runContainerRequest(request)
+}
+
+func (s *Worker) runContainerRequest(request *types.ContainerRequest) {
+	s.runContainerRequestWithRunner(request, s.RunContainer)
+}
+
+func (s *Worker) runContainerRequestWithRunner(
+	request *types.ContainerRequest,
+	runContainer func(context.Context, *types.ContainerRequest) error,
+) {
+	containerId := request.ContainerId
+	log.Info().Str("container_id", containerId).Msg("running container")
+
+	ctx, cancelStartup := context.WithCancel(s.ctx)
+
+	s.registerContainerCancel(containerId, cancelStartup)
+	defer func() {
+		cancelStartup()
+		s.unregisterContainerCancel(containerId)
+	}()
+	s.cancelContainerIfAlreadyStopping(cancelStartup, containerId)
+
+	// The claim uses the worker context, like the delivery stream that carried
+	// the request: a stop that races the claim is observed afterwards through
+	// the startup context, so the container is failed (and its exit reported)
+	// rather than silently forgotten while the gateway believes it is ours.
+	claimed, err := s.claimContainer(s.ctx, request)
+	if err != nil {
+		if !claimed {
+			log.Warn().Str("container_id", containerId).Err(err).Msg("container claim rejected")
+			s.releaseUnclaimedContainer(request)
+			return
+		}
+		log.Error().Str("container_id", containerId).Err(err).Msg("unable to claim container")
+		s.failContainerRequest(containerId, request, err)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		s.failContainerRequest(containerId, request, err)
 		return
 	}
 
-	eventbus := common.NewEventBus(s.redisClient, common.EventBusSubscriber{Type: common.StopBuildEventType(containerId), Callback: func(e *common.Event) bool {
-		log.Info().Str("container_id", containerId).Msg("received stop build event")
-		cancel()
-		return true
-	}})
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(s.ctx)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		defer cancelHeartbeat()
+		s.updateContainerStatusLoop(heartbeatCtx, request)
+	}()
+	heartbeatHandedOff := false
+	defer func() {
+		if !heartbeatHandedOff {
+			cancelHeartbeat()
+			<-heartbeatDone
+		}
+	}()
 
-	go eventbus.ReceiveEvents(ctx)
+	run := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		return runContainer(ctx, request)
+	}
+
+	if request.IsBuildRequest() {
+		err = run()
+	} else {
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- run()
+		}()
+
+		timer := time.NewTimer(containerStartupTimeout)
+		defer timer.Stop()
+
+		select {
+		case err = <-errCh:
+		case <-timer.C:
+			cancelStartup()
+			err = fmt.Errorf("container startup timed out after %s", containerStartupTimeout)
+		case <-s.ctx.Done():
+			cancelStartup()
+			err = fmt.Errorf("worker shutting down before container startup completed: %w", s.ctx.Err())
+		}
+	}
+
+	if err != nil {
+		log.Error().Str("container_id", containerId).Err(err).Msg("unable to run container")
+		s.failContainerRequest(containerId, request, err)
+		return
+	}
+
+	// Runtime/finalization now owns the instance. Stop exposing the startup
+	// cancel, but leave the heartbeat alive until local exit or worker shutdown.
+	s.unregisterContainerCancel(containerId)
+	heartbeatHandedOff = true
+}
+
+// releaseUnclaimedContainer drops a request whose claim the gateway rejected.
+// The container is owned by another worker or already cancelled, so only local
+// bookkeeping is undone: no exit code, persisted state, or resources are
+// touched.
+func (s *Worker) releaseUnclaimedContainer(request *types.ContainerRequest) {
+	if instance, exists := s.containerInstances.Get(request.ContainerId); exists {
+		if request.Stub.Type.Kind() == types.StubTypeSandbox {
+			instance.signalProcessManagerReadiness(false)
+		}
+		s.containerInstances.Delete(request.ContainerId)
+	}
+	if s.completedRequests != nil {
+		select {
+		case s.completedRequests <- request:
+		case <-s.ctx.Done():
+		}
+	}
+}
+
+func (s *Worker) failContainerRequest(containerId string, request *types.ContainerRequest, runErr error) {
+	// Set a non-zero exit code for the container (both in memory, and in repo)
+	exitCode := 1
+
+	serr, ok := runErr.(*types.ExitCodeError)
+	if ok {
+		exitCode = int(serr.ExitCode)
+	}
+
+	s.clearContainer(containerId, request, exitCode, false)
+}
+
+// cancelContainerIfAlreadyStopping closes the local startup-registration race.
+// The lifetime status heartbeat owns persisted-state checks, so startup and
+// reconnect only need this cheap local check.
+func (s *Worker) cancelContainerIfAlreadyStopping(cancel context.CancelFunc, containerId string) {
+	if s.containerInstances == nil {
+		return
+	}
+	if instance, exists := s.containerInstances.Get(containerId); exists && instance != nil {
+		_, stopReason := instance.lifecycleState()
+		if stopReason == "" {
+			return
+		}
+		log.Info().Str("container_id", containerId).Msg("container stopped before startup cancellation was registered")
+		cancel()
+	}
 }
 
 // listenForShutdown listens for SIGINT and SIGTERM signals and cancels the worker context
 func (s *Worker) listenForShutdown() {
 	terminate := make(chan os.Signal, 1)
 	signal.Notify(terminate, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(terminate)
 
 	<-terminate
 	log.Info().Msg("shutdown signal received")
 
 	s.cancel()
+	s.disableSchedulingForShutdown()
 }
 
-// Exit if there are no containers running and no containers have recently been spun up on this
-// worker, or if a shutdown signal has been received.
+func (s *Worker) disableSchedulingForShutdown() {
+	if err := s.disableScheduling(); err != nil {
+		log.Warn().Err(err).Msg("failed to disable worker scheduling during shutdown")
+	}
+}
+
+// disableScheduling marks the worker disabled at the gateway: the scheduler
+// stops placing containers on it and the pool sizer stops counting its free
+// capacity, so a replacement is provisioned while this one is still running.
+func (s *Worker) disableScheduling() error {
+	ctx, cancel := context.WithTimeout(context.Background(), workerShutdownRPCTimeout)
+	defer cancel()
+
+	_, err := handleGRPCResponse(s.workerRepoClient.DisableWorker(ctx, &pb.DisableWorkerRequest{
+		WorkerId: s.workerId,
+	}))
+	return err
+}
+
+// shouldShutDown is the request-stream loop's exit check: the context is done,
+// a worker past maxAge has drained, or an idle worker may leave.
 func (s *Worker) shouldShutDown(lastContainerRequest time.Time) bool {
 	select {
 	case <-s.ctx.Done():
 		return true
 	default:
-		if (time.Since(lastContainerRequest).Seconds() > defaultWorkerSpindownTimeS) && s.containerInstances.Len() == 0 {
-			err := s.storageManager.Cleanup()
-			if err != nil {
-				log.Error().Err(err).Msg("failed to cleanup workspace storage")
-			}
-
-			s.cancel() // Stops goroutines
-			return true
-		}
+	}
+	now := time.Now()
+	s.maybeStartDraining(now)
+	if !s.shouldExit(lastContainerRequest, now) {
 		return false
 	}
+
+	if !s.draining {
+		s.disableSchedulingForShutdown()
+	}
+	if err := s.storageManager.Cleanup(); err != nil {
+		log.Error().Err(err).Msg("failed to cleanup workspace storage")
+	}
+
+	s.cancel() // Stops goroutines
+	return true
 }
 
-func (s *Worker) updateContainerStatus(request *types.ContainerRequest) error {
+// shouldExit: a worker past maxAge leaves only once drained, so the exit never
+// races a DisableWorker that has not landed; any other worker follows the
+// idle rules.
+func (s *Worker) shouldExit(lastContainerRequest, now time.Time) bool {
+	if s.draining {
+		return s.drained(lastContainerRequest, now)
+	}
+	if s.pastMaxAge(now) {
+		return false
+	}
+	return s.shouldExitIdle(lastContainerRequest, now)
+}
+
+func (s *Worker) pastMaxAge(now time.Time) bool {
+	return !s.persistent && s.maxAge > 0 && now.Sub(s.startedAt) >= s.maxAge
+}
+
+// maybeStartDraining disables scheduling for a worker past maxAge: the
+// scheduler skips it, the sizer stops counting it and boots a replacement, and
+// this one exits once its containers are gone. Without it a worker with steady
+// traffic never idles out and runs the image it booted with forever. A failed
+// disable is retried every workerDrainRetryInterval.
+func (s *Worker) maybeStartDraining(now time.Time) {
+	if s.draining || !s.pastMaxAge(now) || now.Before(s.nextDrainAttempt) {
+		return
+	}
+	if err := s.disableScheduling(); err != nil {
+		s.nextDrainAttempt = now.Add(workerDrainRetryInterval)
+		log.Warn().Err(err).Str("worker_id", s.workerId).Dur("retry_in", workerDrainRetryInterval).Msg("worker past its max age could not disable scheduling, retrying")
+		return
+	}
+	s.draining = true
+	s.drainStartedAt = now
+	log.Info().
+		Str("worker_id", s.workerId).
+		Dur("age", now.Sub(s.startedAt)).
+		Dur("max_age", s.maxAge).
+		Int("containers", s.containerInstances.Len()).
+		Msg("worker past its max age, draining: scheduling disabled, exiting once running containers finish")
+}
+
+// drained: no containers, and workerDrainGrace since both the disable and the
+// last request, so nothing placed here before the disable is still on its way.
+func (s *Worker) drained(lastContainerRequest, now time.Time) bool {
+	if s.containerInstances.Len() != 0 {
+		return false
+	}
+	if now.Sub(s.drainStartedAt) < workerDrainGrace || now.Sub(lastContainerRequest) < workerDrainGrace {
+		return false
+	}
+	log.Info().
+		Str("worker_id", s.workerId).
+		Dur("age", now.Sub(s.startedAt)).
+		Dur("drain_took", now.Sub(s.drainStartedAt)).
+		Msg("worker drained after reaching its max age, exiting")
+	return true
+}
+
+// shouldExitIdle decides whether a worker with no containers and no request
+// for the spindown timeout leaves. Persistent workers never do. A worker the
+// gateway says holds the pool's minimum free capacity stays, since exiting
+// would only make the sizer boot a replacement and leave the pool cold; the
+// gateway is asked now rather than trusting the last keepalive, and no answer
+// keeps the worker. Past headroomMaxAge headroom no longer holds it, so an
+// idle pool does not pin one pod across image rollouts and node drains.
+func (s *Worker) shouldExitIdle(lastContainerRequest, now time.Time) bool {
+	if s.persistent {
+		return false
+	}
+	if now.Sub(lastContainerRequest).Seconds() <= defaultWorkerSpindownTimeS || s.containerInstances.Len() != 0 {
+		return false
+	}
+	if err := s.setWorkerKeepAlive(); err != nil {
+		log.Warn().Err(err).Str("worker_id", s.workerId).Msg("staying up: could not refresh pool headroom before spindown")
+		return false
+	}
+	if !s.poolHeadroom.Load() {
+		return true
+	}
+	if s.headroomMaxAge <= 0 || now.Sub(s.startedAt) < s.headroomMaxAge {
+		return false
+	}
+	log.Info().
+		Str("worker_id", s.workerId).
+		Dur("age", now.Sub(s.startedAt)).
+		Dur("max_age", s.headroomMaxAge).
+		Msg("idle headroom worker reached its max age, exiting so the pool sizer replaces it")
+	return true
+}
+
+// jitteredWorkerAge adds up to 1/8 of base as worker-id-derived jitter, so
+// workers started together do not leave together. Non-positive base: no bound.
+func jitteredWorkerAge(base time.Duration, workerId string) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	h.Write([]byte(workerId))
+	jitter := time.Duration(float64(base/8) * (float64(h.Sum32()) / float64(math.MaxUint32)))
+	return base + jitter
+}
+
+// updateContainerStatusLoop is the container's lifetime status heartbeat. It
+// renews the persisted lease, reconciles pending->running from the runtime
+// start signal, and stops containers whose state disappeared or turned
+// STOPPING. The claim already refreshed the lease, so the first update runs a
+// full interval later. It returns when the instance exits or ctx ends.
+func (s *Worker) updateContainerStatusLoop(ctx context.Context, request *types.ContainerRequest) {
 	ticker := time.NewTicker(containerStatusUpdateInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-s.ctx.Done():
-			return nil
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
-			s.containerLock.Lock()
-			_, exists := s.containerInstances.Get(request.ContainerId)
-			s.containerLock.Unlock()
+		}
+		done, err := s.updateContainerStatusOnce(ctx, request)
+		if err != nil {
+			log.Error().Str("container_id", request.ContainerId).Err(err).Msg("unable to update container state")
+		}
+		if done {
+			return
+		}
+	}
+}
 
-			if !exists {
-				return nil
+func (s *Worker) updateContainerStatusOnce(ctx context.Context, request *types.ContainerRequest) (bool, error) {
+	instance, exists := s.containerInstances.Get(request.ContainerId)
+	if !exists {
+		return true, nil
+	}
+
+	exitCode, localStopReason := instance.lifecycleState()
+	if exitCode >= 0 {
+		log.Debug().
+			Str("container_id", request.ContainerId).
+			Int("exit_code", exitCode).
+			Msg("container exited, stopping status heartbeat")
+		return true, nil
+	}
+
+	// Stop container if it is "orphaned" - meaning it's running but has no associated state.
+	getStateCtx, cancelGetState := context.WithTimeout(ctx, containerRepositoryAttemptTimeout)
+	getStateResponse, err := handleGRPCResponse(s.containerRepoClient.GetContainerState(getStateCtx, &pb.GetContainerStateRequest{
+		ContainerId: request.ContainerId,
+	}))
+	cancelGetState()
+	if err != nil {
+		notFoundErr := &types.ErrContainerStateNotFound{}
+		if notFoundErr.From(err) {
+			_, previousStopReason := instance.lifecycleState()
+			s.handleObservedOrphanedContainer(request.ContainerId, types.EventSourceWorkerStatusHeartbeat)
+			if previousStopReason == "" {
+				go s.recordContainerEvent(context.Background(), request, types.EventContainerEventSchema{
+					ID:          types.ContainerEventWorkerOrphanStateMissing,
+					ContainerID: request.ContainerId,
+					Reason:      string(types.StopContainerReasonUnknown),
+					Source:      types.EventSourceWorkerStatusHeartbeat.String(),
+					Message:     types.EventMessageWorkerOrphanStateMissing.String(),
+				})
 			}
+			return false, nil
+		}
 
-			// Stop container if it is "orphaned" - meaning it's running but has no associated state
-			getStateResponse, err := handleGRPCResponse(s.containerRepoClient.GetContainerState(context.Background(), &pb.GetContainerStateRequest{
-				ContainerId: request.ContainerId,
-			}))
-			if err != nil {
-				notFoundErr := &types.ErrContainerStateNotFound{}
-				if notFoundErr.From(err) {
-					s.stopContainerChan <- stopContainerEvent{ContainerId: request.ContainerId, Kill: true}
-					return nil
-				}
+		return false, err
+	}
 
-				continue
-			}
+	state := getStateResponse.State
+	if state == nil {
+		return false, fmt.Errorf("container state response missing state")
+	}
+	if exitCode, localStopReason = instance.lifecycleState(); exitCode >= 0 {
+		return true, nil
+	}
 
-			state := getStateResponse.State
-			status := types.ContainerStatus(state.Status)
+	status := types.ContainerStatus(state.Status)
 
-			log.Info().Str("container_id", request.ContainerId).Str("image_id", request.ImageId).Msg("container still running")
+	log.Debug().Str("container_id", request.ContainerId).Str("image_id", request.ImageId).Msg("container still running")
 
-			// TODO: remove this hotfix
-			if status == types.ContainerStatusPending {
-				log.Info().Str("container_id", request.ContainerId).Msg("forcing container status to running")
-				state.Status = string(types.ContainerStatusRunning)
-			}
+	expirySeconds := int64(types.ContainerStateTtlS)
+	if localStopReason != "" && status != types.ContainerStatusStopping {
+		// A local terminal fault (for example, address publication failure) may
+		// precede a persisted STOPPING transition. Publish that transition so the
+		// lifetime heartbeat continues retrying the owned stop escalation.
+		s.handleObservedStoppingContainer(request.ContainerId, types.EventSourceWorkerStatusHeartbeat)
+		state.Status = string(types.ContainerStatusStopping)
+		expirySeconds = int64(types.ContainerStateTtlSWhileStopping)
+	} else if status == types.ContainerStatusPending {
+		runtimeStarted, runtimePID := instance.runtimeStartState()
+		if runtimeStarted {
+			log.Info().
+				Str("container_id", request.ContainerId).
+				Int("pid", runtimePID).
+				Msg("reconciling pending container to running from runtime start signal")
+			s.recordContainerEvent(context.Background(), request, types.EventContainerEventSchema{
+				ID:          types.ContainerEventWorkerPendingReconciled,
+				ContainerID: request.ContainerId,
+				Source:      types.EventSourceWorkerStatusHeartbeat.String(),
+				Message:     types.EventMessagePendingReconciledRunning.String(),
+				Attrs: map[string]string{
+					types.EventAttrRuntimePID: fmt.Sprintf("%d", runtimePID),
+				},
+			})
+			state.Status = string(types.ContainerStatusRunning)
+		} else {
+			expirySeconds = int64(types.ContainerStateTtlSWhilePending)
+		}
+	}
+	// Finalization owns the STOPPING lease; the normal heartbeat must not renew it.
+	if status == types.ContainerStatusStopping {
+		s.handleObservedStoppingContainer(request.ContainerId, types.EventSourceWorkerStatusHeartbeat)
+		return false, nil
+	}
 
-			_, err = handleGRPCResponse(s.containerRepoClient.UpdateContainerStatus(context.Background(), &pb.UpdateContainerStatusRequest{
-				ContainerId:   request.ContainerId,
-				Status:        string(state.Status),
-				ExpirySeconds: int64(types.ContainerStateTtlS),
-			}))
-			if err != nil {
-				log.Error().Str("container_id", request.ContainerId).Err(err).Msg("unable to update container state")
-			}
+	instance.statusHeartbeatMu.Lock()
+	defer instance.statusHeartbeatMu.Unlock()
+	if exitCode, _ = instance.lifecycleState(); exitCode >= 0 {
+		return true, nil
+	}
+	updateCtx, cancelUpdate := context.WithTimeout(ctx, containerRepositoryAttemptTimeout)
+	defer cancelUpdate()
+	_, err = handleGRPCResponse(s.containerRepoClient.UpdateContainerStatus(updateCtx, &pb.UpdateContainerStatusRequest{
+		ContainerId:   request.ContainerId,
+		Status:        string(state.Status),
+		ExpirySeconds: expirySeconds,
+	}))
+	if err != nil {
+		return false, err
+	}
 
-			// If container is supposed to be stopped, but isn't gone after TerminationGracePeriod seconds
-			// ensure it is killed after that
-			if status == types.ContainerStatusStopping {
-				go func() {
-					time.Sleep(time.Duration(s.config.Worker.TerminationGracePeriod) * time.Second)
+	return false, nil
+}
 
-					_, exists := s.containerInstances.Get(request.ContainerId)
-					if !exists {
-						return
-					}
+// abortStuckWorkspaceMount recovers the shutdown path even when the runtime
+// was never created (or has already disappeared). The local lifecycle state is
+// authoritative here: a nonterminal instance with a stop reason is still
+// waiting for its cleanup defers, commonly on a wedged FUSE flush.
+func (s *Worker) abortStuckWorkspaceMount(request *types.ContainerRequest) {
+	if request == nil || s.containerInstances == nil || s.storageManager == nil || s.storageManager.poolConfig.StorageMode != storage.StorageModeGeese {
+		return
+	}
+	instance, exists := s.containerInstances.Get(request.ContainerId)
+	if !exists || instance == nil {
+		return
+	}
+	exitCode, stopReason := instance.lifecycleState()
+	if exitCode >= 0 || stopReason == "" {
+		return
+	}
 
-					log.Info().Str("container_id", request.ContainerId).Int64("grace_period_seconds", s.config.Worker.TerminationGracePeriod).Msg("container still running after stop event")
-					s.stopContainerChan <- stopContainerEvent{
-						ContainerId: request.ContainerId,
-						Kill:        true,
-					}
-				}()
+	workspaceName := request.Workspace.Name
+	unlock := s.storageManager.lockWorkspaceMount(workspaceName)
+	defer unlock()
+	if !s.workspaceOnlyStopping(workspaceName) {
+		return
+	}
+
+	log.Warn().Str("container_id", request.ContainerId).Str("workspace", workspaceName).Msg("aborting stuck workspace mount after SIGKILL timeout")
+	if mount, ok := s.storageManager.mounts.Get(workspaceName); ok {
+		if aborter, ok := mount.(interface{ AbortPendingOperations(string) error }); ok {
+			// A lazy unmount alone does not release in-flight FUSE requests.
+			// Abort while holding the workspace lock, before detaching the mount.
+			localPath := path.Join(s.storageManager.config.WorkspaceStorage.BaseMountPath, workspaceName)
+			if err := aborter.AbortPendingOperations(localPath); err != nil {
+				log.Warn().Err(err).Str("workspace", workspaceName).Msg("failed to abort stuck workspace filesystem operations")
 			}
 		}
 	}
+	if err := s.storageManager.unmountLocked(workspaceName); err != nil {
+		log.Warn().Err(err).Str("workspace", workspaceName).Msg("stuck workspace mount recovery completed with errors")
+	}
+}
+
+func (s *Worker) workspaceOnlyStopping(workspaceName string) bool {
+	safe := workspaceName != ""
+	s.containerInstances.Range(func(_ string, instance *ContainerInstance) bool {
+		if instance == nil || instance.Request == nil || instance.Request.Workspace.Name != workspaceName {
+			return true
+		}
+		exitCode, stopReason := instance.lifecycleState()
+		if exitCode >= 0 {
+			return true
+		}
+		if stopReason == "" {
+			safe = false
+			return false
+		}
+		return true
+	})
+	return safe
+}
+
+func runtimeNeedsGraceKill(ctx context.Context, rt runtime.Runtime, containerID string) bool {
+	needsStop, _ := runtimeNeedsStop(ctx, rt, containerID)
+	return needsStop
+}
+
+func runtimeNeedsStop(ctx context.Context, rt runtime.Runtime, containerID string) (needsStop, absent bool) {
+	if rt == nil {
+		return false, true
+	}
+	state, err := rt.State(ctx, containerID)
+	if err != nil {
+		if runtimeContainerNotFound(err) {
+			return false, true
+		}
+		return true, false
+	}
+	return state.Status != types.RuncContainerStatusStopped, false
 }
 
 func (s *Worker) processStopContainerEvents() {
@@ -597,9 +1411,12 @@ func (s *Worker) processStopContainerEvents() {
 		case <-s.ctx.Done():
 			return
 		default:
-			err := s.stopContainer(event.ContainerId, event.Kill)
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), observedStoppingSignalTimeout)
+			err := s.stopContainerWithContext(stopCtx, event.ContainerId, event.Kill)
+			cancelStop()
 			if err != nil {
-				time.Sleep(time.Second)
+				log.Warn().Str("container_id", event.ContainerId).Err(err).Msg("failed to stop container; handing off to lifecycle reconciliation")
+				s.handleObservedContainerStop(event.ContainerId, types.EventSourceWorkerEventBus, event.Kill)
 			}
 		}
 	}
@@ -624,32 +1441,83 @@ func (s *Worker) manageWorkerCapacity() {
 }
 
 func (s *Worker) processCompletedRequest(request *types.ContainerRequest) error {
-	_, err := handleGRPCResponse(s.workerRepoClient.UpdateWorkerCapacity(context.Background(), &pb.UpdateWorkerCapacityRequest{
-		WorkerId:         s.workerId,
-		CapacityChange:   int64(types.AddCapacity),
-		ContainerRequest: request.ToProto(),
-	}))
-	if err != nil {
-		return err
+	ctx, cancel := context.WithTimeout(s.ctx, completedRequestRetryTimeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		_, err := handleGRPCResponse(s.workerRepoClient.UpdateWorkerCapacity(ctx, &pb.UpdateWorkerCapacityRequest{
+			WorkerId:         s.workerId,
+			CapacityChange:   int64(types.AddCapacity),
+			ContainerRequest: request.ToProto(),
+		}))
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !common.IsRedisLockNotObtained(err) {
+			return err
+		}
+
+		timer := time.NewTimer(completedRequestRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if lastErr != nil {
+				return lastErr
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 
-	return nil
 }
 
 func (s *Worker) keepalive() {
 	ticker := time.NewTicker(types.WorkerKeepAliveInterval)
 	defer ticker.Stop()
 
+	consecutiveFailures := 0
 	for {
 		select {
 		case <-ticker.C:
-			s.workerRepoClient.SetWorkerKeepAlive(s.ctx, &pb.SetWorkerKeepAliveRequest{
-				WorkerId: s.workerId,
-			})
+			if err := s.setWorkerKeepAlive(); err != nil {
+				consecutiveFailures++
+				if consecutiveFailures == 1 || consecutiveFailures%20 == 0 {
+					log.Warn().Err(err).Int("consecutive_failures", consecutiveFailures).Str("worker_id", s.workerId).Msg("worker keepalive failed")
+				}
+				continue
+			}
+			if consecutiveFailures > 0 {
+				log.Info().Int("consecutive_failures", consecutiveFailures).Str("worker_id", s.workerId).Msg("worker keepalive recovered")
+				consecutiveFailures = 0
+			}
 		case <-s.ctx.Done():
 			return
 		}
 	}
+}
+
+// setWorkerKeepAlive renews the worker's lease at the gateway. An idle worker
+// also learns whether it holds the pool's headroom (see shouldShutDown); the
+// call is bounded so a stalled gateway cannot hang the request loop.
+func (s *Worker) setWorkerKeepAlive() error {
+	ctx, cancel := context.WithTimeout(s.ctx, workerShutdownRPCTimeout)
+	defer cancel()
+
+	idle := s.containerInstances == nil || s.containerInstances.Len() == 0
+	resp, err := handleGRPCResponse(s.workerRepoClient.SetWorkerKeepAlive(ctx, &pb.SetWorkerKeepAliveRequest{
+		WorkerId:  s.workerId,
+		MachineId: s.machineID,
+		Idle:      idle,
+	}))
+	if err != nil {
+		return err
+	}
+	if headroom := resp.GetPoolHeadroom(); headroom != s.poolHeadroom.Swap(headroom) {
+		log.Info().Bool("pool_headroom", headroom).Str("worker_id", s.workerId).Msg("worker pool headroom changed")
+	}
+	return nil
 }
 
 func (s *Worker) profile() {
@@ -685,20 +1553,18 @@ func (s *Worker) profile() {
 func (s *Worker) startup() error {
 	log.Info().Msg("worker starting up")
 
+	if err := s.setWorkerKeepAlive(); err != nil {
+		return err
+	}
 	_, err := handleGRPCResponse(s.workerRepoClient.ToggleWorkerAvailable(s.ctx, &pb.ToggleWorkerAvailableRequest{
-		WorkerId: s.workerId,
+		WorkerId:   s.workerId,
+		Generation: s.workerGeneration,
 	}))
 	if err != nil {
 		return err
 	}
 
-	eventBus := common.NewEventBus(
-		s.redisClient,
-		common.EventBusSubscriber{Type: common.EventTypeStopContainer, Callback: s.handleStopContainerEvent},
-	)
-
-	s.eventBus = eventBus
-	go s.eventBus.ReceiveEvents(s.ctx)
+	go s.listenForWorkerEvents()
 	go s.keepalive()
 
 	err = os.MkdirAll(containerLogsPath, os.ModePerm)
@@ -718,22 +1584,43 @@ func (s *Worker) shutdown() error {
 	defer s.eventRepo.PushWorkerStoppedEvent(s.workerId)
 
 	var errs error
-	if _, err := handleGRPCResponse(s.workerRepoClient.RemoveWorker(context.Background(), &pb.RemoveWorkerRequest{
-		WorkerId: s.workerId,
-	})); err != nil {
-		errs = errors.Join(errs, err)
+	if s.cacheManager != nil {
+		if err := s.cacheManager.Drain(); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("failed to drain cache: %v", err))
+		}
+	}
+
+	s.waitForActiveContainersBeforeShutdown()
+	s.stopActiveContainersForShutdown()
+	if s.diskManager != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), durableDiskCleanupGrace)
+		if err := s.diskManager.Close(ctx); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("failed to detach qcow volumes: %w", err))
+		}
+		cancel()
+	}
+
+	if s.containerNetworkManager != nil {
+		if err := s.containerNetworkManager.Close(); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("failed to cleanup preallocated container networks: %v", err))
+		}
+	}
+
+	if s.persistent {
+		s.disableSchedulingForShutdown()
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), workerShutdownRPCTimeout)
+		defer cancel()
+		if _, err := handleGRPCResponse(s.workerRepoClient.RemoveWorker(ctx, &pb.RemoveWorkerRequest{
+			WorkerId: s.workerId,
+		})); err != nil {
+			errs = errors.Join(errs, err)
+		}
 	}
 
 	err := s.userDataStorage.Unmount(s.config.Storage.FilesystemPath)
 	if err != nil {
 		errs = errors.Join(errs, fmt.Errorf("failed to unmount data storage: %v", err))
-	}
-
-	if s.checkpointStorage != nil {
-		err = s.checkpointStorage.Unmount(s.config.Worker.CRIU.Storage.MountPath)
-		if err != nil {
-			errs = errors.Join(errs, fmt.Errorf("failed to unmount checkpoint storage: %v", err))
-		}
 	}
 
 	err = s.imageClient.Cleanup()
@@ -746,9 +1633,17 @@ func (s *Worker) shutdown() error {
 		errs = errors.Join(errs, fmt.Errorf("failed to cleanup workspace storage: %v", err))
 	}
 
-	err = os.RemoveAll(s.imageMountPath)
-	if err != nil {
-		errs = errors.Join(errs, err)
+	// Workspace GeeseFS mounts may still be draining lazy read-through stores
+	// and durable identity publications. Keep the cache client alive until every
+	// workspace mount has completed WaitForFlush and unmounted.
+	if s.cacheManager != nil {
+		if err := s.cacheManager.Close(); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("failed to cleanup cache: %v", err))
+		}
+	}
+
+	if err := cleanupImageMountPath(s.imageMountPath); err != nil {
+		log.Warn().Str("path", s.imageMountPath).Err(err).Msg("failed to cleanup image mount path")
 	}
 
 	// Close runtimes
@@ -759,5 +1654,145 @@ func (s *Worker) shutdown() error {
 		s.gvisorRuntime.Close()
 	}
 
+	return s.finishShutdown(errs)
+}
+
+func (s *Worker) finishShutdown(errs error) error {
+	if errs != nil && s.shutdownCanceled() {
+		log.Warn().Err(errs).Msg("worker shutdown cleanup completed with errors")
+		return nil
+	}
 	return errs
+}
+
+func (s *Worker) shutdownCanceled() bool {
+	return s != nil && s.ctx != nil && s.ctx.Err() != nil
+}
+
+func (s *Worker) waitForActiveContainersBeforeShutdown() {
+	if s.containerInstances == nil || s.containerInstances.Len() == 0 {
+		return
+	}
+
+	timeout := workerShutdownDrainTimeout(s.config.Worker.TerminationGracePeriod)
+	log.Info().
+		Int("containers", s.containerInstances.Len()).
+		Dur("timeout", timeout).
+		Msg("waiting for active containers before worker shutdown")
+	if s.waitForActiveContainers(timeout) {
+		return
+	}
+
+	log.Warn().
+		Int("containers", s.containerInstances.Len()).
+		Dur("timeout", timeout).
+		Msg("active containers still present after worker shutdown drain")
+}
+
+func (s *Worker) stopActiveContainersForShutdown() {
+	if s.containerInstances == nil || s.containerInstances.Len() == 0 {
+		return
+	}
+
+	ids := s.activeContainerIDs()
+	log.Info().Int("containers", len(ids)).Msg("stopping active containers before worker shutdown")
+
+	for _, id := range ids {
+		if instance, exists := s.containerInstances.Get(id); exists {
+			instance.setStopReason(types.StopContainerReasonAdmin)
+			s.containerInstances.Set(id, instance)
+		}
+		if err := s.stopContainer(id, false); err != nil {
+			log.Warn().Str("container_id", id).Err(err).Msg("failed to stop container during worker shutdown")
+		}
+	}
+
+	grace := workerContainerStopGrace(s.config.Worker.TerminationGracePeriod)
+	if s.waitForActiveContainers(grace) {
+		return
+	}
+
+	remaining := s.activeContainerIDs()
+	log.Warn().
+		Int("containers", len(remaining)).
+		Dur("grace", grace).
+		Msg("force stopping active containers during worker shutdown")
+	for _, id := range remaining {
+		if err := s.stopContainer(id, true); err != nil {
+			log.Warn().Str("container_id", id).Err(err).Msg("failed to force stop container during worker shutdown")
+		}
+	}
+
+	s.waitForActiveContainers(shutdownForceWait)
+}
+
+func (s *Worker) activeContainerIDs() []string {
+	ids := []string{}
+	if s.containerInstances == nil {
+		return ids
+	}
+	s.containerInstances.Range(func(key string, _ *ContainerInstance) bool {
+		ids = append(ids, key)
+		return true
+	})
+	return ids
+}
+
+func (s *Worker) waitForActiveContainers(timeout time.Duration) bool {
+	if s.containerInstances == nil || s.containerInstances.Len() == 0 {
+		return true
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for s.containerInstances.Len() > 0 {
+			s.containerWg.Wait()
+			if s.containerInstances.Len() == 0 {
+				return
+			}
+			time.Sleep(shutdownDrainPollInterval)
+		}
+	}()
+
+	if timeout <= 0 {
+		<-done
+		return true
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return s.containerInstances.Len() == 0
+	}
+}
+
+func workerContainerStopGrace(configuredSeconds int64) time.Duration {
+	if configuredSeconds <= 0 {
+		configuredSeconds = defaultWorkerStopGracePeriodS
+	}
+	budget := time.Duration(configuredSeconds) * time.Second
+	grace := budget - workerShutdownDrainTimeout(configuredSeconds) - shutdownForceWait - shutdownCleanupReserve
+	if grace <= 0 {
+		return budget
+	}
+	return grace
+}
+
+func workerShutdownDrainTimeout(configuredSeconds int64) time.Duration {
+	if configuredSeconds <= 0 {
+		configuredSeconds = defaultWorkerStopGracePeriodS
+	}
+	budget := time.Duration(configuredSeconds) * time.Second
+	if budget <= 10*time.Second {
+		return 0
+	}
+	drain := budget / 6
+	if drain > shutdownDrainMax {
+		return shutdownDrainMax
+	}
+	return drain
 }

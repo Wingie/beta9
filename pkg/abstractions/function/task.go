@@ -10,6 +10,7 @@ import (
 
 	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
 	"github.com/beam-cloud/beta9/pkg/auth"
+	taskmetrics "github.com/beam-cloud/beta9/pkg/task"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/rs/zerolog/log"
 )
@@ -33,6 +34,33 @@ func (t *FunctionTask) Execute(ctx context.Context, options ...interface{}) erro
 	containerId := t.fs.genContainerId(taskId, stub.Type.Kind())
 
 	t.containerId = containerId
+
+	cpu := stubConfig.Runtime.Cpu
+	if cpu <= 0 {
+		cpu = defaultFunctionContainerCpu
+	}
+	gpuCount := stubConfig.Runtime.GpuCount
+	if stubConfig.RequiresGPU() && gpuCount == 0 {
+		gpuCount = 1
+	}
+	if t.fs.scheduler != nil {
+		if err := t.fs.scheduler.CheckConcurrencyLimit(&types.ContainerRequest{
+			Cpu:              cpu,
+			GpuCount:         uint32(gpuCount),
+			WorkspaceId:      stub.Workspace.ExternalId,
+			Workspace:        stub.Workspace,
+			StubId:           stub.ExternalId,
+			Stub:             *stub,
+			AllowMarketplace: stubConfig.AllowMarketplace,
+		}); err != nil {
+			if _, ok := err.(*types.ThrottledByConcurrencyLimitError); ok {
+				log.Info().Str("task_id", taskId).Str("reason", err.Error()).Msg("task rejected due to concurrency limit")
+			} else if _, ok := err.(*types.InsufficientCreditsError); ok {
+				log.Info().Str("task_id", taskId).Str("reason", err.Error()).Msg("task rejected due to insufficient credits")
+			}
+			return err
+		}
+	}
 
 	var externalWorkspaceId *uint
 	if stubConfig.Pricing != nil && stub.Workspace.ExternalId != authInfo.Workspace.ExternalId {
@@ -72,6 +100,7 @@ func (t *FunctionTask) Retry(ctx context.Context) error {
 
 	task.Status = types.TaskStatusRetry
 	task.ContainerId = containerId
+	task.FailureReason = ""
 	updatedTask, err := t.fs.backendRepo.UpdateTask(ctx, taskId, task.Task)
 	if err != nil {
 		return err
@@ -120,12 +149,17 @@ func (t *FunctionTask) run(ctx context.Context, stub *types.StubWithRelated, tas
 		stubConfig.Runtime.Memory = defaultFunctionContainerMemory
 	}
 
+	phaseMetrics := taskmetrics.NewPhaseMetrics(t.fs.rdb)
+	phaseLabels := taskmetrics.FunctionPhaseLabelsFromStub(stub, stubConfig, task.Status)
+	if err := phaseMetrics.StoreLabels(ctx, stub.Workspace.Name, t.msg.TaskId, phaseLabels); err != nil {
+		log.Debug().Err(err).Str("task_id", t.msg.TaskId).Msg("failed to store function phase metric labels")
+	}
+
 	mounts, err := abstractions.ConfigureContainerRequestMounts(
 		t.containerId,
-		stub.Object.ExternalId,
+		stub,
 		&stub.Workspace,
 		stubConfig,
-		stub.ExternalId,
 	)
 	if err != nil {
 		return err
@@ -167,28 +201,42 @@ func (t *FunctionTask) run(ctx context.Context, stub *types.StubWithRelated, tas
 		gpuCount = 1
 	}
 
-	err = t.fs.scheduler.Run(&types.ContainerRequest{
-		ContainerId: t.containerId,
-		Env:         env,
-		Cpu:         stubConfig.Runtime.Cpu,
-		Memory:      stubConfig.Runtime.Memory,
-		GpuRequest:  gpuRequest,
-		GpuCount:    uint32(gpuCount),
-		ImageId:     stubConfig.Runtime.ImageId,
-		StubId:      stub.ExternalId,
-		AppId:       stub.App.ExternalId,
-		WorkspaceId: stub.Workspace.ExternalId,
-		Workspace:   stub.Workspace,
-		EntryPoint:  []string{stubConfig.PythonVersion, "-m", "beta9.runner.function"},
-		Mounts:      mounts,
-		Stub:        *stub,
-	})
+	if err := phaseMetrics.Mark(ctx, stub.Workspace.Name, t.msg.TaskId, taskmetrics.FunctionPhaseContainerRequestReady, time.Now()); err != nil {
+		log.Debug().Err(err).Str("task_id", t.msg.TaskId).Msg("failed to mark function container request ready phase")
+	}
+
+	runRequest := &types.ContainerRequest{
+		ContainerId:  t.containerId,
+		Env:          env,
+		Cpu:          stubConfig.Runtime.Cpu,
+		Memory:       stubConfig.Runtime.Memory,
+		GpuRequest:   gpuRequest,
+		GpuCount:     uint32(gpuCount),
+		ImageId:      stubConfig.Runtime.ImageId,
+		StubId:       stub.ExternalId,
+		TaskId:       task.ExternalId,
+		AppId:        stub.App.ExternalId,
+		WorkspaceId:  stub.Workspace.ExternalId,
+		Workspace:    stub.Workspace,
+		EntryPoint:   []string{stubConfig.PythonVersion, "-m", "beta9.runner.function"},
+		Mounts:       mounts,
+		Stub:         *stub,
+		PoolSelector: stubConfig.PoolSelector(),
+	}
+	if err := abstractions.ConfigureContainerRequestNetwork(runRequest, stubConfig); err != nil {
+		return err
+	}
+
+	err = t.fs.scheduler.Run(runRequest)
 	if err != nil {
 		if _, ok := err.(*types.ThrottledByConcurrencyLimitError); ok {
 			log.Info().Str("task_id", task.ExternalId).Str("reason", err.Error()).Msg("task cancelled due to concurrency limit")
+		} else if _, ok := err.(*types.InsufficientCreditsError); ok {
+			log.Info().Str("task_id", task.ExternalId).Str("reason", err.Error()).Msg("task cancelled due to insufficient credits")
 		}
 
 		task.Status = types.TaskStatusCancelled
+		task.FailureReason = err.Error()
 		task.EndedAt = types.NullTime{}.Now()
 		t.fs.backendRepo.UpdateTask(ctx, task.ExternalId, *task)
 

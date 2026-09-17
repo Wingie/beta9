@@ -6,29 +6,82 @@ import "types.proto";
 service WorkerRepositoryService {
   rpc GetNextContainerRequest(GetNextContainerRequestRequest)
       returns (stream GetNextContainerRequestResponse) {}
+  rpc PushContainerLifecycleEvents(PushContainerLifecycleEventsRequest)
+      returns (PushContainerLifecycleEventsResponse) {}
+  rpc StreamWorkerEvents(StreamWorkerEventsRequest)
+      returns (stream WorkerEvent) {}
   rpc SetImagePullLock(SetImagePullLockRequest)
       returns (SetImagePullLockResponse) {}
   rpc RemoveImagePullLock(RemoveImagePullLockRequest)
       returns (RemoveImagePullLockResponse) {}
+  // Deprecated: workers claim containers with ClaimContainer. Kept so a
+  // gateway upgrade does not strand workers still running the old binary.
   rpc AddContainerToWorker(AddContainerToWorkerRequest)
       returns (AddContainerToWorkerResponse) {}
+  rpc ClaimContainer(ClaimContainerRequest) returns (ClaimContainerResponse) {}
   rpc RemoveContainerFromWorker(RemoveContainerFromWorkerRequest)
       returns (RemoveContainerFromWorkerResponse) {}
   rpc GetWorkerById(GetWorkerByIdRequest) returns (GetWorkerByIdResponse) {}
   rpc ToggleWorkerAvailable(ToggleWorkerAvailableRequest)
       returns (ToggleWorkerAvailableResponse) {}
+  rpc DisableWorker(DisableWorkerRequest) returns (DisableWorkerResponse) {}
   rpc RemoveWorker(RemoveWorkerRequest) returns (RemoveWorkerResponse) {}
   rpc UpdateWorkerCapacity(UpdateWorkerCapacityRequest)
       returns (UpdateWorkerCapacityResponse) {}
   rpc SetWorkerKeepAlive(SetWorkerKeepAliveRequest)
       returns (SetWorkerKeepAliveResponse) {}
+  rpc RegisterCacheHost(RegisterCacheHostRequest)
+      returns (RegisterCacheHostResponse) {}
+  rpc UnregisterCacheHost(UnregisterCacheHostRequest)
+      returns (UnregisterCacheHostResponse) {}
+  rpc ListCacheHosts(ListCacheHostsRequest) returns (ListCacheHostsResponse) {}
+  rpc SetCacheClientLock(SetCacheClientLockRequest)
+      returns (SetCacheClientLockResponse) {}
+  rpc RemoveCacheClientLock(RemoveCacheClientLockRequest)
+      returns (RemoveCacheClientLockResponse) {}
+  rpc SetCacheStoreFromContentLock(SetCacheStoreFromContentLockRequest)
+      returns (SetCacheStoreFromContentLockResponse) {}
+  rpc RemoveCacheStoreFromContentLock(RemoveCacheStoreFromContentLockRequest)
+      returns (RemoveCacheStoreFromContentLockResponse) {}
+  rpc RefreshCacheStoreFromContentLock(RefreshCacheStoreFromContentLockRequest)
+      returns (RefreshCacheStoreFromContentLockResponse) {}
+  rpc AddRecentCacheStub(AddRecentCacheStubRequest)
+      returns (AddRecentCacheStubResponse) {}
+  rpc ListRecentCacheStubs(ListRecentCacheStubsRequest)
+      returns (ListRecentCacheStubsResponse) {}
+  rpc MarkCacheStubReported(MarkCacheStubReportedRequest)
+      returns (MarkCacheStubReportedResponse) {}
+  rpc AcquireCacheReconcileLock(AcquireCacheReconcileLockRequest)
+      returns (AcquireCacheReconcileLockResponse) {}
+  rpc ReleaseCacheReconcileLock(ReleaseCacheReconcileLockRequest)
+      returns (ReleaseCacheReconcileLockResponse) {}
+  rpc GetCacheOriginCredentials(GetCacheOriginCredentialsRequest)
+      returns (GetCacheOriginCredentialsResponse) {}
+  rpc GetContainerRuntimeCredentials(GetContainerRuntimeCredentialsRequest)
+      returns (GetContainerRuntimeCredentialsResponse) {}
+  rpc PruneStaleCacheCheckpoints(PruneStaleCacheCheckpointsRequest)
+      returns (PruneStaleCacheCheckpointsResponse) {}
+  rpc SetCacheFsNode(SetCacheFsNodeRequest) returns (SetCacheFsNodeResponse) {}
+  rpc GetCacheFsNode(GetCacheFsNodeRequest) returns (GetCacheFsNodeResponse) {}
+  rpc AddCacheFsNodeChild(AddCacheFsNodeChildRequest)
+      returns (AddCacheFsNodeChildResponse) {}
+  rpc RemoveCacheFsNode(RemoveCacheFsNodeRequest)
+      returns (RemoveCacheFsNodeResponse) {}
+  rpc RemoveCacheFsNodeChild(RemoveCacheFsNodeChildRequest)
+      returns (RemoveCacheFsNodeChildResponse) {}
+  rpc GetCacheFsNodeChildren(GetCacheFsNodeChildrenRequest)
+      returns (GetCacheFsNodeChildrenResponse) {}
   rpc SetNetworkLock(SetNetworkLockRequest) returns (SetNetworkLockResponse) {}
   rpc RemoveNetworkLock(RemoveNetworkLockRequest)
       returns (RemoveNetworkLockResponse) {}
   rpc SetContainerIp(SetContainerIpRequest) returns (SetContainerIpResponse) {}
+  rpc MoveContainerIp(MoveContainerIpRequest)
+      returns (MoveContainerIpResponse) {}
   rpc GetContainerIp(GetContainerIpRequest) returns (GetContainerIpResponse) {}
   rpc GetContainerIps(GetContainerIpsRequest)
       returns (GetContainerIpsResponse) {}
+  rpc GetContainerIpAssignments(GetContainerIpAssignmentsRequest)
+      returns (GetContainerIpAssignmentsResponse) {}
   rpc RemoveContainerIp(RemoveContainerIpRequest)
       returns (RemoveContainerIpResponse) {}
 }
@@ -39,7 +92,29 @@ message GetNextContainerRequestResponse {
   bool ok = 1;
   types.ContainerRequest container_request = 2;
   string error_msg = 3;
+  string delivery_token = 4;
 }
+
+message StreamWorkerEventsRequest {
+  string worker_id = 1;
+}
+
+message WorkerEvent {
+  string event_id = 1;
+
+  oneof event {
+    StopContainerEvent stop_container = 2;
+    StopBuildEvent stop_build = 3;
+  }
+}
+
+message StopContainerEvent {
+  string container_id = 1;
+  bool force = 2;
+  string reason = 3;
+}
+
+message StopBuildEvent { string container_id = 1; }
 
 message SetImagePullLockRequest {
   string worker_id = 1;
@@ -68,11 +143,37 @@ message AddContainerToWorkerRequest {
   string container_id = 2;
   string pool_name = 3;
   string pod_hostname = 4;
+  string delivery_token = 5;
 }
 
 message AddContainerToWorkerResponse {
   bool ok = 1;
   string error_msg = 2;
+}
+
+// ClaimContainer acknowledges a delivered container request, refreshes the
+// container's pending lease, and vends its runtime credentials in one round
+// trip. It replaces the AddContainerToWorker -> GetContainerState ->
+// UpdateContainerStatus -> GetContainerRuntimeCredentials sequence.
+message ClaimContainerRequest {
+  string worker_id = 1;
+  string container_id = 2;
+  string pool_name = 3;
+  string pod_hostname = 4;
+  string delivery_token = 5;
+  // Optional. When set, credentials are vended after the claim succeeds.
+  GetContainerRuntimeCredentialsRequest credentials = 6;
+}
+
+message ClaimContainerResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  // claimed is true once the delivery was acknowledged, even when a later step
+  // failed. A worker that claimed a container owns its failure reporting; one
+  // that did not must only release its reserved capacity.
+  bool claimed = 3;
+  types.ContainerState state = 4;
+  GetContainerRuntimeCredentialsResponse credentials = 5;
 }
 
 message RemoveContainerFromWorkerRequest {
@@ -95,9 +196,19 @@ message GetWorkerByIdResponse {
   string error_msg = 3;
 }
 
-message ToggleWorkerAvailableRequest { string worker_id = 1; }
+message ToggleWorkerAvailableRequest {
+  string worker_id = 1;
+  string generation = 2;
+}
 
 message ToggleWorkerAvailableResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message DisableWorkerRequest { string worker_id = 1; }
+
+message DisableWorkerResponse {
   bool ok = 1;
   string error_msg = 2;
 }
@@ -120,11 +231,334 @@ message UpdateWorkerCapacityResponse {
   string error_msg = 2;
 }
 
-message SetWorkerKeepAliveRequest { string worker_id = 1; }
+message SetWorkerKeepAliveRequest {
+  string worker_id = 1;
+  string machine_id = 2;
+  // idle is set when the worker runs no containers. Only an idle worker can
+  // spin down, so only an idle worker needs pool_headroom answered; busy
+  // workers' keepalives skip the pool scan.
+  bool idle = 3;
+}
 
 message SetWorkerKeepAliveResponse {
   bool ok = 1;
   string error_msg = 2;
+  // pool_headroom is set when the pool's free capacity would fall below its
+  // configured minimum without this worker. The worker keeps running through
+  // its idle spindown timeout while this is set.
+  bool pool_headroom = 3;
+}
+
+message CacheCoordinatorHost {
+  reserved 7;
+
+  string logical_host_id = 1;
+  string registration_id = 2;
+  string pool_name = 3;
+  string locality = 4;
+  string node_id = 5;
+  string cache_path_id = 6;
+  string addr = 8;
+  string private_addr = 9;
+  float capacity_usage_pct = 10;
+}
+
+message RegisterCacheHostRequest {
+  CacheCoordinatorHost host = 1;
+  int32 ttl_seconds = 2;
+}
+
+message RegisterCacheHostResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message UnregisterCacheHostRequest {
+  string logical_host_id = 1;
+  string registration_id = 2;
+  string pool_name = 3;
+  string locality = 4;
+}
+
+message UnregisterCacheHostResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ListCacheHostsRequest {
+  string pool_name = 1;
+  string locality = 2;
+}
+
+message ListCacheHostsResponse {
+  bool ok = 1;
+  repeated CacheCoordinatorHost hosts = 2;
+  string error_msg = 3;
+}
+
+message SetCacheClientLockRequest {
+  string hash = 1;
+  string host_id = 2;
+}
+
+message SetCacheClientLockResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message RemoveCacheClientLockRequest {
+  string hash = 1;
+  string host_id = 2;
+}
+
+message RemoveCacheClientLockResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message SetCacheStoreFromContentLockRequest {
+  string locality = 1;
+  string source_path = 2;
+}
+
+message SetCacheStoreFromContentLockResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message RecentCacheStub {
+  string workspace_id = 1;
+  string stub_id = 2;
+  int64 last_seen_unix = 3;
+}
+
+message AddRecentCacheStubRequest {
+  string locality = 1;
+  string workspace_id = 2;
+  string stub_id = 3;
+  int64 ttl_seconds = 4;
+}
+
+message AddRecentCacheStubResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ListRecentCacheStubsRequest {
+  string locality = 1;
+  int64 ttl_seconds = 2;
+  int32 limit = 3;
+}
+
+message ListRecentCacheStubsResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated RecentCacheStub stubs = 3;
+}
+
+message MarkCacheStubReportedRequest {
+  string locality = 1;
+  string stub_id = 2;
+  int64 ttl_seconds = 3;
+}
+
+message MarkCacheStubReportedResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  bool claimed = 3;
+}
+
+message AcquireCacheReconcileLockRequest {
+  string locality = 1;
+  string logical_host = 2;
+  string hash = 3;
+  int64 ttl_seconds = 4;
+}
+
+message AcquireCacheReconcileLockResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  bool acquired = 3;
+}
+
+message ReleaseCacheReconcileLockRequest {
+  string locality = 1;
+  string logical_host = 2;
+  string hash = 3;
+}
+
+message ReleaseCacheReconcileLockResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message CacheWorkspaceStorageCredentials {
+  string endpoint_url = 1;
+  string region = 2;
+  string bucket_name = 3;
+  string access_key = 4;
+  string secret_key = 5;
+  bool force_path_style = 6;
+}
+
+message GetCacheOriginCredentialsRequest {
+  string workspace_id = 1;
+  string stub_id = 2;
+  string registry = 3;
+  string image_id = 4;
+}
+
+message GetCacheOriginCredentialsResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  // Opaque registry credentials blob (same format as runtime image credentials).
+  // Short-lived and used in-memory by the worker only; never persisted.
+  string registry_credentials = 3;
+  CacheWorkspaceStorageCredentials workspace_storage = 4;
+  CacheWorkspaceStorageCredentials image_archive_storage = 5;
+  string image_archive_object_key = 6;
+  string image_archive_url = 7;
+  // Presigned URL for the CLIP v1 data archive ("<image_id>.clip"), used by
+  // private-pool workers that have no S3 credentials to lazily restore or
+  // reconcile v1 archive data.
+  string image_archive_data_url = 8;
+}
+
+message RuntimeMountCredentialRequest {
+  string mount_path = 1;
+  string bucket_name = 2;
+}
+
+message RuntimeMountCredentials {
+  string mount_path = 1;
+  types.MountPointConfig config = 2;
+}
+
+message GetContainerRuntimeCredentialsRequest {
+  string workspace_id = 1;
+  string stub_id = 2;
+  string container_id = 3;
+  repeated string secret_names = 4;
+  bool runtime_token = 5;
+  bool workspace_storage = 6;
+  repeated RuntimeMountCredentialRequest mount_credentials = 7;
+}
+
+message GetContainerRuntimeCredentialsResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated string env = 3;
+  CacheWorkspaceStorageCredentials workspace_storage = 4;
+  repeated RuntimeMountCredentials mount_credentials = 5;
+}
+
+message PruneStaleCacheCheckpointsRequest {
+  string locality = 1;
+  repeated string active_stub_ids = 2;
+}
+
+message PruneStaleCacheCheckpointsResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  int32 pruned = 3;
+}
+
+message RemoveCacheStoreFromContentLockRequest {
+  string locality = 1;
+  string source_path = 2;
+}
+
+message RemoveCacheStoreFromContentLockResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message RefreshCacheStoreFromContentLockRequest {
+  string locality = 1;
+  string source_path = 2;
+}
+
+message RefreshCacheStoreFromContentLockResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message WorkerCacheFSMetadata {
+  string pid = 1;
+  string id = 2;
+  string name = 3;
+  string path = 4;
+  string hash = 5;
+  uint64 ino = 6;
+  uint64 size = 7;
+  uint64 blocks = 8;
+  uint64 atime = 9;
+  uint64 mtime = 10;
+  uint64 ctime = 11;
+  uint32 atimensec = 12;
+  uint32 mtimensec = 13;
+  uint32 ctimensec = 14;
+  uint32 mode = 15;
+  uint32 nlink = 16;
+  uint32 rdev = 17;
+  uint32 blksize = 18;
+  uint32 padding = 19;
+  uint32 uid = 20;
+  uint32 gid = 21;
+  uint64 gen = 22;
+}
+
+message SetCacheFsNodeRequest {
+  string id = 1;
+  WorkerCacheFSMetadata metadata = 2;
+}
+
+message SetCacheFsNodeResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message GetCacheFsNodeRequest { string id = 1; }
+
+message GetCacheFsNodeResponse {
+  bool ok = 1;
+  WorkerCacheFSMetadata metadata = 2;
+  string error_msg = 3;
+}
+
+message AddCacheFsNodeChildRequest {
+  string pid = 1;
+  string id = 2;
+}
+
+message AddCacheFsNodeChildResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message RemoveCacheFsNodeRequest { string id = 1; }
+
+message RemoveCacheFsNodeResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message RemoveCacheFsNodeChildRequest {
+  string pid = 1;
+  string id = 2;
+}
+
+message RemoveCacheFsNodeChildResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message GetCacheFsNodeChildrenRequest { string id = 1; }
+
+message GetCacheFsNodeChildrenResponse {
+  bool ok = 1;
+  repeated WorkerCacheFSMetadata children = 2;
+  string error_msg = 3;
 }
 
 message SetNetworkLockRequest {
@@ -160,6 +594,18 @@ message SetContainerIpResponse {
   string error_msg = 2;
 }
 
+message MoveContainerIpRequest {
+  string network_prefix = 1;
+  string from_container_id = 2;
+  string to_container_id = 3;
+  string ip_address = 4;
+}
+
+message MoveContainerIpResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
 message GetContainerIpRequest {
   string network_prefix = 1;
   string container_id = 2;
@@ -179,12 +625,35 @@ message GetContainerIpsResponse {
   string error_msg = 3;
 }
 
+message ContainerIpAssignment {
+  string container_id = 1;
+  string ip_address = 2;
+}
+
+message GetContainerIpAssignmentsRequest { string network_prefix = 1; }
+
+message GetContainerIpAssignmentsResponse {
+  bool ok = 1;
+  repeated ContainerIpAssignment assignments = 2;
+  string error_msg = 3;
+}
+
 message RemoveContainerIpRequest {
   string network_prefix = 1;
   string container_id = 2;
 }
 
 message RemoveContainerIpResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PushContainerLifecycleEventsRequest {
+  string worker_id = 1;
+  repeated bytes events = 2;
+}
+
+message PushContainerLifecycleEventsResponse {
   bool ok = 1;
   string error_msg = 2;
 }

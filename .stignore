@@ -31,3 +31,10 @@ deploy
 bin/worker
 bin/gateway
 sdk
+benchmarks
+
+# Local worktrees and build output
+.codex-*
+.htmlcov
+node_modules
+.next

@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	pkgcommon "github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/compute"
 	"github.com/beam-cloud/beta9/pkg/repository/common"
 	"github.com/beam-cloud/beta9/pkg/types"
 )
@@ -15,25 +17,33 @@ type WorkerRepository interface {
 	GetWorkerById(workerId string) (*types.Worker, error)
 	GetAllWorkers() ([]*types.Worker, error)
 	GetAllWorkersInPool(poolName string) ([]*types.Worker, error)
-	CordonAllPendingWorkersInPool(poolName string) error
 	GetAllWorkersOnMachine(machineId string) ([]*types.Worker, error)
 	AddWorker(w *types.Worker) error
-	ToggleWorkerAvailable(workerId string) error
+	ToggleWorkerAvailable(workerId, generation string) error
+	SetWorkerCordon(workerId string, cordoned bool) error
+	PrepareWorkerRollout(workerId, generation string) (bool, error)
 	UpdateWorkerStatus(workerId string, status types.WorkerStatus) error
 	RemoveWorker(workerId string) error
-	SetWorkerKeepAlive(workerId string) error
+	SetWorkerKeepAlive(workerId string, keepAlive types.WorkerKeepAlive) error
 	UpdateWorkerCapacity(w *types.Worker, cr *types.ContainerRequest, ut types.CapacityUpdateType) error
 	ScheduleContainerRequest(worker *types.Worker, request *types.ContainerRequest) error
+	ScheduleContainerRequests(worker *types.Worker, requests []*types.ContainerRequest) error
 	GetNextContainerRequest(workerId string) (*types.ContainerRequest, error)
-	AddContainerToWorker(workerId string, containerId string) error
+	GetNextContainerRequests(workerId string, limit int) ([]*types.ContainerRequest, error)
+	RecoverPendingContainerRequests(workerId string) error
+	RequeueContainerRequests(workerId string, requests []*types.ContainerRequest) error
+	AddContainerToWorker(workerId, containerId, deliveryToken string) error
 	RemoveContainerFromWorker(workerId string, containerId string) error
 	SetContainerResourceValues(workerId string, containerId string, usage types.ContainerResourceUsage) error
 	SetImagePullLock(workerId, imageId string) (string, error)
 	RemoveImagePullLock(workerId, imageId, token string) error
 	GetContainerIp(networkPrefix string, containerId string) (string, error)
 	SetContainerIp(networkPrefix string, containerId, containerIp string) error
+	MoveContainerIp(networkPrefix, fromContainerId, toContainerId, containerIp string) error
 	RemoveContainerIp(networkPrefix string, containerId string) error
 	GetContainerIps(networkPrefix string) ([]string, error)
+	GetContainerIpAssignments(networkPrefix string) ([]types.ContainerIpAssignment, error)
+	RemoveWorkerNetworkState(ctx context.Context, networkPrefix string) error
 	SetNetworkLock(networkPrefix string, ttl, retries int) (string, error)
 	RemoveNetworkLock(networkPrefix string, token string) error
 	GetGpuCounts() (map[string]int, error)
@@ -46,38 +56,116 @@ type ContainerRepository interface {
 	GetContainerState(string) (*types.ContainerState, error)
 	SetContainerState(string, *types.ContainerState) error
 	SetContainerExitCode(string, int) error
+	SetContainerFailureCooldown([]string) error
 	GetContainerExitCode(string) (int, error)
 	SetContainerAddress(containerId string, addr string) error
 	GetContainerAddress(containerId string) (string, error)
+	SetBackendRoute(ctx context.Context, route types.BackendRoute) error
+	SetBackendRoutes(ctx context.Context, routes []types.BackendRoute) error
+	GetBackendRoute(ctx context.Context, routeID string) (*types.BackendRoute, error)
+	ListBackendRoutesByMachine(ctx context.Context, workspaceID, poolName, machineID string) ([]types.BackendRoute, error)
+	ListBackendRoutesByMachineID(ctx context.Context, machineID string) ([]types.BackendRoute, error)
+	DeleteBackendRoutesByContainerID(ctx context.Context, containerID string) error
+	DeleteBackendRoutesByMachine(ctx context.Context, workspaceID, poolName, machineID string) error
 	UpdateContainerStatus(string, types.ContainerStatus, int64) error
-	UpdateAssignedContainerGPU(string, string) error
+	MarkPendingContainerStoppingIfUnassigned(containerId string, expirySeconds int64) (bool, error)
 	DeleteContainerState(containerId string) error
 	SetContainerRequestStatus(containerId string, status types.ContainerRequestStatus) error
+	GetContainerRequestStatus(containerId string) (types.ContainerRequestStatus, error)
 	SetWorkerAddress(containerId string, addr string) error
 	GetWorkerAddress(ctx context.Context, containerId string) (string, error)
 	SetContainerAddressMap(containerId string, addressMap map[int32]string) error
 	GetContainerAddressMap(containerId string) (map[int32]string, error)
-	SetContainerStateWithConcurrencyLimit(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error
+	CheckContainerConcurrencyLimit(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error
+	CreateContainerStateWithConcurrencyLimit(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error
+	ReserveContainerConcurrencyForPending(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error
 	GetActiveContainersByStubId(stubId string) ([]types.ContainerState, error)
 	GetActiveContainersByWorkspaceId(workspaceId string) ([]types.ContainerState, error)
+	RecordSandboxCreated(workspaceId, appId string, at time.Time) error
+	GetSandboxActivity(workspaceId string, appIds []string, since time.Time) (map[string][]types.AppActivityBucket, error)
 	GetActiveContainersByWorkerId(workerId string) ([]types.ContainerState, error)
 	GetFailedContainersByStubId(stubId string) ([]string, error)
 	GetStubState(stubId string) (string, error)
 	SetStubState(stubId, state string) error
 	DeleteStubState(stubId string) error
 	SetBuildContainerTTL(containerId string, ttl time.Duration) error
-	HasBuildContainerTTL(containerId string) bool
+	RefreshBuildContainerTTL(containerId string, ttl time.Duration) (bool, error)
+	GetEndpointRequestTokens(ctx context.Context, workspaceName, stubId, containerId string, maxTokens int, ttl time.Duration) (int, error)
+	AcquireEndpointRequestToken(ctx context.Context, workspaceName, stubId, containerId string, maxTokens int, ttl time.Duration) (bool, error)
+	ReleaseEndpointRequestToken(ctx context.Context, workspaceName, stubId, containerId, taskId string, maxTokens int, ttl time.Duration) error
+	RefreshEndpointRequestTokenTTL(ctx context.Context, workspaceName, stubId, containerId string, ttl time.Duration) error
+	SetEndpointRequestHeartbeat(ctx context.Context, workspaceName, stubId, taskId, containerId string, ttl time.Duration) error
+	EndpointRequestHeartbeatExists(ctx context.Context, workspaceName, stubId, taskId, containerId string) (bool, error)
+	SetPodKeepWarmLock(ctx context.Context, workspaceName, stubId, containerId string, keepWarmSeconds int) error
+	PodKeepWarmLockExists(ctx context.Context, workspaceName, stubId, containerId string) (bool, error)
 }
 
 type WorkerPoolRepository interface {
 	SetWorkerPoolState(ctx context.Context, poolName string, state *types.WorkerPoolState) error
 	GetWorkerPoolState(ctx context.Context, poolName string) (*types.WorkerPoolState, error)
+	DeleteWorkerPoolState(ctx context.Context, poolName string) error
 	SetWorkerPoolStateLock(poolName string) error
 	RemoveWorkerPoolStateLock(poolName string) error
 	SetWorkerPoolSizerLock(poolName string) error
 	RemoveWorkerPoolSizerLock(poolName string) error
 	SetWorkerCleanerLock(poolName string) error
 	RemoveWorkerCleanerLock(poolName string) error
+}
+
+type ComputeRepository interface {
+	WithPoolStateLock(ctx context.Context, workspaceID, name string, fn func(context.Context) error) error
+	SavePoolState(ctx context.Context, workspaceID string, state *compute.PoolState) error
+	GetPoolState(ctx context.Context, workspaceID, name string) (*compute.PoolState, error)
+	ListPoolStates(ctx context.Context, workspaceID string, limit int) ([]*compute.PoolState, error)
+	ListAllPoolStates(ctx context.Context, limit int) ([]*compute.PoolState, error)
+	DeletePoolState(ctx context.Context, workspaceID, name string) error
+	SaveJoinTokenState(ctx context.Context, state *compute.JoinTokenState, ttl time.Duration) error
+	GetJoinTokenState(ctx context.Context, tokenHash string) (*compute.JoinTokenState, error)
+	SaveAgentTokenState(ctx context.Context, state *compute.AgentTokenState, ttl time.Duration) error
+	GetAgentTokenState(ctx context.Context, tokenHash string) (*compute.AgentTokenState, error)
+	GetAgentMachineState(ctx context.Context, workspaceID, poolName, machineID string) (*compute.AgentTokenState, error)
+	GetAgentMachineStateForWorkspace(ctx context.Context, workspaceID, machineID string) (*compute.AgentTokenState, error)
+	ListAgentTokenStates(ctx context.Context, workspaceID, poolName string) ([]*compute.AgentTokenState, error)
+	DeleteAgentMachineState(ctx context.Context, workspaceID, poolName, machineID string) error
+	PruneAgentMachineIndex(ctx context.Context, workspaceID, poolName string) error
+	WithMachineSSHStateLock(ctx context.Context, workspaceID, poolName, machineID string, fn func(context.Context) error) error
+	SaveMachineSSHState(ctx context.Context, state *compute.MachineSSHState) error
+	GetMachineSSHState(ctx context.Context, workspaceID, poolName, machineID string) (*compute.MachineSSHState, error)
+	DeleteMachineSSHState(ctx context.Context, workspaceID, poolName, machineID string) error
+	SaveAgentWorkerSlotState(ctx context.Context, state *compute.AgentWorkerSlotState) error
+	ListAgentWorkerSlotStates(ctx context.Context, workspaceID, poolName, machineID string) ([]*compute.AgentWorkerSlotState, error)
+	DeleteAgentWorkerSlotState(ctx context.Context, workspaceID, poolName, machineID, workerID string) error
+	SaveMarketplaceListing(ctx context.Context, state *compute.MarketplaceListingState) error
+	GetMarketplaceListing(ctx context.Context, sellerWorkspaceID, listingID string) (*compute.MarketplaceListingState, error)
+	GetMarketplaceListingByID(ctx context.Context, listingID string) (*compute.MarketplaceListingState, error)
+	ListMarketplaceListings(ctx context.Context, sellerWorkspaceID string, limit int) ([]*compute.MarketplaceListingState, error)
+	ListAllMarketplaceListings(ctx context.Context, limit int) ([]*compute.MarketplaceListingState, error)
+	DeleteMarketplaceListing(ctx context.Context, sellerWorkspaceID, listingID string) error
+	LockMachineRentals(ctx context.Context, machineID string) error
+	UnlockMachineRentals(machineID string) error
+	SaveMarketplaceRental(ctx context.Context, state *compute.MarketplaceRentalState) error
+	GetMarketplaceRental(ctx context.Context, buyerWorkspaceID, rentalID string) (*compute.MarketplaceRentalState, error)
+	ListMarketplaceRentals(ctx context.Context, buyerWorkspaceID string) ([]*compute.MarketplaceRentalState, error)
+	ListMarketplaceRentalsForMachine(ctx context.Context, machineID string) ([]*compute.MarketplaceRentalState, error)
+	ListAllMarketplaceRentals(ctx context.Context) ([]*compute.MarketplaceRentalState, error)
+	DeleteMarketplaceRental(ctx context.Context, state *compute.MarketplaceRentalState) error
+	PushFailoverDemand(ctx context.Context, demand *compute.FailoverDemand, ttl time.Duration) error
+	ListFailoverDemand(ctx context.Context) ([]*compute.FailoverDemand, error)
+	DeleteFailoverDemand(ctx context.Context, gpu string) error
+	RecordOnDemandSpend(ctx context.Context, at time.Time, cents float64) error
+	OnDemandSpendCents(ctx context.Context, window time.Duration) (float64, error)
+}
+
+// ManagedPoolRepository keeps managed pool definitions separate from
+// tenant/private compute state. That boundary lets mixed gateway versions roll
+// safely: replicas that predate managed pools cannot enumerate or rewrite these
+// records through ComputeRepository.
+type ManagedPoolRepository interface {
+	WithManagedPoolStateLock(ctx context.Context, workspaceID, name string, fn func(context.Context) error) error
+	SaveManagedPoolState(ctx context.Context, workspaceID string, state *compute.PoolState) error
+	GetManagedPoolState(ctx context.Context, workspaceID, name string) (*compute.PoolState, error)
+	ListManagedPoolStates(ctx context.Context, workspaceID string, limit int) ([]*compute.PoolState, error)
+	DeleteManagedPoolState(ctx context.Context, workspaceID, name string) error
 }
 
 type WorkspaceRepository interface {
@@ -134,6 +222,9 @@ type BackendRepository interface {
 	DeleteVolume(ctx context.Context, workspaceId uint, name string) error
 	ListVolumesWithRelated(ctx context.Context, workspaceId uint) ([]types.VolumeWithRelated, error)
 	ListDeploymentsWithRelated(ctx context.Context, filters types.DeploymentFilter) ([]types.DeploymentWithRelated, error)
+	ListLatestDeploymentsByAppIDs(ctx context.Context, workspaceID uint, appExternalIDs []string) (map[string]types.DeploymentWithRelated, error)
+	CountActiveDeploymentsByApp(ctx context.Context, workspaceID uint, appExternalIDs []string) (map[string]int, error)
+	AggregateTaskActivityByApp(ctx context.Context, workspaceID uint, appExternalIDs []string, since time.Time) (map[string][]types.AppActivityBucket, error)
 	ListLatestDeploymentsWithRelatedPaginated(ctx context.Context, filters types.DeploymentFilter) (common.CursorPaginationInfo[types.DeploymentWithRelated], error)
 	ListDeploymentsPaginated(ctx context.Context, filters types.DeploymentFilter) (common.CursorPaginationInfo[types.DeploymentWithRelated], error)
 	GetLatestDeploymentByName(ctx context.Context, workspaceId uint, name string, stubType string, filterDeleted bool) (*types.DeploymentWithRelated, error)
@@ -145,6 +236,8 @@ type BackendRepository interface {
 	UpdateDeployment(ctx context.Context, deployment types.Deployment) (*types.Deployment, error)
 	DeleteDeployment(ctx context.Context, deployment types.Deployment) error
 	ListStubs(ctx context.Context, filters types.StubFilter) ([]types.StubWithRelated, error)
+	ListLatestStubsByAppIDs(ctx context.Context, workspaceID uint, appExternalIDs []string) (map[string]types.StubWithRelated, error)
+	ListAppIDsByStubExternalIDs(ctx context.Context, workspaceID string, stubExternalIDs []string) (map[string]string, error)
 	ListStubsPaginated(ctx context.Context, filters types.StubFilter) (common.CursorPaginationInfo[types.StubWithRelated], error)
 	GetConcurrencyLimit(ctx context.Context, concurrenyLimitId uint) (*types.ConcurrencyLimit, error)
 	GetConcurrencyLimitByWorkspaceId(ctx context.Context, workspaceId string) (*types.ConcurrencyLimit, error)
@@ -173,6 +266,7 @@ type BackendRepository interface {
 	RetrieveAppByStubExternalId(ctx context.Context, stubExternalId string) (*types.App, error)
 	ListApps(ctx context.Context, workspaceId uint) ([]types.App, error)
 	ListAppsPaginated(ctx context.Context, workspaceId uint, filters types.AppFilter) (common.CursorPaginationInfo[types.App], error)
+	CountApps(ctx context.Context, workspaceId uint) (int, error)
 	DeleteApp(ctx context.Context, appId string) error
 	GetImageClipVersion(ctx context.Context, imageId string) (uint32, error)
 	CreateImage(ctx context.Context, imageId string, clipVersion uint32) (uint32, error)
@@ -183,9 +277,24 @@ type BackendRepository interface {
 	ListCheckpoints(ctx context.Context, workspaceExternalId string) ([]types.Checkpoint, error)
 	GetCheckpointById(ctx context.Context, checkpointId string) (*types.Checkpoint, error)
 	GetLatestCheckpointByStubId(ctx context.Context, stubExternalId string) (*types.Checkpoint, error)
+	ListStaleCheckpoints(ctx context.Context, activeRecentStubKeys []string, stubLastUsedBefore time.Time) ([]types.Checkpoint, error)
+	PruneCheckpoints(ctx context.Context, checkpointIds []string) ([]types.Checkpoint, error)
+	CreateDiskSnapshot(ctx context.Context, snapshot *types.DiskSnapshot) (*types.DiskSnapshot, error)
+	UpdateDiskSnapshot(ctx context.Context, snapshot *types.DiskSnapshot) (*types.DiskSnapshot, error)
+	GetDiskSnapshot(ctx context.Context, workspaceId uint, snapshotId string) (*types.DiskSnapshot, error)
+	GetLatestDiskSnapshot(ctx context.Context, workspaceId uint, diskName string) (*types.DiskSnapshot, error)
+	ListDiskSnapshots(ctx context.Context, filter types.DiskSnapshotFilter) ([]types.DiskSnapshot, error)
+	GetDisk(ctx context.Context, workspaceId uint, name string) (*types.Disk, error)
+	GetOrCreateDisk(ctx context.Context, workspaceId uint, disk *types.Disk) (*types.Disk, error)
+	// DeleteDisk unregisters the mutable disk resource. Immutable snapshots and
+	// their backing payload are retained because snapshot IDs can outlive a disk
+	// record (for example, when pinned by a template or published for a fork).
+	DeleteDisk(ctx context.Context, workspaceId uint, name string) error
+	ListDisksWithRelated(ctx context.Context, workspaceId uint) ([]types.DiskWithRelated, error)
 }
 
 type TaskRepository interface {
+	WithTaskMonitorLease(ctx context.Context, fn func(context.Context) error) error
 	GetTaskState(ctx context.Context, workspaceName, stubId, taskId string) (*types.TaskMessage, error)
 	SetTaskState(ctx context.Context, workspaceName, stubId, taskId string, msg []byte) error
 	DeleteTaskState(ctx context.Context, workspaceName, stubId, taskId string) error
@@ -220,15 +329,55 @@ type TailscaleRepository interface {
 }
 
 type EventRepository interface {
-	PushContainerRequestedEvent(request *types.ContainerRequest)
-	PushContainerScheduledEvent(containerID string, workerID string, request *types.ContainerRequest)
-	PushContainerStartedEvent(containerID string, workerID string, request *types.ContainerRequest)
-	PushContainerStoppedEvent(containerID string, workerID string, request *types.ContainerRequest, exitCode int)
-	PushContainerOOMEvent(containerID string, workerID string, request *types.ContainerRequest)
+	GetContainerEvents(ctx context.Context, containerID string, query types.EventQuery) (*types.ContainerEventsResponse, error)
+	GetEventHistory(ctx context.Context, query types.EventQuery) (*types.EventHistoryResponse, error)
+	GetLogs(ctx context.Context, query types.LogQuery) (*types.LogsResponse, error)
+	GetStubMetricsTimeseries(ctx context.Context, query types.EventQuery, start time.Time, end time.Time, interval string) (*types.MetricsTimeseriesResponse, error)
+	GetWorkspaceMetricsTimeseries(ctx context.Context, query types.EventQuery, start time.Time, end time.Time, interval string) (*types.MetricsTimeseriesResponse, error)
+	GetPoolMetricsTimeseries(ctx context.Context, query types.EventQuery, start time.Time, end time.Time, interval string) (*types.PoolMetricsTimeseriesResponse, error)
+	StreamContainerEvents(ctx context.Context, containerID string, query types.EventQuery) (EventStream, error)
+	StreamStubEvents(ctx context.Context, query types.EventQuery) (EventStream, error)
+	StreamTaskEvents(ctx context.Context, query types.EventQuery) (EventStream, error)
+	StreamWorkspaceEvents(ctx context.Context, query types.EventQuery) (EventStream, error)
+	StreamAppNamespaceEvents(ctx context.Context, query types.EventQuery) (EventStream, error)
+	StreamLogs(ctx context.Context, query types.LogQuery) (EventStream, error)
 	PushContainerResourceMetricsEvent(workerID string, request *types.ContainerRequest, metrics types.EventContainerMetricsData)
+	PushContainerLifecycleEvent(lifecycle types.EventContainerLifecycleSchema)
+	PushContainerEvent(event types.EventContainerEventSchema)
+	PushContainerLogEvent(entry types.EventContainerLogSchema)
+	PushContainerLogEventQueued(entry types.EventContainerLogSchema) error
+	PushPlatformLogEvent(entry types.EventPlatformLogSchema)
+	PushLLMRouteEvent(event types.EventLLMRouteSchema)
+	PushContainerRequestEvent(workerID string, request *types.ContainerRequest, eventID types.ContainerEventID, opts types.ContainerEventOptions)
+	PushContainerRequestLifecycle(workerID string, request *types.ContainerRequest, lifecycleID types.ContainerLifecycleID, startedAt time.Time, duration time.Duration, success bool, opts types.ContainerLifecycleOptions)
+	PushContainerTaskEvent(task *types.TaskWithRelated, eventID types.ContainerEventID, opts types.ContainerEventOptions)
+	PushContainerFunctionTaskEvent(workspaceID string, task types.TaskInterface, eventID types.ContainerEventID, opts types.ContainerEventOptions)
+	PushContainerTaskLifecycle(task *types.TaskWithRelated, lifecycleID types.ContainerLifecycleID, start time.Time, end time.Time, success bool, opts types.ContainerLifecycleOptions)
+	PushContainerFunctionTaskLifecycle(workspaceID string, task types.TaskInterface, lifecycleID types.ContainerLifecycleID, start time.Time, end time.Time, success bool, opts types.ContainerLifecycleOptions)
+	PushContainerTaskLifecycleSince(ctx context.Context, rdb *pkgcommon.RedisClient, task *types.TaskWithRelated, lifecycleID types.ContainerLifecycleID, sincePhase string, end time.Time, success bool, opts types.ContainerLifecycleOptions)
+	PushContainerRequestLogLine(workerID string, request *types.ContainerRequest, taskID string, stream string, line string)
+	PushContainerRunnerEvent(workerID string, request *types.ContainerRequest, event *types.ContainerRunnerEvent)
+	PushFunctionResultLoaded(workspaceID string, task types.TaskInterface, exitCode int32, byteCount int)
+	PushFunctionResultSent(workspaceID string, task types.TaskInterface, exitCode int32, byteCount int)
+	PushFunctionResultDelivery(workspaceID string, task types.TaskInterface, startedAt time.Time, exitCode int32, byteCount int)
+	PushFunctionStreamCancelRequested(workspaceID string, task types.TaskInterface)
+	PushFunctionStreamCancelApplied(workspaceID string, task types.TaskInterface)
+	PushFunctionGetArgs(ctx context.Context, rdb *pkgcommon.RedisClient, task *types.TaskWithRelated, at time.Time, byteCount int)
+	PushFunctionSetResult(ctx context.Context, rdb *pkgcommon.RedisClient, task *types.TaskWithRelated, at time.Time, byteCount int)
+	PushTaskStartEvents(ctx context.Context, rdb *pkgcommon.RedisClient, task *types.TaskWithRelated, containerID string, startedAt time.Time)
+	PushTaskEndEvents(ctx context.Context, rdb *pkgcommon.RedisClient, task *types.TaskWithRelated, endedAt time.Time)
+	PushTaskEndPersisted(task *types.TaskWithRelated)
+	PushContainerRunningToStartTask(task *types.TaskWithRelated, runningAt time.Time, startedAt time.Time, status types.ContainerStatus)
+	PushTaskCancelRequested(task *types.TaskWithRelated, source types.EventSource, message types.EventMessage)
+	PushTaskCancelApplied(task *types.TaskWithRelated, source types.EventSource, message types.EventMessage)
+	PushContainerLogFlushCompleted(workerID string, request *types.ContainerRequest)
+	PushContainerLogDropped(workerID string, request *types.ContainerRequest, message types.EventMessage, taskID string)
+	PushContainerLogFirstByte(workerID string, request *types.ContainerRequest, taskID string)
+	PushContainerLogLastByte(workerID string, request *types.ContainerRequest)
 	PushWorkerStartedEvent(workerID string)
 	PushWorkerStoppedEvent(workerID string)
 	PushWorkerDeletedEvent(workerID, machineID, poolName string, reason types.DeletedWorkerReason)
+	PushComputeEvent(eventType string, event types.EventComputeSchema)
 	PushDeployStubEvent(workspaceId string, stub *types.Stub)
 	PushServeStubEvent(workspaceId string, stub *types.Stub)
 	PushRunStubEvent(workspaceId string, stub *types.Stub)
@@ -236,9 +385,10 @@ type EventRepository interface {
 	PushTaskUpdatedEvent(task *types.TaskWithRelated)
 	PushTaskCreatedEvent(task *types.TaskWithRelated)
 	PushStubStateUnhealthy(workspaceId string, stubId string, currentState, previousState string, reason string, failedContainers []string)
-	PushWorkerPoolDegradedEvent(poolName string, reasons []string, poolState *types.WorkerPoolState)
-	PushWorkerPoolHealthyEvent(poolName string, poolState *types.WorkerPoolState)
 	PushGatewayEndpointCalledEvent(method, path, workspaceID string, statusCode int, userAgent, remoteIP, requestID, contentType, accept, errorMessage string)
+	PushStubCacheRequiredContent(schema types.EventStubCacheRequiredContentSchema) error
+	PushPlatformCacheEvent(schema types.EventPlatformCacheSchema)
+	ReadStubCacheRequiredContent(ctx context.Context, workspaceID, stubID string) ([]types.CacheRequiredContentItem, error)
 }
 
 type UsageMetricsRepository interface {

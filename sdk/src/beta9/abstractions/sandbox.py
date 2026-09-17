@@ -1,13 +1,15 @@
+import asyncio
 import atexit
 import io
 import shlex
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 from .. import terminal
-from ..abstractions.base import unset_channel
+from ..abstractions.base import set_channel, unset_channel
 from ..abstractions.base.runner import (
+    RUNTIME_PREPARE_FAILED_MSG,
     SANDBOX_STUB_TYPE,
     BaseAbstraction,
 )
@@ -27,10 +29,9 @@ from ..clients.pod import (
     PodSandboxDeleteFileRequest,
     PodSandboxDownloadFileRequest,
     PodSandboxExecRequest,
+    PodSandboxExecResponse,
     PodSandboxExposePortRequest,
     PodSandboxExposePortResponse,
-    PodSandboxUpdateNetworkPermissionsRequest,
-    PodSandboxUpdateNetworkPermissionsResponse,
     PodSandboxFindInFilesRequest,
     PodSandboxKillRequest,
     PodSandboxListFilesRequest,
@@ -43,16 +44,94 @@ from ..clients.pod import (
     PodSandboxSnapshotMemoryResponse,
     PodSandboxStatFileRequest,
     PodSandboxStatusRequest,
+    PodSandboxStatusResponse,
     PodSandboxStderrRequest,
+    PodSandboxStderrResponse,
     PodSandboxStdoutRequest,
+    PodSandboxStdoutResponse,
+    PodSandboxUpdateNetworkPermissionsRequest,
+    PodSandboxUpdateNetworkPermissionsResponse,
     PodSandboxUpdateTtlRequest,
     PodSandboxUpdateTtlResponse,
     PodSandboxUploadFileRequest,
     PodServiceStub,
 )
+from ..config import ConfigContext
 from ..env import is_remote
 from ..exceptions import SandboxConnectionError, SandboxFileSystemError, SandboxProcessError
-from ..type import GpuType, GpuTypeAlias
+from ..type import DurableDisk, GpuType, GpuTypeAlias, Pool
+from ..utils import retry_on_transient_error
+
+SANDBOX_EXEC_RPC_TIMEOUT_SECONDS = 15
+SANDBOX_STATUS_RPC_TIMEOUT_SECONDS = 5
+SANDBOX_OUTPUT_RPC_TIMEOUT_SECONDS = 5
+SANDBOX_WAIT_POLL_INTERVAL_SECONDS = 0.1
+SANDBOX_EXEC_READY_TIMEOUT_SECONDS = 90
+SANDBOX_EXEC_READY_RETRY_DELAY_SECONDS = 0.05
+SANDBOX_EXEC_READINESS_ERRORS = (
+    "failed to connect to sandbox",
+    "process manager not ready",
+    "sandbox process manager is not ready",
+    "process manager failed to become ready",
+    "sandbox process manager client not ready",
+    "deadline exceeded while waiting for connections to become ready",
+    "context deadline exceeded while waiting for connections to become ready",
+)
+SANDBOX_TERMINAL_STATUSES = {
+    "complete",
+    "completed",
+    "exited",
+    "failed",
+    "error",
+    "stopped",
+    "terminated",
+}
+DOCKER_SANDBOX_NETWORK_MODE = "host"
+DOCKER_SANDBOX_PID_MODE = "host"
+DOCKER_COMPOSE_OVERRIDE_PATH = "/tmp/.docker-compose-override.yml"
+SANDBOX_IDLE_ENTRYPOINT = ["tail", "-f", "/dev/null"]
+
+
+def _is_sandbox_exec_readiness_error(error_msg: str) -> bool:
+    normalized = (error_msg or "").lower()
+    return any(marker in normalized for marker in SANDBOX_EXEC_READINESS_ERRORS)
+
+
+def _call_with_sandbox_readiness_retry(do_call):
+    deadline = time.monotonic() + SANDBOX_EXEC_READY_TIMEOUT_SECONDS
+
+    while True:
+        response = retry_on_transient_error(do_call)
+        if response.ok:
+            return response
+        if not _is_sandbox_exec_readiness_error(response.error_msg):
+            return response
+        if time.monotonic() >= deadline:
+            return response
+
+        time.sleep(SANDBOX_EXEC_READY_RETRY_DELAY_SECONDS)
+
+
+def _sandbox_docker_namespace_args() -> List[str]:
+    return [
+        "--network",
+        DOCKER_SANDBOX_NETWORK_MODE,
+        "--pid",
+        DOCKER_SANDBOX_PID_MODE,
+    ]
+
+
+def _is_sandbox_terminal_status(status: str) -> bool:
+    return (status or "").strip().lower() in SANDBOX_TERMINAL_STATUSES
+
+
+def _default_sandbox_exit_code(status: str) -> int:
+    normalized = (status or "").strip().lower()
+    if normalized in {"failed", "error"}:
+        return 1
+    if normalized == "terminated":
+        return 137
+    return 0
 
 
 class Sandbox(Pod):
@@ -80,7 +159,7 @@ class Sandbox(Pod):
         authorized (bool):
             Whether the sandbox should be authorized for external access. Default is False.
         name (str):
-            The name of the Sandbox app. Default is none, which means you must provide it during deployment.
+            Assign the sandbox to an app namespace. If the app does not exist, it will be created with the given name.
         volumes (List[Union[Volume, CloudBucket]]):
             The volumes and/or cloud buckets to mount into the Sandbox container. Default is an empty list.
         secrets (List[str]):
@@ -120,6 +199,9 @@ class Sandbox(Pod):
             List of ports to expose from the sandbox. When specified, these ports will be accessible
             via public URLs upon sandbox creation. Default is an empty list. You can also dynamically
             expose ports at runtime using `instance.expose_port(port)`.
+        pool (Optional[Union[str, Pool]]):
+            The private pool to run the sandbox on. Pass a pool name to select an existing private
+            pool, or a Pool object to request managed pool capacity.
 
     Example:
         ```python
@@ -129,6 +211,7 @@ class Sandbox(Pod):
         sandbox = Sandbox(
             cpu=2.0,
             memory="2Gi",
+            pool="my-private-pool",
             keep_warm_seconds=1800  # 30 minutes
         )
 
@@ -156,6 +239,7 @@ class Sandbox(Pod):
         authorized: bool = False,
         name: Optional[str] = None,
         volumes: Optional[List[Union[Volume, CloudBucket]]] = [],
+        disks: Optional[List[DurableDisk]] = None,
         secrets: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = {},
         sync_local_dir: bool = False,
@@ -163,9 +247,14 @@ class Sandbox(Pod):
         allow_list: Optional[List[str]] = None,
         docker_enabled: bool = False,
         ports: Optional[List[int]] = [],
+        pool: Optional[Union[str, Pool]] = None,
+        allow_marketplace: bool = False,
+        context: Optional[ConfigContext] = None,
     ):
         self.debug_buffer = io.StringIO()
         self.sync_local_dir = sync_local_dir
+        if context is not None:
+            set_channel(context=context)
 
         super().__init__(
             cpu=cpu,
@@ -177,13 +266,19 @@ class Sandbox(Pod):
             authorized=authorized,
             name=name,
             volumes=volumes,
+            disks=disks,
             secrets=secrets,
             env=env,
             block_network=block_network,
             allow_list=allow_list,
             docker_enabled=docker_enabled,
             ports=ports,
+            pool=pool,
+            allow_marketplace=allow_marketplace,
+            entrypoint=list(SANDBOX_IDLE_ENTRYPOINT),
         )
+        if context is not None:
+            self.config_context = context
 
     def debug(self):
         """
@@ -296,8 +391,6 @@ class Sandbox(Pod):
             ```
         """
 
-        self.entrypoint = ["tail", "-f", "/dev/null"]
-
         if not self.prepare_runtime(
             stub_type=SANDBOX_STUB_TYPE,
             force_create_stub=True,
@@ -306,7 +399,7 @@ class Sandbox(Pod):
             return SandboxInstance(
                 container_id="",
                 ok=False,
-                error_msg="Failed to prepare runtime",
+                error_msg=RUNTIME_PREPARE_FAILED_MSG,
                 stub_id="",
             )
 
@@ -500,6 +593,50 @@ class SandboxInstance(BaseAbstraction):
         """
         return self.container_id
 
+    def status(self) -> Tuple[int, str]:
+        """
+        Get the current sandbox status.
+
+        Returns:
+            Tuple[int, str]: The sandbox exit code and status string. An exit code of -1
+            indicates that the sandbox is still running.
+        """
+        res: "PodSandboxStatusResponse" = self.stub.sandbox_status(
+            PodSandboxStatusRequest(container_id=self.container_id)
+        )
+        if not res.ok:
+            raise SandboxProcessError(res.error_msg)
+        return res.exit_code, res.status
+
+    def poll(self) -> Optional[int]:
+        """
+        Return the sandbox exit code if it has exited, otherwise None.
+        """
+        exit_code, status = self.status()
+        if not _is_sandbox_terminal_status(status):
+            return None
+        if exit_code < 0:
+            return _default_sandbox_exit_code(status)
+        return exit_code
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        """
+        Wait for the sandbox to exit and return its exit code.
+
+        Parameters:
+            timeout (Optional[float]): Maximum seconds to wait. Default is None.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            exit_code = self.poll()
+            if exit_code is not None:
+                return exit_code
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SandboxProcessError(
+                    f"Sandbox {self.container_id} did not exit within {timeout} seconds"
+                )
+            time.sleep(SANDBOX_WAIT_POLL_INTERVAL_SECONDS)
+
     def update_ttl(self, ttl: int):
         """
         Update the keep warm setting of the sandbox.
@@ -573,7 +710,7 @@ class SandboxInstance(BaseAbstraction):
 
         This method allows you to modify the network access restrictions of a running
         sandbox without needing to restart it. You can either block all network access
-        or specify an allowlist of CIDR ranges that the sandbox can communicate with. 
+        or specify an allowlist of CIDR ranges that the sandbox can communicate with.
         Does not block access via ports exposed by expose_port.
 
         Parameters:
@@ -625,9 +762,7 @@ class SandboxInstance(BaseAbstraction):
         )
 
         if not res.ok:
-            raise SandboxProcessError(
-                f"Failed to update network permissions: {res.error_msg}"
-            )
+            raise SandboxProcessError(f"Failed to update network permissions: {res.error_msg}")
 
     def list_urls(self) -> Dict[int, str]:
         """
@@ -654,6 +789,28 @@ class SandboxInstance(BaseAbstraction):
 
         return res.urls
 
+    @property
+    def aio(self) -> "AsyncSandboxInstance":
+        """
+        Get an async interface for this sandbox instance.
+
+        Returns:
+            AsyncSandboxInstance: An async wrapper providing non-blocking methods.
+
+        Example:
+            ```python
+            instance = sandbox.create()
+
+            # Use async operations
+            await instance.aio.fs.upload_file("local.txt", "/remote.txt")
+            result = await instance.aio.process.run_code("print('hello')")
+            await instance.aio.terminate()
+            ```
+        """
+        if not hasattr(self, "_aio"):
+            self._aio = AsyncSandboxInstance(self)
+        return self._aio
+
     def __getstate__(self):
         state = self.__dict__.copy()
 
@@ -661,6 +818,7 @@ class SandboxInstance(BaseAbstraction):
         state.pop("gateway_stub", None)
         state.pop("stub", None)
         state.pop("channel", None)
+        state.pop("_aio", None)
 
         unset_channel()
         return state
@@ -705,6 +863,21 @@ class SandboxProcessResponse:
         self.pid = pid
         self.exit_code = exit_code
         self.result: str = stdout.read() + stderr.read()
+
+    @classmethod
+    def from_output(
+        cls,
+        *,
+        pid: int,
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+    ) -> "SandboxProcessResponse":
+        response = cls.__new__(cls)
+        response.pid = pid
+        response.exit_code = exit_code
+        response.result = stdout + stderr
+        return response
 
 
 class SandboxProcessManager:
@@ -777,9 +950,17 @@ class SandboxProcessManager:
             process.wait()
             ```
         """
-        process = self._exec("python3", "-c", code, cwd=cwd, env=env)
+        process = self._exec("python3", "-c", code, cwd=cwd, env=env, wait=blocking)
 
         if blocking:
+            if process.exit_code >= 0:
+                return SandboxProcessResponse.from_output(
+                    pid=process.pid,
+                    exit_code=process.exit_code,
+                    stdout=process._inline_stdout,
+                    stderr=process._inline_stderr,
+                )
+
             process.wait()
 
             return SandboxProcessResponse(
@@ -831,6 +1012,7 @@ class SandboxProcessManager:
         *args,
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
+        wait: bool = False,
     ) -> "SandboxProcess":
         """
         Internal method to execute commands in the sandbox.
@@ -849,27 +1031,46 @@ class SandboxProcessManager:
         command = list(args) if not isinstance(args[0], list) else args[0]
         shell_command = " ".join(shlex.quote(arg) for arg in command)
 
-        response = self.sandbox_instance.stub.sandbox_exec(
-            PodSandboxExecRequest(
-                container_id=self.sandbox_instance.container_id,
-                command=shell_command,
-                cwd=cwd,
-                env=env,
+        def _do_exec():
+            return self.sandbox_instance.stub._unary_unary(
+                "/pod.PodService/SandboxExec",
+                PodSandboxExecRequest,
+                PodSandboxExecResponse,
+            )(
+                PodSandboxExecRequest(
+                    container_id=self.sandbox_instance.container_id,
+                    command=shell_command,
+                    cwd=cwd,
+                    env=env,
+                    wait=wait,
+                ),
+                timeout=SANDBOX_EXEC_RPC_TIMEOUT_SECONDS,
             )
-        )
+
+        response = self._exec_with_readiness_retry(_do_exec)
+
         if not response.ok or response.pid <= 0:
             raise SandboxProcessError(response.error_msg)
 
-        if response.pid > 0:
-            process = SandboxProcess(
-                self.sandbox_instance,
-                pid=response.pid,
-                cwd=cwd,
-                args=command,
-                env=env,
-            )
-            self.processes[response.pid] = process
-            return process
+        done = getattr(response, "done", False)
+        process = SandboxProcess(
+            self.sandbox_instance,
+            pid=response.pid,
+            cwd=cwd,
+            args=command,
+            env=env,
+            exit_code=getattr(response, "exit_code", -1) if done else -1,
+            inline_stdout=getattr(response, "stdout", "") if done else "",
+            inline_stderr=getattr(response, "stderr", "") if done else "",
+        )
+        self.processes[response.pid] = process
+        return process
+
+    def _exec_with_readiness_retry(
+        self,
+        do_exec: Callable[[], PodSandboxExecResponse],
+    ) -> PodSandboxExecResponse:
+        return _call_with_sandbox_readiness_retry(do_exec)
 
     def list_processes(self) -> Dict[int, "SandboxProcess"]:
         """
@@ -933,6 +1134,24 @@ class SandboxProcessManager:
             raise SandboxProcessError(f"Process with pid {pid} not found")
 
         return self.processes[pid]
+
+    @property
+    def aio(self) -> "AsyncSandboxProcessManager":
+        """
+        Get an async interface for this process manager.
+
+        Returns:
+            AsyncSandboxProcessManager: An async wrapper providing non-blocking methods.
+
+        Example:
+            ```python
+            result = await instance.process.aio.run_code("print('hello')")
+            process = await instance.process.aio.exec("ls", "-la")
+            ```
+        """
+        if not hasattr(self, "_aio"):
+            self._aio = AsyncSandboxProcessManager(self)
+        return self._aio
 
 
 class SandboxProcessStream:
@@ -1023,14 +1242,10 @@ class SandboxProcessStream:
         Returns:
             str: New output chunk, or empty string if no new output.
         """
-        output = self.fetch_fn()
-
-        if output == self._last_output:
-            return ""
-
-        new_output = output[len(self._last_output) :]
-        self._last_output = output
-        return new_output
+        # The sandbox process manager returns output deltas and clears its
+        # internal buffer after each read. Do not treat the returned value as
+        # cumulative output.
+        return retry_on_transient_error(self.fetch_fn, max_retries=2, delay=0.2)
 
     def read(self):
         """
@@ -1038,11 +1253,14 @@ class SandboxProcessStream:
         """
         data = self._buffer
         self._buffer = ""
+        process_exited = getattr(self.process, "exit_code", -1) >= 0
 
         while True:
             chunk = self._fetch_next_chunk()
             if chunk:
                 data += chunk
+                if process_exited:
+                    break
             else:
                 break
 
@@ -1092,6 +1310,8 @@ class SandboxProcess:
         args: List[str],
         env: Dict[str, str],
         exit_code: int = -1,
+        inline_stdout: str = "",
+        inline_stderr: str = "",
     ):
         self.sandbox_instance = sandbox_instance
         self.pid = pid
@@ -1100,13 +1320,18 @@ class SandboxProcess:
         self.cwd = cwd
         self.args = args
         self.env = env
+        self._inline_stdout = inline_stdout
+        self._inline_stderr = inline_stderr
 
-    def wait(self) -> int:
+    def wait(self, timeout: Optional[float] = None) -> int:
         """
         Wait for the process to complete.
 
         This method blocks until the process finishes execution and returns
         the exit code. It polls the process status until completion.
+
+        Parameters:
+            timeout (Optional[float]): Maximum seconds to wait. Default is None.
 
         Returns:
             int: The exit code of the completed process.
@@ -1119,11 +1344,14 @@ class SandboxProcess:
                 print("Command completed successfully")
             ```
         """
+        deadline = None if timeout is None else time.monotonic() + timeout
         self.exit_code, self._status = self.status()
 
         while self.exit_code < 0:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SandboxProcessError(f"Process {self.pid} did not exit within {timeout} seconds")
             self.exit_code, self._status = self.status()
-            time.sleep(0.1)
+            time.sleep(SANDBOX_WAIT_POLL_INTERVAL_SECONDS)
 
         return self.exit_code
 
@@ -1180,9 +1408,20 @@ class SandboxProcess:
                 time.sleep(1)
             ```
         """
-        response = self.sandbox_instance.stub.sandbox_status(
-            PodSandboxStatusRequest(container_id=self.sandbox_instance.container_id, pid=self.pid)
-        )
+
+        def _get_status():
+            return self.sandbox_instance.stub._unary_unary(
+                "/pod.PodService/SandboxStatus",
+                PodSandboxStatusRequest,
+                PodSandboxStatusResponse,
+            )(
+                PodSandboxStatusRequest(
+                    container_id=self.sandbox_instance.container_id, pid=self.pid
+                ),
+                timeout=SANDBOX_STATUS_RPC_TIMEOUT_SECONDS,
+            )
+
+        response = _call_with_sandbox_readiness_retry(_get_status)
 
         if not response.ok:
             raise SandboxProcessError(response.error_msg)
@@ -1204,14 +1443,13 @@ class SandboxProcess:
             print(f"STDOUT: {stdout_content}")
             ```
         """
-        return SandboxProcessStream(
-            self,
-            lambda: self.sandbox_instance.stub.sandbox_stdout(
-                PodSandboxStdoutRequest(
-                    container_id=self.sandbox_instance.container_id, pid=self.pid
-                )
-            ).stdout,
-        )
+        # Cache the stream to preserve buffer state across multiple accesses
+        if not hasattr(self, "_stdout_stream"):
+            self._stdout_stream = SandboxProcessStream(
+                self,
+                self._stdout,
+            )
+        return self._stdout_stream
 
     @property
     def stderr(self):
@@ -1228,14 +1466,43 @@ class SandboxProcess:
             print(f"STDERR: {stderr_content}")
             ```
         """
-        return SandboxProcessStream(
-            self,
-            lambda: self.sandbox_instance.stub.sandbox_stderr(
-                PodSandboxStderrRequest(
-                    container_id=self.sandbox_instance.container_id, pid=self.pid
-                )
-            ).stderr,
+        # Cache the stream to preserve buffer state across multiple accesses
+        if not hasattr(self, "_stderr_stream"):
+            self._stderr_stream = SandboxProcessStream(
+                self,
+                self._stderr,
+            )
+        return self._stderr_stream
+
+    def _stdout(self) -> str:
+        response = self.sandbox_instance.stub._unary_unary(
+            "/pod.PodService/SandboxStdout",
+            PodSandboxStdoutRequest,
+            PodSandboxStdoutResponse,
+        )(
+            PodSandboxStdoutRequest(
+                container_id=self.sandbox_instance.container_id, pid=self.pid
+            ),
+            timeout=SANDBOX_OUTPUT_RPC_TIMEOUT_SECONDS,
         )
+        if not response.ok:
+            raise SandboxProcessError(response.error_msg)
+        return response.stdout
+
+    def _stderr(self) -> str:
+        response = self.sandbox_instance.stub._unary_unary(
+            "/pod.PodService/SandboxStderr",
+            PodSandboxStderrRequest,
+            PodSandboxStderrResponse,
+        )(
+            PodSandboxStderrRequest(
+                container_id=self.sandbox_instance.container_id, pid=self.pid
+            ),
+            timeout=SANDBOX_OUTPUT_RPC_TIMEOUT_SECONDS,
+        )
+        if not response.ok:
+            raise SandboxProcessError(response.error_msg)
+        return response.stderr
 
     @property
     def logs(self):
@@ -1261,6 +1528,9 @@ class SandboxProcess:
             all_logs = process.logs.read()
             ```
         """
+        # Cache to preserve state across multiple accesses
+        if hasattr(self, "_logs_stream"):
+            return self._logs_stream
 
         class CombinedStream:
             def __init__(self, process: "SandboxProcess"):
@@ -1280,22 +1550,27 @@ class SandboxProcess:
                     return
 
                 chunk = stream_info["stream"]._fetch_next_chunk()
-                if chunk:
-                    stream_info["buffer"] += chunk
-
-                    while "\n" in stream_info["buffer"]:  # Process any complete lines
-                        line, stream_info["buffer"] = stream_info["buffer"].split("\n", 1)
-                        self._queue.append(line + "\n")
-
-                else:
+                if not chunk:
                     exit_code, _ = self.process.status()
                     if exit_code >= 0:  # Process has exited
+                        chunk = stream_info["stream"]._fetch_next_chunk()
+                    else:
+                        return
+
+                    if not chunk:
                         if stream_info["buffer"]:
                             self._queue.append(stream_info["buffer"])
                             stream_info["buffer"] = ""
                             return
 
                         stream_info["exhausted"] = True
+                        return
+
+                stream_info["buffer"] += chunk
+
+                while "\n" in stream_info["buffer"]:  # Process any complete lines
+                    line, stream_info["buffer"] = stream_info["buffer"].split("\n", 1)
+                    self._queue.append(line + "\n")
 
             def _fill_queue(self):
                 self._process_stream("stdout")
@@ -1325,14 +1600,46 @@ class SandboxProcess:
                     return self._queue.pop(0)
 
             def read(self):
+                buffered_data = "".join(self._queue)
+                self._queue = []
+                for stream_info in self._streams.values():
+                    if stream_info["buffer"]:
+                        buffered_data += stream_info["buffer"]
+                        stream_info["buffer"] = ""
+
                 stdout_data = self._stdout.read()
                 stderr_data = self._stderr.read()
-                return stdout_data + stderr_data
+                return buffered_data + stdout_data + stderr_data
 
-        return CombinedStream(self)
+        self._logs_stream = CombinedStream(self)
+        return self._logs_stream
+
+    @property
+    def aio(self) -> "AsyncSandboxProcess":
+        """
+        Get an async interface for this process.
+
+        Returns:
+            AsyncSandboxProcess: An async wrapper providing non-blocking methods.
+
+        Example:
+            ```python
+            process = instance.process.exec("sleep", "10")
+            exit_code = await process.aio.wait()
+            async for line in process.aio.stdout:
+                print(line)
+            ```
+        """
+        if not hasattr(self, "_aio"):
+            self._aio = AsyncSandboxProcess(self)
+        return self._aio
 
     def __getstate__(self):
         state = self.__dict__.copy()
+        state.pop("_aio", None)
+        state.pop("_stdout_stream", None)
+        state.pop("_stderr_stream", None)
+        state.pop("_logs_stream", None)
         return state
 
     def __setstate__(self, state):
@@ -1521,6 +1828,32 @@ class SandboxFileSystem:
                     container_id=self.sandbox_instance.container_id,
                 )
 
+    def write_bytes(self, sandbox_path: str, data: bytes, mode: int = 644):
+        """
+        Write bytes to a file in the sandbox.
+        """
+        response = self.sandbox_instance.stub.sandbox_upload_file(
+            PodSandboxUploadFileRequest(
+                container_id=self.sandbox_instance.container_id,
+                container_path=sandbox_path,
+                data=data,
+                mode=mode,
+            )
+        )
+        if not response.ok:
+            raise SandboxFileSystemError(
+                message=response.error_msg,
+                operation="write_bytes",
+                path=sandbox_path,
+                container_id=self.sandbox_instance.container_id,
+            )
+
+    def write_text(self, sandbox_path: str, text: str, encoding: str = "utf-8", mode: int = 644):
+        """
+        Write text to a file in the sandbox.
+        """
+        self.write_bytes(sandbox_path, text.encode(encoding), mode=mode)
+
     def download_file(self, sandbox_path: str, local_path: str):
         """
         Download a file from the sandbox to a local path.
@@ -1561,6 +1894,31 @@ class SandboxFileSystem:
 
         with open(local_path, "wb") as f:
             f.write(response.data)
+
+    def read_bytes(self, sandbox_path: str) -> bytes:
+        """
+        Read a file from the sandbox and return its bytes.
+        """
+        response = self.sandbox_instance.stub.sandbox_download_file(
+            PodSandboxDownloadFileRequest(
+                container_id=self.sandbox_instance.container_id,
+                container_path=sandbox_path,
+            )
+        )
+        if not response.ok:
+            raise SandboxFileSystemError(
+                message=response.error_msg,
+                operation="read_bytes",
+                path=sandbox_path,
+                container_id=self.sandbox_instance.container_id,
+            )
+        return response.data
+
+    def read_text(self, sandbox_path: str, encoding: str = "utf-8") -> str:
+        """
+        Read a file from the sandbox and return text.
+        """
+        return self.read_bytes(sandbox_path).decode(encoding)
 
     def stat_file(self, sandbox_path: str) -> "SandboxFileInfo":
         """
@@ -1759,6 +2117,18 @@ class SandboxFileSystem:
                 container_id=self.sandbox_instance.container_id,
             )
 
+    def remove(self, sandbox_path: str):
+        """
+        Remove a file or directory from the sandbox.
+
+        Directories are removed with the backend directory-delete RPC, which may
+        require the directory to be empty.
+        """
+        info = self.stat_file(sandbox_path)
+        if info.is_dir:
+            return self.delete_directory(sandbox_path)
+        return self.delete_file(sandbox_path)
+
     def replace_in_files(self, sandbox_path: str, old_string: str, new_string: str):
         r"""
         Replace a string in all files in a directory.
@@ -1867,6 +2237,24 @@ class SandboxFileSystem:
 
         return results
 
+    @property
+    def aio(self) -> "AsyncSandboxFileSystem":
+        """
+        Get an async interface for this file system.
+
+        Returns:
+            AsyncSandboxFileSystem: An async wrapper providing non-blocking methods.
+
+        Example:
+            ```python
+            await instance.fs.aio.upload_file("local.txt", "/remote.txt")
+            files = await instance.fs.aio.list_files("/")
+            ```
+        """
+        if not hasattr(self, "_aio"):
+            self._aio = AsyncSandboxFileSystem(self)
+        return self._aio
+
 
 class DockerResult:
     """
@@ -1901,6 +2289,8 @@ class DockerResult:
         self._waited = False
         self._output = None
         self._success = None
+        self._stdout = None
+        self._stderr = None
 
     def wait(self) -> bool:
         """Wait for operation to complete. Returns True if successful."""
@@ -1970,14 +2360,18 @@ class DockerResult:
         """Get all stdout (auto-waits if needed)."""
         if not self._waited:
             self.wait()
-        return self.process.stdout.read()
+        if self._stdout is None:
+            self._stdout = self.process.stdout.read()
+        return self._stdout
 
     @property
     def stderr(self) -> str:
         """Get all stderr (auto-waits if needed)."""
         if not self._waited:
             self.wait()
-        return self.process.stderr.read()
+        if self._stderr is None:
+            self._stderr = self.process.stderr.read()
+        return self._stderr
 
 
 class DockerComposeStack:
@@ -2195,7 +2589,9 @@ class SandboxDockerManager:
             ```
         """
         cmd = ["docker", "run"]
-        cmd.extend(["--network", "host"])
+        # Inner containers use the sandbox's network/PID namespaces so Docker
+        # commands work consistently under both runc and gVisor.
+        cmd.extend(_sandbox_docker_namespace_args())
 
         if detach:
             cmd.append("-d")
@@ -2246,7 +2642,7 @@ class SandboxDockerManager:
         if quiet:
             cmd.append("-q")
 
-        output = self._run(*cmd)
+        output = self._run(*cmd).stdout
         return output.split("\n") if quiet and output else output
 
     def stop(self, container: str) -> bool:
@@ -2389,9 +2785,7 @@ class SandboxDockerManager:
 
         cmd = ["docker", "build", "-t", tag]
 
-        # Use host networking for gVisor
-        # Safe because "host" = sandbox's network namespace, still isolated
-        cmd.extend(["--network", "host"])
+        cmd.extend(["--network", DOCKER_SANDBOX_NETWORK_MODE])
 
         if dockerfile:
             cmd.extend(["-f", dockerfile])
@@ -2424,7 +2818,7 @@ class SandboxDockerManager:
         if quiet:
             cmd.append("-q")
 
-        output = self._run(*cmd)
+        output = self._run(*cmd).stdout
         return output.split("\n") if quiet and output else output
 
     def rmi(self, image: str, force: bool = False) -> bool:
@@ -2531,6 +2925,62 @@ class SandboxDockerManager:
 
     # === Docker Compose ===
 
+    def _compose_file_path(self, file: str, cwd: Optional[str] = None) -> str:
+        return file if file.startswith("/") else f"{cwd or '.'}/{file}"
+
+    def _read_compose_services(
+        self, file: str, cwd: Optional[str] = None
+    ) -> Tuple[List[str], Set[str]]:
+        import os
+        import tempfile
+
+        import yaml
+
+        compose_path = self._compose_file_path(file, cwd)
+        service_names: List[str] = []
+        services_with_build: Set[str] = set()
+
+        try:
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".yml", delete=False) as tmp_file:
+                local_compose_path = tmp_file.name
+
+            try:
+                self.sandbox_instance.fs.download_file(compose_path, local_compose_path)
+                with open(local_compose_path, "r") as f:
+                    compose_data = yaml.safe_load(f.read())
+            finally:
+                if os.path.exists(local_compose_path):
+                    os.unlink(local_compose_path)
+        except Exception:
+            return service_names, services_with_build
+
+        services = compose_data.get("services") if isinstance(compose_data, dict) else None
+        if not isinstance(services, dict):
+            return service_names, services_with_build
+
+        service_names = list(services.keys())
+        services_with_build = {
+            name
+            for name, config in services.items()
+            if isinstance(config, dict) and "build" in config
+        }
+        return service_names, services_with_build
+
+    def _upload_text(self, content: str, remote_path: str, suffix: str = "") -> None:
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as tmp_file:
+            tmp_file.write(content)
+            tmp_file.flush()
+            local_path = tmp_file.name
+
+        try:
+            self.sandbox_instance.fs.upload_file(local_path, remote_path)
+        finally:
+            if os.path.exists(local_path):
+                os.unlink(local_path)
+
     def _create_compose_override(self, file: str, cwd: Optional[str] = None) -> str:
         """
         Create gVisor-compatible compose override file.
@@ -2544,67 +2994,28 @@ class SandboxDockerManager:
         """
         import yaml
 
-        compose_file_path = file if file.startswith("/") else f"{cwd or '.'}/{file}"
+        service_names, services_with_build = self._read_compose_services(file, cwd)
+        override_path = DOCKER_COMPOSE_OVERRIDE_PATH
+        override = {"services": {}}
 
-        # Download and parse compose file
-        service_names = []
-        services_with_build = set()
-        try:
-            import os
-            import tempfile
+        for service_name in service_names or ["default"]:
+            service = {
+                "network_mode": DOCKER_SANDBOX_NETWORK_MODE,
+                "pid": DOCKER_SANDBOX_PID_MODE,
+            }
 
-            with tempfile.NamedTemporaryFile(mode="w+", suffix=".yml", delete=False) as tmp_file:
-                local_compose_path = tmp_file.name
+            if len(service_names) > 1:
+                service["extra_hosts"] = [
+                    f"{other_service}:127.0.0.1" for other_service in service_names
+                ]
 
-            try:
-                self.sandbox_instance.fs.download_file(compose_file_path, local_compose_path)
-                with open(local_compose_path, "r") as f:
-                    compose_data = yaml.safe_load(f.read())
-                    if compose_data and "services" in compose_data:
-                        service_names = list(compose_data["services"].keys())
-                        for svc_name, svc_config in compose_data["services"].items():
-                            if isinstance(svc_config, dict) and "build" in svc_config:
-                                services_with_build.add(svc_name)
-            finally:
-                if os.path.exists(local_compose_path):
-                    os.unlink(local_compose_path)
-        except Exception:
-            pass
+            if service_name in services_with_build or not service_names:
+                service["build"] = {"network": DOCKER_SANDBOX_NETWORK_MODE}
 
-        # Generate override
-        override_path = "/tmp/.docker-compose-override.yml"
-        if service_names:
-            override_content = "services:\n"
-            for service_name in service_names:
-                override_content += f"  {service_name}:\n"
-                override_content += "    network_mode: host\n"
-                # Map all service names to localhost for inter-service communication
-                if len(service_names) > 1:
-                    override_content += "    extra_hosts:\n"
-                    for other_service in service_names:
-                        override_content += f'      - "{other_service}:127.0.0.1"\n'
-                if service_name in services_with_build:
-                    override_content += "    build:\n"
-                    override_content += "      network: host\n"
-        else:
-            override_content = (
-                "services:\n  default:\n    network_mode: host\n    build:\n      network: host\n"
-            )
+            override["services"][service_name] = service
 
-        # Upload override
-        import os
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as tmp_file:
-            tmp_file.write(override_content)
-            tmp_file.flush()
-            local_override_path = tmp_file.name
-
-        try:
-            self.sandbox_instance.fs.upload_file(local_override_path, override_path)
-        finally:
-            if os.path.exists(local_override_path):
-                os.unlink(local_override_path)
+        override_content = yaml.safe_dump(override, sort_keys=False)
+        self._upload_text(override_content, override_path, suffix=".yml")
 
         return override_path
 
@@ -2618,8 +3029,9 @@ class SandboxDockerManager:
         """
         Start services from docker-compose file.
 
-        Note: Automatically configures host networking for gVisor compatibility.
-        All services will use the host network - ports are directly accessible.
+        Note: Automatically configures host networking and host PID mode for gVisor
+        compatibility. All services will use the sandbox network, so ports are directly
+        accessible.
 
         Args:
             file: Path to docker-compose file (default: "docker-compose.yml")
@@ -2643,33 +3055,11 @@ class SandboxDockerManager:
             stack.stop()
             ```
         """
-        import yaml
-
         if not self._authenticated:
             self._auto_login()
 
         override_path = self._create_compose_override(file, cwd)
-
-        # Parse service names for the DockerComposeStack object
-        compose_file_path = file if file.startswith("/") else f"{cwd or '.'}/{file}"
-        service_names = []
-        try:
-            import os
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(mode="w+", suffix=".yml", delete=False) as tmp_file:
-                local_compose_path = tmp_file.name
-            try:
-                self.sandbox_instance.fs.download_file(compose_file_path, local_compose_path)
-                with open(local_compose_path, "r") as f:
-                    compose_data = yaml.safe_load(f.read())
-                    if compose_data and "services" in compose_data:
-                        service_names = list(compose_data["services"].keys())
-            finally:
-                if os.path.exists(local_compose_path):
-                    os.unlink(local_compose_path)
-        except Exception:
-            pass
+        service_names, _ = self._read_compose_services(file, cwd)
 
         cmd = ["docker-compose", "-f", file, "-f", override_path, "up"]
         if detach:
@@ -2822,5 +3212,1059 @@ class SandboxDockerManager:
         cmd = ["docker", "volume", "ls"]
         if quiet:
             cmd.append("-q")
-        output = self._run(*cmd)
+        output = self._run(*cmd).stdout
         return output.split("\n") if quiet and output else output
+
+    @property
+    def aio(self) -> "AsyncSandboxDockerManager":
+        """
+        Get an async interface for this Docker manager.
+
+        Returns:
+            AsyncSandboxDockerManager: An async wrapper providing non-blocking methods.
+
+        Example:
+            ```python
+            result = await instance.docker.aio.build("myapp:v1", context=".")
+            async for line in result.logs():
+                print(line)
+            ```
+        """
+        if not hasattr(self, "_aio"):
+            self._aio = AsyncSandboxDockerManager(self)
+        return self._aio
+
+
+# =============================================================================
+# Async Classes
+# =============================================================================
+
+
+class AsyncSandboxProcessStream:
+    """
+    Async stream-like interface for reading process output.
+
+    This class provides an async iterator interface for reading stdout or stderr
+    from a running process.
+
+    Example:
+        ```python
+        process = await instance.aio.process.exec("echo", "Hello\nWorld")
+
+        # Read line by line asynchronously
+        async for line in process.stdout:
+            print(f"Output: {line.strip()}")
+
+        # Read all output at once
+        all_output = await process.stdout.read()
+        ```
+    """
+
+    _STOP_SENTINEL = object()
+
+    def __init__(self, sync_stream: "SandboxProcessStream"):
+        self._sync = sync_stream
+
+    def __aiter__(self):
+        """Return an async iterator for reading the stream line by line."""
+        return self
+
+    def _get_next(self):
+        """Get next item, returning sentinel on StopIteration."""
+        try:
+            return self._sync.__next__()
+        except StopIteration:
+            return AsyncSandboxProcessStream._STOP_SENTINEL
+
+    async def __anext__(self):
+        """Get the next line from the stream asynchronously."""
+        result = await asyncio.to_thread(self._get_next)
+        if result is AsyncSandboxProcessStream._STOP_SENTINEL:
+            raise StopAsyncIteration
+        return result
+
+    async def read(self) -> str:
+        """Return whatever output is currently available in the stream."""
+        return await asyncio.to_thread(self._sync.read)
+
+
+class AsyncCombinedStream:
+    """
+    Async combined stream for reading both stdout and stderr.
+
+    Example:
+        ```python
+        async for line in process.logs:
+            print(line)
+        ```
+    """
+
+    _STOP_SENTINEL = object()
+
+    def __init__(self, sync_process: "SandboxProcess"):
+        self._sync_process = sync_process
+        self._sync_logs = None
+
+    def _get_sync_logs(self):
+        if self._sync_logs is None:
+            self._sync_logs = self._sync_process.logs
+        return self._sync_logs
+
+    def _get_next(self):
+        """Get next item, returning sentinel on StopIteration."""
+        try:
+            return self._get_sync_logs().__next__()
+        except StopIteration:
+            return AsyncCombinedStream._STOP_SENTINEL
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        result = await asyncio.to_thread(self._get_next)
+        if result is AsyncCombinedStream._STOP_SENTINEL:
+            raise StopAsyncIteration
+        return result
+
+    async def read(self) -> str:
+        """Read all combined output."""
+        sync_logs = self._get_sync_logs()
+        return await asyncio.to_thread(sync_logs.read)
+
+
+class AsyncSandboxProcess:
+    """
+    Async wrapper for a running process within a sandbox.
+
+    This class provides async control and monitoring capabilities for processes
+    running in the sandbox.
+
+    Example:
+        ```python
+        # Start a process
+        process = await instance.aio.process.exec("sleep", "10")
+
+        # Wait for completion asynchronously
+        exit_code = await process.wait()
+
+        # Stream output asynchronously
+        async for line in process.stdout:
+            print(line)
+        ```
+    """
+
+    def __init__(self, sync_process: "SandboxProcess"):
+        self._sync = sync_process
+
+    @property
+    def pid(self) -> int:
+        """The process ID."""
+        return self._sync.pid
+
+    @property
+    def exit_code(self) -> int:
+        """The exit code of the process (-1 if still running)."""
+        return self._sync.exit_code
+
+    @property
+    def cwd(self) -> str:
+        """The working directory."""
+        return self._sync.cwd
+
+    @property
+    def args(self) -> List[str]:
+        """The command arguments."""
+        return self._sync.args
+
+    @property
+    def env(self) -> Dict[str, str]:
+        """The environment variables."""
+        return self._sync.env
+
+    async def wait(self) -> int:
+        """
+        Wait for the process to complete asynchronously.
+
+        Returns:
+            int: The exit code of the completed process.
+
+        Example:
+            ```python
+            process = await instance.aio.process.exec("long_running_command")
+            exit_code = await process.wait()
+            if exit_code == 0:
+                print("Command completed successfully")
+            ```
+        """
+        return await asyncio.to_thread(self._sync.wait)
+
+    async def kill(self):
+        """
+        Kill the process asynchronously.
+
+        Raises:
+            SandboxProcessError: If the kill operation fails.
+        """
+        return await asyncio.to_thread(self._sync.kill)
+
+    async def status(self) -> Tuple[int, str]:
+        """
+        Get the status of the process asynchronously.
+
+        Returns:
+            Tuple[int, str]: A tuple containing (exit_code, status_string).
+        """
+        return await asyncio.to_thread(self._sync.status)
+
+    @property
+    def stdout(self) -> "AsyncSandboxProcessStream":
+        """
+        Get an async handle to the process's stdout.
+
+        Returns:
+            AsyncSandboxProcessStream: An async stream object for reading stdout.
+        """
+        # Cache to preserve buffer state across multiple accesses
+        if not hasattr(self, "_stdout_stream"):
+            self._stdout_stream = AsyncSandboxProcessStream(self._sync.stdout)
+        return self._stdout_stream
+
+    @property
+    def stderr(self) -> "AsyncSandboxProcessStream":
+        """
+        Get an async handle to the process's stderr.
+
+        Returns:
+            AsyncSandboxProcessStream: An async stream object for reading stderr.
+        """
+        # Cache to preserve buffer state across multiple accesses
+        if not hasattr(self, "_stderr_stream"):
+            self._stderr_stream = AsyncSandboxProcessStream(self._sync.stderr)
+        return self._stderr_stream
+
+    @property
+    def logs(self) -> "AsyncCombinedStream":
+        """
+        Returns an async combined stream of both stdout and stderr.
+
+        Returns:
+            AsyncCombinedStream: An async stream object that combines stdout and stderr.
+        """
+        # Cache to preserve state across multiple accesses
+        if not hasattr(self, "_logs_stream"):
+            self._logs_stream = AsyncCombinedStream(self._sync)
+        return self._logs_stream
+
+
+class AsyncSandboxProcessResponse:
+    """
+    Async response object containing the results of a completed process execution.
+
+    Attributes:
+        pid (int): The process ID of the executed command.
+        exit_code (int): The exit code of the process.
+        result (str): Combined stdout and stderr output as a string.
+    """
+
+    def __init__(self, sync_response: "SandboxProcessResponse"):
+        self.pid = sync_response.pid
+        self.exit_code = sync_response.exit_code
+        self.result = sync_response.result
+
+
+class AsyncSandboxProcessManager:
+    """
+    Async manager for executing and controlling processes within a sandbox.
+
+    This class provides an async interface for running commands and Python
+    code within the sandbox environment.
+
+    Example:
+        ```python
+        # Get the async process manager
+        pm = instance.aio.process
+
+        # Run Python code asynchronously
+        result = await pm.run_code("import sys; print(sys.version)")
+
+        # Run a shell command asynchronously
+        process = await pm.exec("ls", "-la")
+        await process.wait()
+
+        # List running processes
+        active_processes = await pm.list_processes()
+        ```
+    """
+
+    def __init__(self, sync_manager: "SandboxProcessManager"):
+        self._sync = sync_manager
+
+    async def run_code(
+        self,
+        code: str,
+        blocking: bool = True,
+        cwd: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Union["AsyncSandboxProcessResponse", "AsyncSandboxProcess"]:
+        """
+        Run Python code in the sandbox asynchronously.
+
+        Parameters:
+            code (str): The Python code to execute.
+            blocking (bool): Whether to wait for the process to complete.
+            cwd (Optional[str]): The working directory to run the code in.
+            env (Optional[Dict[str, str]]): Environment variables to set.
+
+        Returns:
+            Union[AsyncSandboxProcessResponse, AsyncSandboxProcess]:
+                - AsyncSandboxProcessResponse if blocking=True
+                - AsyncSandboxProcess if blocking=False
+        """
+        result = await asyncio.to_thread(
+            self._sync.run_code, code, blocking=blocking, cwd=cwd, env=env
+        )
+        if blocking:
+            return AsyncSandboxProcessResponse(result)
+        return AsyncSandboxProcess(result)
+
+    async def exec(
+        self,
+        *args,
+        cwd: Optional[str] = "/workspace",
+        env: Optional[Dict[str, str]] = None,
+    ) -> "AsyncSandboxProcess":
+        """
+        Run an arbitrary command in the sandbox asynchronously.
+
+        Parameters:
+            *args: The command and its arguments to execute.
+            cwd (Optional[str]): The working directory to run the command in.
+            env (Optional[Dict[str, str]]): Environment variables to set.
+
+        Returns:
+            AsyncSandboxProcess: An async process object.
+
+        Example:
+            ```python
+            process = await pm.exec("ls", "-la")
+            await process.wait()
+            output = await process.stdout.read()
+            ```
+        """
+        sync_process = await asyncio.to_thread(self._sync.exec, *args, cwd=cwd, env=env)
+        return AsyncSandboxProcess(sync_process)
+
+    async def list_processes(self) -> Dict[int, "AsyncSandboxProcess"]:
+        """
+        List all processes running in the sandbox asynchronously.
+
+        Returns:
+            Dict[int, AsyncSandboxProcess]: Dictionary of async process objects, indexed by PID.
+        """
+        sync_processes = await asyncio.to_thread(self._sync.list_processes)
+        return {pid: AsyncSandboxProcess(proc) for pid, proc in sync_processes.items()}
+
+    async def get_process(self, pid: int) -> "AsyncSandboxProcess":
+        """
+        Get a process by its PID asynchronously.
+
+        Parameters:
+            pid (int): The process ID to look up.
+
+        Returns:
+            AsyncSandboxProcess: The async process object for the given PID.
+
+        Raises:
+            SandboxProcessError: If the process is not found.
+        """
+        sync_process = await asyncio.to_thread(self._sync.get_process, pid)
+        return AsyncSandboxProcess(sync_process)
+
+
+class AsyncSandboxFileSystem:
+    """
+    Async file system interface for managing files within a sandbox.
+
+    This class provides an async API for file operations within the sandbox,
+    including uploading, downloading, listing, and managing files and directories.
+
+    Example:
+        ```python
+        fs = instance.aio.fs
+
+        # Upload a file asynchronously
+        await fs.upload_file("local_file.txt", "/remote_file.txt")
+
+        # List files asynchronously
+        files = await fs.list_files("/")
+        for file_info in files:
+            print(f"{file_info.name}: {file_info.size} bytes")
+
+        # Download a file asynchronously
+        await fs.download_file("/remote_file.txt", "downloaded_file.txt")
+        ```
+    """
+
+    def __init__(self, sync_fs: "SandboxFileSystem"):
+        self._sync = sync_fs
+
+    async def upload_file(self, local_path: str, sandbox_path: str):
+        """
+        Upload a local file to the sandbox asynchronously.
+
+        Parameters:
+            local_path (str): The path to the local file to upload.
+            sandbox_path (str): The destination path within the sandbox.
+
+        Raises:
+            SandboxFileSystemError: If the upload fails.
+        """
+        return await asyncio.to_thread(self._sync.upload_file, local_path, sandbox_path)
+
+    async def write_bytes(self, sandbox_path: str, data: bytes, mode: int = 644):
+        """
+        Write bytes to a sandbox file asynchronously.
+        """
+        return await asyncio.to_thread(self._sync.write_bytes, sandbox_path, data, mode)
+
+    async def write_text(
+        self, sandbox_path: str, text: str, encoding: str = "utf-8", mode: int = 644
+    ):
+        """
+        Write text to a sandbox file asynchronously.
+        """
+        return await asyncio.to_thread(self._sync.write_text, sandbox_path, text, encoding, mode)
+
+    async def download_file(self, sandbox_path: str, local_path: str):
+        """
+        Download a file from the sandbox asynchronously.
+
+        Parameters:
+            sandbox_path (str): The path to the file within the sandbox.
+            local_path (str): The destination path on the local filesystem.
+
+        Raises:
+            SandboxFileSystemError: If the download fails.
+        """
+        return await asyncio.to_thread(self._sync.download_file, sandbox_path, local_path)
+
+    async def read_bytes(self, sandbox_path: str) -> bytes:
+        """
+        Read bytes from a sandbox file asynchronously.
+        """
+        return await asyncio.to_thread(self._sync.read_bytes, sandbox_path)
+
+    async def read_text(self, sandbox_path: str, encoding: str = "utf-8") -> str:
+        """
+        Read text from a sandbox file asynchronously.
+        """
+        return await asyncio.to_thread(self._sync.read_text, sandbox_path, encoding)
+
+    async def stat_file(self, sandbox_path: str) -> "SandboxFileInfo":
+        """
+        Get the metadata of a file in the sandbox asynchronously.
+
+        Parameters:
+            sandbox_path (str): The path to the file within the sandbox.
+
+        Returns:
+            SandboxFileInfo: Detailed information about the file.
+
+        Raises:
+            SandboxFileSystemError: If the file doesn't exist or stat fails.
+        """
+        return await asyncio.to_thread(self._sync.stat_file, sandbox_path)
+
+    async def list_files(self, sandbox_path: str) -> List["SandboxFileInfo"]:
+        """
+        List the files in a directory in the sandbox asynchronously.
+
+        Parameters:
+            sandbox_path (str): The path to the directory within the sandbox.
+
+        Returns:
+            List[SandboxFileInfo]: List of file information objects.
+
+        Raises:
+            SandboxFileSystemError: If the directory doesn't exist or listing fails.
+        """
+        return await asyncio.to_thread(self._sync.list_files, sandbox_path)
+
+    async def create_directory(self, sandbox_path: str):
+        """
+        Create a directory in the sandbox asynchronously.
+
+        Parameters:
+            sandbox_path (str): The path where the directory should be created.
+
+        Raises:
+            SandboxFileSystemError: If the directory creation fails.
+        """
+        return await asyncio.to_thread(self._sync.create_directory, sandbox_path)
+
+    async def delete_directory(self, sandbox_path: str):
+        """
+        Delete a directory in the sandbox asynchronously.
+
+        Parameters:
+            sandbox_path (str): The path of the directory to delete.
+
+        Raises:
+            SandboxFileSystemError: If the directory deletion fails.
+        """
+        return await asyncio.to_thread(self._sync.delete_directory, sandbox_path)
+
+    async def delete_file(self, sandbox_path: str):
+        """
+        Delete a file in the sandbox asynchronously.
+
+        Parameters:
+            sandbox_path (str): The path to the file within the sandbox.
+
+        Raises:
+            SandboxFileSystemError: If the file doesn't exist or deletion fails.
+        """
+        return await asyncio.to_thread(self._sync.delete_file, sandbox_path)
+
+    async def remove(self, sandbox_path: str):
+        """
+        Remove a sandbox file or directory asynchronously.
+        """
+        return await asyncio.to_thread(self._sync.remove, sandbox_path)
+
+    async def replace_in_files(self, sandbox_path: str, old_string: str, new_string: str):
+        """
+        Replace a string in all files in a directory asynchronously.
+
+        Parameters:
+            sandbox_path (str): The directory path to search in.
+            old_string (str): The string to find and replace.
+            new_string (str): The string to replace with.
+
+        Raises:
+            SandboxFileSystemError: If the operation fails.
+        """
+        return await asyncio.to_thread(
+            self._sync.replace_in_files, sandbox_path, old_string, new_string
+        )
+
+    async def find_in_files(
+        self, sandbox_path: str, pattern: str
+    ) -> List["SandboxFileSearchResult"]:
+        """
+        Search file contents in the sandbox using a regex pattern asynchronously.
+
+        Parameters:
+            sandbox_path (str): The directory path to search under.
+            pattern (str): A regular expression applied to file contents.
+
+        Returns:
+            List[SandboxFileSearchResult]: Per-file results with match ranges and text.
+
+        Raises:
+            SandboxFileSystemError: If the search fails.
+        """
+        return await asyncio.to_thread(self._sync.find_in_files, sandbox_path, pattern)
+
+
+class AsyncDockerResult:
+    """
+    Async result object for Docker operations.
+
+    Example:
+        ```python
+        result = await sandbox.aio.docker.build("myapp:v1", context=".")
+        async for line in result.logs():
+            print(line)
+        if await result.wait():
+            print("Build succeeded!")
+        ```
+    """
+
+    def __init__(self, sync_result: "DockerResult"):
+        self._sync = sync_result
+
+    async def wait(self) -> bool:
+        """Wait for operation to complete asynchronously. Returns True if successful."""
+        return await asyncio.to_thread(self._sync.wait)
+
+    async def logs(self):
+        """
+        Async generator for streaming logs line by line.
+
+        Yields log lines as they become available, providing true streaming behavior.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        sentinel = object()  # Marker for end of stream
+        loop = asyncio.get_running_loop()
+
+        def _producer():
+            """Run in thread: iterate sync generator and push to queue."""
+            try:
+                for line in self._sync.logs():
+                    loop.call_soon_threadsafe(queue.put_nowait, line)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+        # Start producer in background thread
+        producer_task = loop.run_in_executor(None, _producer)
+
+        # Consume from queue, yielding items as they arrive
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                yield item
+        finally:
+            # Ensure producer completes
+            await producer_task
+
+    @property
+    async def output(self) -> str:
+        """Get the primary output (auto-waits if needed)."""
+        return await asyncio.to_thread(lambda: self._sync.output)
+
+    @property
+    async def success(self) -> bool:
+        """Check if operation succeeded (auto-waits if needed)."""
+        return await asyncio.to_thread(lambda: self._sync.success)
+
+    @property
+    async def stdout(self) -> str:
+        """Get all stdout (auto-waits if needed)."""
+        return await asyncio.to_thread(lambda: self._sync.stdout)
+
+    @property
+    async def stderr(self) -> str:
+        """Get all stderr (auto-waits if needed)."""
+        return await asyncio.to_thread(lambda: self._sync.stderr)
+
+
+class AsyncDockerComposeStack:
+    """Async wrapper for a running Docker Compose stack."""
+
+    def __init__(self, sync_stack: "DockerComposeStack"):
+        self._sync = sync_stack
+
+    @property
+    def services(self) -> List[str]:
+        """List of service names in the stack."""
+        return self._sync.services
+
+    async def logs(
+        self, service: Optional[str] = None, follow: bool = False, tail: Optional[int] = None
+    ) -> str:
+        """Get logs from compose stack or specific service asynchronously."""
+        return await asyncio.to_thread(self._sync.logs, service, follow, tail)
+
+    async def stop(self) -> None:
+        """Stop the compose stack asynchronously."""
+        return await asyncio.to_thread(self._sync.stop)
+
+    async def ps(self) -> str:
+        """List services in the stack asynchronously."""
+        return await asyncio.to_thread(self._sync.ps)
+
+
+class AsyncSandboxDockerManager:
+    """
+    Async Docker manager for sandbox operations.
+
+    Most operations return AsyncDockerResult objects that provide:
+    - Streaming logs via async iteration
+    - Automatic waiting via await .wait()
+    - Access to output via await .output
+
+    Example:
+        ```python
+        sandbox = Sandbox(
+            docker_enabled=True,
+            image=Image().with_docker()
+        ).create()
+
+        # Build with streaming logs
+        result = await sandbox.aio.docker.build("myapp:v1", context=".")
+        async for line in result.logs():
+            print(line)
+
+        # Pull and see result
+        result = await sandbox.aio.docker.pull("nginx:latest")
+        if await result.wait():
+            print("Pull succeeded!")
+
+        # Run container
+        result = await sandbox.aio.docker.run("nginx", name="web", detach=True)
+        container_id = await result.output
+        ```
+    """
+
+    def __init__(self, sync_docker: "SandboxDockerManager"):
+        self._sync = sync_docker
+
+    # === Container Operations ===
+
+    async def run(
+        self,
+        image: str,
+        command: Optional[Union[str, List[str]]] = None,
+        name: Optional[str] = None,
+        detach: bool = False,
+        remove: bool = False,
+        volumes: Optional[Dict[str, str]] = None,
+        env: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> "AsyncDockerResult":
+        """
+        Run a Docker container asynchronously.
+
+        Args:
+            image: Docker image (e.g. "nginx:latest")
+            command: Command to run INSIDE the container
+            name: Container name
+            detach: Run in background
+            remove: Auto-remove when stopped
+            volumes: Volume mappings {"host_path": "container_path"}
+            env: Environment variables {"KEY": "value"}
+
+        Returns:
+            AsyncDockerResult: Result with container ID in .output property
+        """
+        sync_result = await asyncio.to_thread(
+            self._sync.run,
+            image,
+            command=command,
+            name=name,
+            detach=detach,
+            remove=remove,
+            volumes=volumes,
+            env=env,
+            **kwargs,
+        )
+        return AsyncDockerResult(sync_result)
+
+    async def ps(self, all: bool = False, quiet: bool = False) -> Union[List[str], str]:
+        """List containers asynchronously."""
+        return await asyncio.to_thread(self._sync.ps, all=all, quiet=quiet)
+
+    async def stop(self, container: str) -> bool:
+        """Stop a container asynchronously."""
+        return await asyncio.to_thread(self._sync.stop, container)
+
+    async def rm(self, container: str, force: bool = False) -> bool:
+        """Remove a container asynchronously."""
+        return await asyncio.to_thread(self._sync.rm, container, force=force)
+
+    async def logs(self, container: str, follow: bool = False, tail: Optional[int] = None) -> str:
+        """Get container logs asynchronously."""
+        return await asyncio.to_thread(self._sync.logs, container, follow=follow, tail=tail)
+
+    async def exec(
+        self, container: str, command: Union[str, List[str]], **kwargs
+    ) -> "AsyncSandboxProcess":
+        """Execute command in running container asynchronously."""
+        sync_process = await asyncio.to_thread(self._sync.exec, container, command, **kwargs)
+        return AsyncSandboxProcess(sync_process)
+
+    # === Image Operations ===
+
+    async def pull(self, image: str, quiet: bool = False) -> "AsyncDockerResult":
+        """Pull an image asynchronously."""
+        sync_result = await asyncio.to_thread(self._sync.pull, image, quiet=quiet)
+        return AsyncDockerResult(sync_result)
+
+    async def build(
+        self,
+        tag: str,
+        context: str = ".",
+        dockerfile: Optional[str] = None,
+        build_args: Optional[Dict[str, str]] = None,
+        no_cache: bool = False,
+        quiet: bool = False,
+    ) -> "AsyncDockerResult":
+        """Build a Docker image asynchronously."""
+        sync_result = await asyncio.to_thread(
+            self._sync.build,
+            tag,
+            context=context,
+            dockerfile=dockerfile,
+            build_args=build_args,
+            no_cache=no_cache,
+            quiet=quiet,
+        )
+        return AsyncDockerResult(sync_result)
+
+    async def images(self, quiet: bool = False) -> Union[List[str], str]:
+        """List images asynchronously."""
+        return await asyncio.to_thread(self._sync.images, quiet=quiet)
+
+    async def rmi(self, image: str, force: bool = False) -> bool:
+        """Remove an image asynchronously."""
+        return await asyncio.to_thread(self._sync.rmi, image, force=force)
+
+    async def push(self, image: str) -> bool:
+        """Push an image to registry asynchronously."""
+        return await asyncio.to_thread(self._sync.push, image)
+
+    async def tag(self, source: str, target: str) -> bool:
+        """Tag an image asynchronously."""
+        return await asyncio.to_thread(self._sync.tag, source, target)
+
+    # === Authentication ===
+
+    async def login(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        registry: Optional[str] = None,
+    ) -> bool:
+        """Login to a Docker registry asynchronously."""
+        return await asyncio.to_thread(
+            self._sync.login, username=username, password=password, registry=registry
+        )
+
+    # === Docker Compose ===
+
+    async def compose_up(
+        self,
+        file: str = "docker-compose.yml",
+        detach: bool = True,
+        build: bool = False,
+        cwd: Optional[str] = None,
+    ) -> "AsyncDockerComposeStack":
+        """Start services from docker-compose file asynchronously."""
+        sync_stack = await asyncio.to_thread(
+            self._sync.compose_up, file=file, detach=detach, build=build, cwd=cwd
+        )
+        return AsyncDockerComposeStack(sync_stack)
+
+    async def compose_down(
+        self,
+        file: str = "docker-compose.yml",
+        volumes: bool = False,
+        cwd: Optional[str] = None,
+    ) -> bool:
+        """Stop and remove compose services asynchronously."""
+        return await asyncio.to_thread(self._sync.compose_down, file=file, volumes=volumes, cwd=cwd)
+
+    async def compose_logs(
+        self,
+        file: str = "docker-compose.yml",
+        follow: bool = False,
+        cwd: Optional[str] = None,
+    ) -> "AsyncSandboxProcess":
+        """View compose service logs asynchronously."""
+        sync_process = await asyncio.to_thread(
+            self._sync.compose_logs, file=file, follow=follow, cwd=cwd
+        )
+        return AsyncSandboxProcess(sync_process)
+
+    async def compose_ps(self, file: str = "docker-compose.yml", cwd: Optional[str] = None) -> str:
+        """List compose services asynchronously."""
+        return await asyncio.to_thread(self._sync.compose_ps, file=file, cwd=cwd)
+
+    async def compose_build(
+        self,
+        file: str = "docker-compose.yml",
+        no_cache: bool = False,
+        pull: bool = False,
+        cwd: Optional[str] = None,
+    ) -> "AsyncSandboxProcess":
+        """Build or rebuild services from docker-compose file asynchronously."""
+        sync_process = await asyncio.to_thread(
+            self._sync.compose_build, file=file, no_cache=no_cache, pull=pull, cwd=cwd
+        )
+        return AsyncSandboxProcess(sync_process)
+
+    # === Volumes ===
+
+    async def volume_create(self, name: str) -> bool:
+        """Create a volume asynchronously."""
+        return await asyncio.to_thread(self._sync.volume_create, name)
+
+    async def volume_rm(self, name: str, force: bool = False) -> bool:
+        """Remove a volume asynchronously."""
+        return await asyncio.to_thread(self._sync.volume_rm, name, force=force)
+
+    async def volume_ls(self, quiet: bool = False) -> Union[List[str], str]:
+        """List volumes asynchronously."""
+        return await asyncio.to_thread(self._sync.volume_ls, quiet=quiet)
+
+
+class AsyncSandboxInstance:
+    """
+    Async wrapper for a sandbox instance.
+
+    This class provides async access to sandbox operations including
+    process management, file system operations, Docker management, and lifecycle management.
+
+    Attributes:
+        container_id (str): The unique ID of the sandbox container.
+        fs (AsyncSandboxFileSystem): Async file system interface.
+        process (AsyncSandboxProcessManager): Async process management interface.
+        docker (AsyncSandboxDockerManager): Async Docker management interface.
+
+    Example:
+        ```python
+        # Create a sandbox instance and access async interface
+        instance = sandbox.create()
+
+        # Use async file operations
+        await instance.aio.fs.upload_file("local_file.txt", "/remote_file.txt")
+
+        # Run processes asynchronously
+        result = await instance.aio.process.run_code("import os; print(os.getcwd())")
+
+        # Use Docker asynchronously
+        await instance.aio.docker.run("nginx:latest", detach=True)
+
+        # Terminate asynchronously
+        await instance.aio.terminate()
+        ```
+    """
+
+    def __init__(self, sync_instance: "SandboxInstance"):
+        self._sync = sync_instance
+        self.fs = AsyncSandboxFileSystem(sync_instance.fs)
+        self.process = AsyncSandboxProcessManager(sync_instance.process)
+        self.docker = AsyncSandboxDockerManager(sync_instance.docker)
+
+    @property
+    def container_id(self) -> str:
+        """The unique ID of the sandbox container."""
+        return self._sync.container_id
+
+    @property
+    def stub_id(self) -> str:
+        """The stub ID."""
+        return self._sync.stub_id
+
+    @property
+    def ok(self) -> bool:
+        """Whether the sandbox was created successfully."""
+        return self._sync.ok
+
+    @property
+    def error_msg(self) -> str:
+        """Error message if creation failed."""
+        return self._sync.error_msg
+
+    async def terminate(self) -> bool:
+        """
+        Terminate the container associated with this sandbox instance asynchronously.
+
+        Returns:
+            bool: True if the container was terminated successfully.
+
+        Example:
+            ```python
+            success = await instance.aio.terminate()
+            if success:
+                print("Sandbox terminated successfully")
+            ```
+        """
+        return await asyncio.to_thread(self._sync.terminate)
+
+    async def create_image_from_filesystem(self) -> str:
+        """
+        Save the current sandbox filesystem state and create an image asynchronously.
+
+        Returns:
+            str: The image ID.
+        """
+        return await asyncio.to_thread(self._sync.create_image_from_filesystem)
+
+    async def snapshot_memory(self) -> str:
+        """
+        Create a memory snapshot of the sandbox asynchronously.
+
+        Returns:
+            str: The checkpoint ID.
+        """
+        return await asyncio.to_thread(self._sync.snapshot_memory)
+
+    def sandbox_id(self) -> str:
+        """
+        Get the ID of the sandbox.
+
+        Returns:
+            str: The container ID of the sandbox.
+        """
+        return self._sync.sandbox_id()
+
+    async def status(self) -> Tuple[int, str]:
+        """
+        Get the current sandbox status asynchronously.
+        """
+        return await asyncio.to_thread(self._sync.status)
+
+    async def poll(self) -> Optional[int]:
+        """
+        Return the sandbox exit code if it has exited, otherwise None.
+        """
+        return await asyncio.to_thread(self._sync.poll)
+
+    async def wait(self, timeout: Optional[float] = None) -> int:
+        """
+        Wait for the sandbox to exit asynchronously.
+        """
+        return await asyncio.to_thread(self._sync.wait, timeout)
+
+    async def update_ttl(self, ttl: int):
+        """
+        Update the keep warm setting of the sandbox asynchronously.
+
+        Parameters:
+            ttl (int): The number of seconds to keep the sandbox alive.
+                      Use -1 for sandboxes that never timeout.
+
+        Raises:
+            SandboxProcessError: If the TTL update fails.
+        """
+        return await asyncio.to_thread(self._sync.update_ttl, ttl)
+
+    async def expose_port(self, port: int) -> str:
+        """
+        Dynamically expose a port to the internet asynchronously.
+
+        Parameters:
+            port (int): The port number to expose within the sandbox.
+
+        Returns:
+            str: The public URL for accessing the exposed port.
+
+        Raises:
+            SandboxProcessError: If port exposure fails.
+        """
+        return await asyncio.to_thread(self._sync.expose_port, port)
+
+    async def update_network_permissions(
+        self, block_network: bool = False, allow_list: Optional[List[str]] = None
+    ) -> None:
+        """
+        Dynamically update network permissions for the sandbox asynchronously.
+
+        Parameters:
+            block_network (bool): If True, blocks all outbound network access.
+            allow_list (Optional[List[str]]): List of CIDR ranges to allow.
+
+        Raises:
+            SandboxProcessError: If the network permissions update fails.
+        """
+        return await asyncio.to_thread(
+            self._sync.update_network_permissions,
+            block_network=block_network,
+            allow_list=allow_list,
+        )
+
+    async def list_urls(self) -> Dict[int, str]:
+        """
+        List all exposed URLs in the sandbox asynchronously.
+
+        Returns:
+            Dict[int, str]: A dictionary of exposed URLs, organized by port.
+
+        Raises:
+            SandboxConnectionError: If listing URLs fails.
+        """
+        return await asyncio.to_thread(self._sync.list_urls)

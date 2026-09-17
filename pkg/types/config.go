@@ -2,41 +2,45 @@ package types
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/beam-cloud/beta9/pkg/cache"
 	pb "github.com/beam-cloud/beta9/proto"
-	blobcache "github.com/beam-cloud/blobcache-v2/pkg"
-	cedana "github.com/cedana/cedana/pkg/config"
 	corev1 "k8s.io/api/core/v1"
 )
 
 type AppConfig struct {
-	ClusterName    string                    `key:"clusterName" json:"cluster_name"`
-	DebugMode      bool                      `key:"debugMode" json:"debug_mode"`
-	PrettyLogs     bool                      `key:"prettyLogs" json:"pretty_logs"`
-	Database       DatabaseConfig            `key:"database" json:"database"`
-	GatewayService GatewayServiceConfig      `key:"gateway" json:"gateway_service"`
-	FileService    FileServiceConfig         `key:"fileService" json:"file_service"`
-	ImageService   ImageServiceConfig        `key:"imageService" json:"image_service"`
-	Storage        StorageConfig             `key:"storage" json:"storage"`
-	Worker         WorkerConfig              `key:"worker" json:"worker"`
-	Providers      ProviderConfig            `key:"providers" json:"providers"`
-	Tailscale      TailscaleConfig           `key:"tailscale" json:"tailscale"`
-	Proxy          ProxyConfig               `key:"proxy" json:"proxy"`
-	Monitoring     MonitoringConfig          `key:"monitoring" json:"monitoring"`
-	Abstractions   AbstractionConfig         `key:"abstractions" json:"abstractions"`
-	BlobCache      blobcache.BlobCacheConfig `key:"blobcache" json:"blobcache"`
-	Agent          AgentConfig               `key:"agent" json:"agent"`
+	ClusterName    string               `key:"clusterName" json:"cluster_name"`
+	DebugMode      bool                 `key:"debugMode" json:"debug_mode"`
+	PrettyLogs     bool                 `key:"prettyLogs" json:"pretty_logs"`
+	Database       DatabaseConfig       `key:"database" json:"database"`
+	Events         EventsConfig         `key:"events" json:"events"`
+	GatewayService GatewayServiceConfig `key:"gateway" json:"gateway_service"`
+	FileService    FileServiceConfig    `key:"fileService" json:"file_service"`
+	ImageService   ImageServiceConfig   `key:"imageService" json:"image_service"`
+	Storage        StorageConfig        `key:"storage" json:"storage"`
+	Worker         WorkerConfig         `key:"worker" json:"worker"`
+	Scheduling     SchedulingConfig     `key:"scheduling" json:"scheduling"`
+	Providers      ProviderConfig       `key:"providers" json:"providers"`
+	Tailscale      TailscaleConfig      `key:"tailscale" json:"tailscale"`
+	Proxy          ProxyConfig          `key:"proxy" json:"proxy"`
+	Monitoring     MonitoringConfig     `key:"monitoring" json:"monitoring"`
+	ManagedCompute ManagedComputeConfig `key:"managedCompute" json:"managed_compute"`
+	Abstractions   AbstractionConfig    `key:"abstractions" json:"abstractions"`
+	Cache          cache.Config         `key:"cache" json:"cache"`
+	Agent          AgentConfig          `key:"agent" json:"agent"`
 }
 
 type DatabaseConfig struct {
 	Redis    RedisConfig    `key:"redis" json:"redis"`
 	Postgres PostgresConfig `key:"postgres" json:"postgres"`
+	S2       S2Config       `key:"s2" json:"s2"`
 }
 
 type RedisMode string
 
-var (
+const (
 	RedisModeSingle  RedisMode = "single"
 	RedisModeCluster RedisMode = "cluster"
 )
@@ -47,7 +51,6 @@ type RedisConfig struct {
 	ClientName         string        `key:"clientName" json:"client_name"`
 	EnableTLS          bool          `key:"enableTLS" json:"enable_tls"`
 	InsecureSkipVerify bool          `key:"insecureSkipVerify" json:"insecure_skip_verify"`
-	ExternalPort       int           `key:"externalPort" json:"external_port"` // Port for external workers via Tailscale (default: 6379)
 	MinIdleConns       int           `key:"minIdleConns" json:"min_idle_conns"`
 	MaxIdleConns       int           `key:"maxIdleConns" json:"max_idle_conns"`
 	ConnMaxIdleTime    time.Duration `key:"connMaxIdleTime" json:"conn_max_idle_time"`
@@ -72,6 +75,28 @@ type PostgresConfig struct {
 	TimeZone      string `key:"timezone" json:"timezone"`
 	EnableTLS     bool   `key:"enableTLS" json:"enable_tls"`
 	EncryptionKey string `key:"encryptionKey" json:"encryption_key"`
+}
+
+type S2Config struct {
+	ApiKey            string `key:"apiKey" json:"api_key"`
+	Basin             string `key:"basin" json:"basin"`
+	StreamPrefix      string `key:"streamPrefix" json:"stream_prefix"`
+	LogApiKey         string `key:"logApiKey" json:"log_api_key"`
+	LogStreamPrefix   string `key:"logStreamPrefix" json:"log_stream_prefix"`
+	EventApiKey       string `key:"eventApiKey" json:"event_api_key"`
+	EventStreamPrefix string `key:"eventStreamPrefix" json:"event_stream_prefix"`
+}
+
+type EventsConfig struct {
+	Callbacks []EventCallbackConfig `key:"callbacks" json:"callbacks"`
+}
+
+type EventCallbackConfig struct {
+	URL        string            `key:"url" json:"url"`
+	Format     string            `key:"format" json:"format"`
+	EventTypes []string          `key:"eventTypes" json:"event_types"`
+	Headers    map[string]string `key:"headers" json:"headers"`
+	Timeout    time.Duration     `key:"timeout" json:"timeout"`
 }
 
 type GRPCConfig struct {
@@ -159,6 +184,87 @@ type GatewayServiceConfig struct {
 	HTTP            HTTPConfig    `key:"http" json:"http"`
 	ShutdownTimeout time.Duration `key:"shutdownTimeout" json:"shutdown_timeout"`
 	StubLimits      StubLimits    `key:"stubLimits" json:"stub_limits"`
+	// Applied to workspaces that have no explicit concurrency limit row.
+	// Both values must be > 0 for the default to take effect; otherwise
+	// workspaces without a row remain unlimited (legacy behavior).
+	DefaultConcurrencyLimit DefaultConcurrencyLimitConfig `key:"defaultConcurrencyLimit" json:"default_concurrency_limit"`
+	// CreditGate decides whether a workspace has prepaid credit to run
+	// serverless workloads. Independent of the concurrency limit, which is a
+	// capacity cap, not a paywall.
+	CreditGate CreditGateConfig `key:"creditGate" json:"credit_gate"`
+}
+
+type DefaultConcurrencyLimitConfig struct {
+	CPUMillicores uint32 `key:"cpuMillicores" json:"cpu_millicores"`
+	GPUCount      uint32 `key:"gpuCount" json:"gpu_count"`
+}
+
+const (
+	CreditGateModeNoop = "noop"
+	CreditGateModeHTTP = "http"
+)
+
+// CreditGateConfig configures the scheduler's prepaid-credit check.
+//
+// In "http" mode every container request (and the periodic enforcement sweep)
+// asks the billing service whether the workspace still has credit. Decisions
+// are cached in Redis for CacheTTL and reused for up to StaleTTL when billing
+// is unreachable; with no usable cached decision FailOpen decides.
+type CreditGateConfig struct {
+	Mode            string        `key:"mode" json:"mode"`
+	Endpoint        string        `key:"endpoint" json:"endpoint"`
+	AuthToken       string        `key:"authToken" json:"auth_token"`
+	Timeout         time.Duration `key:"timeout" json:"timeout"`
+	CacheTTL        time.Duration `key:"cacheTTL" json:"cache_ttl"`
+	StaleTTL        time.Duration `key:"staleTTL" json:"stale_ttl"`
+	FailOpen        *bool         `key:"failOpen" json:"fail_open"`
+	EnforceInterval time.Duration `key:"enforceInterval" json:"enforce_interval"`
+}
+
+// Enabled reports whether the gate consults billing at all: http mode with an
+// endpoint. Anything else allows everything.
+func (c CreditGateConfig) Enabled() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Mode), CreditGateModeHTTP) && strings.TrimSpace(c.Endpoint) != ""
+}
+
+// TimeoutOrDefault bounds one billing call. The check may run an off-session
+// Stripe charge (auto top-up) before answering, so it needs Stripe latency
+// headroom; a cached decision serves the next 30s either way.
+func (c CreditGateConfig) TimeoutOrDefault() time.Duration {
+	if c.Timeout <= 0 {
+		return 10 * time.Second
+	}
+	return c.Timeout
+}
+
+func (c CreditGateConfig) CacheTTLOrDefault() time.Duration {
+	if c.CacheTTL <= 0 {
+		return 30 * time.Second
+	}
+	return c.CacheTTL
+}
+
+func (c CreditGateConfig) StaleTTLOrDefault() time.Duration {
+	if c.StaleTTL <= 0 {
+		return 10 * time.Minute
+	}
+	return c.StaleTTL
+}
+
+// FailOpenOrDefault: allow when billing cannot be reached and nothing is
+// cached, unless explicitly set to false.
+func (c CreditGateConfig) FailOpenOrDefault() bool {
+	if c.FailOpen == nil {
+		return true
+	}
+	return *c.FailOpen
+}
+
+func (c CreditGateConfig) EnforceIntervalOrDefault() time.Duration {
+	if c.EnforceInterval <= 0 {
+		return time.Minute
+	}
+	return c.EnforceInterval
 }
 
 type FileServiceConfig struct {
@@ -197,6 +303,36 @@ type ImageServiceConfig struct {
 	BuildRepositoryName            string                         `key:"buildRepositoryName" json:"build_repository_name"`
 	BuildRegistryCredentials       BuildRegistryCredentialsConfig `key:"buildRegistryCredentials" json:"build_registry_credentials"`
 	BuildRegistryInsecure          bool                           `key:"buildRegistryInsecure" json:"build_registry_insecure"`
+	// LayeredBuilds publishes a build's changes as layers packed straight from
+	// the working container instead of buildah commit + push + re-index.
+	// Dockerfiles outside the supported subset still go through buildah bud.
+	LayeredBuilds bool `key:"layeredBuilds" json:"layered_builds"`
+	// BuildApt tunes apt inside the RUN steps of a layered build. The settings
+	// are bind-mounted into each step and never land in the image.
+	BuildApt BuildAptConfig `key:"buildApt" json:"build_apt"`
+	// BuildLayerCacheMaxPct bounds the persistent buildah layer store to this
+	// fraction of the filesystem it sits on; after a build, the oldest images
+	// are removed until it fits. Zero disables the bound.
+	BuildLayerCacheMaxPct float64 `key:"buildLayerCacheMaxPct" json:"build_layer_cache_max_pct"`
+}
+
+// BuildAptConfig is applied to apt during image builds whose base image has
+// apt installed. Public archives are slow or stall from some regions
+// (archive.ubuntu.com measured at ~90 KB/s from us-east-1, with apt's default
+// 120 s timeouts turning a stalled connection into a many-minute build), so a
+// build gets short timeouts with retries and, when configured, a nearby
+// mirror or caching proxy.
+type BuildAptConfig struct {
+	// Mirror replaces http://archive.ubuntu.com/ubuntu and
+	// http://security.ubuntu.com/ubuntu in the base image's sources for the
+	// duration of each RUN step, e.g. http://mirrors.edge.kernel.org/ubuntu.
+	Mirror string `key:"mirror" json:"mirror"`
+	// Proxy is set as Acquire::http::Proxy (an apt-cacher-ng, for instance).
+	Proxy string `key:"proxy" json:"proxy"`
+	// TimeoutS is Acquire::http::Timeout / Acquire::https::Timeout; 0 keeps apt's default.
+	TimeoutS int `key:"timeoutS" json:"timeout_s"`
+	// Retries is Acquire::Retries; 0 keeps apt's default.
+	Retries int `key:"retries" json:"retries"`
 }
 
 // BuildRegistryCredentialsConfig stores credentials for generating tokens for the build registry
@@ -233,11 +369,10 @@ type S3ImageRegistryConfig struct {
 }
 
 type RunnerConfig struct {
-	BaseImageName             string                 `key:"baseImageName" json:"base_image_name"`
-	BaseImageRegistry         string                 `key:"baseImageRegistry" json:"base_image_registry"`
-	ExternalBaseImageRegistry string                 `key:"externalBaseImageRegistry" json:"external_base_image_registry"` // HTTPS registry for external workers
-	Tags                      map[string]string      `key:"tags" json:"tags"`
-	PythonStandalone          PythonStandaloneConfig `key:"pythonStandalone" json:"python_standalone"`
+	BaseImageName     string                 `key:"baseImageName" json:"base_image_name"`
+	BaseImageRegistry string                 `key:"baseImageRegistry" json:"base_image_registry"`
+	Tags              map[string]string      `key:"tags" json:"tags"`
+	PythonStandalone  PythonStandaloneConfig `key:"pythonStandalone" json:"python_standalone"`
 }
 
 type PythonStandaloneConfig struct {
@@ -258,13 +393,14 @@ type StorageConfig struct {
 }
 
 type WorkspaceStorageConfig struct {
-	BaseMountPath       string `key:"baseMountPath" json:"base_mount_path"`
-	DefaultStorageMode  string `key:"defaultStorageMode" json:"default_storage_mode"`
-	DefaultBucketPrefix string `key:"defaultBucketPrefix" json:"default_bucket_prefix"`
-	DefaultAccessKey    string `key:"defaultAccessKey" json:"default_access_key"`
-	DefaultSecretKey    string `key:"defaultSecretKey" json:"default_secret_key"`
-	DefaultEndpointUrl  string `key:"defaultEndpointUrl" json:"default_endpoint_url"`
-	DefaultRegion       string `key:"defaultRegion" json:"default_region"`
+	BaseMountPath               string `key:"baseMountPath" json:"base_mount_path"`
+	DefaultStorageMode          string `key:"defaultStorageMode" json:"default_storage_mode"`
+	DefaultBucketPrefix         string `key:"defaultBucketPrefix" json:"default_bucket_prefix"`
+	DefaultAccessKey            string `key:"defaultAccessKey" json:"default_access_key"`
+	DefaultSecretKey            string `key:"defaultSecretKey" json:"default_secret_key"`
+	DefaultEndpointUrl          string `key:"defaultEndpointUrl" json:"default_endpoint_url"`
+	DefaultPresignedEndpointUrl string `key:"defaultPresignedEndpointUrl" json:"default_presigned_endpoint_url"`
+	DefaultRegion               string `key:"defaultRegion" json:"default_region"`
 
 	// Storage mode configs
 	Geese   GeeseConfig   `key:"geese" json:"geese"`
@@ -272,43 +408,51 @@ type WorkspaceStorageConfig struct {
 }
 
 type JuiceFSConfig struct {
-	RedisURI          string `key:"redisURI" json:"redis_uri"`
-	AWSS3Bucket       string `key:"awsS3Bucket" json:"aws_s3_bucket"`
-	AWSAccessKey      string `key:"awsAccessKey" json:"aws_access_key"`
-	AWSSecretKey      string `key:"awsSecretKey" json:"aws_secret_key"`
-	CacheSize         int64  `key:"cacheSize" json:"cache_size"`
-	BlockSize         int64  `key:"blockSize" json:"block_size"`
-	Prefetch          int64  `key:"prefetch" json:"prefetch"`
-	BufferSize        int64  `key:"bufferSize" json:"buffer_size"`
-	ExternalRedisPort int    `key:"externalRedisPort" json:"external_redis_port"` // Port for external workers via Tailscale (default: 6379)
-	ExternalS3Port    int    `key:"externalS3Port" json:"external_s3_port"`       // S3 port for external workers via Tailscale (default: 31566)
+	RedisURI     string `key:"redisURI" json:"redis_uri"`
+	AWSS3Bucket  string `key:"awsS3Bucket" json:"aws_s3_bucket"`
+	AWSAccessKey string `key:"awsAccessKey" json:"aws_access_key"`
+	AWSSecretKey string `key:"awsSecretKey" json:"aws_secret_key"`
+	CacheSize    int64  `key:"cacheSize" json:"cache_size"`
+	BlockSize    int64  `key:"blockSize" json:"block_size"`
+	Prefetch     int64  `key:"prefetch" json:"prefetch"`
+	BufferSize   int64  `key:"bufferSize" json:"buffer_size"`
+	// CacheDir holds the local block cache (--cache-dir); CacheSize bounds it in MiB.
+	CacheDir string `key:"cacheDir" json:"cache_dir"`
+	// Writeback acknowledges writes once they are in the local cache and
+	// uploads them in the background (--writeback). Needs a CacheDir.
+	Writeback bool `key:"writeback" json:"writeback"`
+	// MaxUploads is the number of blocks uploaded concurrently (--max-uploads, juicefs default 20).
+	MaxUploads int64 `key:"maxUploads" json:"max_uploads"`
 }
 
 type GeeseConfig struct {
-	Debug                   bool          `key:"debug" json:"debug"`                                // --debug
-	FsyncOnClose            bool          `key:"fsyncOnClose" json:"fsync_on_close"`                // --fsync-on-close
-	MountOptions            []string      `key:"mountOptions" json:"mount_options"`                 // --mount-options
-	MemoryLimit             int64         `key:"memoryLimit" json:"memory_limit"`                   // --memory-limit
-	MaxFlushers             int           `key:"maxFlushers" json:"max_flushers"`                   // --max-flushers
-	MaxParallelParts        int           `key:"maxParallelParts" json:"max_parallel_parts"`        // --max-parallel-parts
-	ReadAheadKB             int           `key:"readAheadKB" json:"read_ahead_kb"`                  // --read-ahead-kb
-	ReadAheadLargeKB        int           `key:"readAheadLargeKB" json:"read_ahead_large_kb"`       // --read-ahead-large-kb
-	ReadAheadParallelKB     int           `key:"readAheadParallelKB" json:"read_ahead_parallel_kb"` // --read-ahead-parallel-kb
-	FuseReadAheadKB         int           `key:"fuseReadAheadKB" json:"fuse_read_ahead_kb"`         // --fuse-read-ahead-kb
-	DirMode                 string        `key:"dirMode" json:"dir_mode"`                           // --dir-mode, e.g., "0777"
-	FileMode                string        `key:"fileMode" json:"file_mode"`                         // --file-mode, e.g., "0666"
-	ListType                int           `key:"listType" json:"list_type"`                         // --list-type
-	AccessKey               string        `key:"accessKey" json:"access_key"`
-	SecretKey               string        `key:"secretKey" json:"secret_key"`
-	EndpointUrl             string        `key:"endpointURL" json:"endpoint_url"` // --endpoint
-	BucketName              string        `key:"bucketName" json:"bucket_name"`
-	Region                  string        `key:"region" json:"region"`
-	DisableVolumeCaching    bool          `key:"disableVolumeCaching" json:"disable_volume_caching"`
-	StagedWriteModeEnabled  bool          `key:"stagedWriteModeEnabled" json:"staged_write_mode_enabled"`
-	StagedWritePath         string        `key:"stagedWritePath" json:"staged_write_path"`
-	StagedWriteDebounce     time.Duration `key:"stagedWriteDebounce" json:"staged_write_debounce"`
-	CacheStreamingEnabled   bool          `key:"cacheStreamingEnabled" json:"cache_streaming_enabled"`
-	CacheThroughModeEnabled bool          `key:"cacheThroughModeEnabled" json:"cache_through_mode_enabled"`
+	Debug                  bool          `key:"debug" json:"debug"`                                // --debug
+	FsyncOnClose           bool          `key:"fsyncOnClose" json:"fsync_on_close"`                // --fsync-on-close
+	MountOptions           []string      `key:"mountOptions" json:"mount_options"`                 // --mount-options
+	MemoryLimit            int64         `key:"memoryLimit" json:"memory_limit"`                   // --memory-limit
+	MaxFlushers            int           `key:"maxFlushers" json:"max_flushers"`                   // --max-flushers
+	MaxParallelParts       int           `key:"maxParallelParts" json:"max_parallel_parts"`        // --max-parallel-parts
+	PartSizeMB             int64         `key:"partSizeMB" json:"part_size_mb"`                    // multipart upload part size for the first 1000 parts (default 64)
+	HTTPTimeout            time.Duration `key:"httpTimeout" json:"http_timeout"`                   // --http-timeout
+	ReadAheadKB            int           `key:"readAheadKB" json:"read_ahead_kb"`                  // --read-ahead-kb
+	ReadAheadLargeKB       int           `key:"readAheadLargeKB" json:"read_ahead_large_kb"`       // --read-ahead-large-kb
+	ReadAheadParallelKB    int           `key:"readAheadParallelKB" json:"read_ahead_parallel_kb"` // --read-ahead-parallel-kb
+	FuseReadAheadKB        int           `key:"fuseReadAheadKB" json:"fuse_read_ahead_kb"`         // --fuse-read-ahead-kb
+	DirMode                string        `key:"dirMode" json:"dir_mode"`                           // --dir-mode, e.g., "0777"
+	FileMode               string        `key:"fileMode" json:"file_mode"`                         // --file-mode, e.g., "0666"
+	ListType               int           `key:"listType" json:"list_type"`                         // --list-type
+	AccessKey              string        `key:"accessKey" json:"access_key"`
+	SecretKey              string        `key:"secretKey" json:"secret_key"`
+	EndpointUrl            string        `key:"endpointURL" json:"endpoint_url"` // --endpoint
+	BucketName             string        `key:"bucketName" json:"bucket_name"`
+	Region                 string        `key:"region" json:"region"`
+	DisableVolumeCaching   bool          `key:"disableVolumeCaching" json:"disable_volume_caching"`
+	StagedWriteModeEnabled bool          `key:"stagedWriteModeEnabled" json:"staged_write_mode_enabled"`
+	StagedWritePath        string        `key:"stagedWritePath" json:"staged_write_path"`
+	StagedWriteDebounce    time.Duration `key:"stagedWriteDebounce" json:"staged_write_debounce"`
+	CacheStreamingEnabled  bool          `key:"cacheStreamingEnabled" json:"cache_streaming_enabled"`
+	CacheDirectIO          bool          `key:"cacheDirectIO" json:"cache_direct_io"`
+	CacheThroughEnabled    bool          `key:"cacheThroughEnabled" json:"cache_through_enabled"`
 }
 
 type AlluxioConfig struct {
@@ -338,6 +482,16 @@ type MountPointConfig struct {
 	ForcePathStyle bool   `json:"force_path_style"`
 }
 
+func (m MountPointConfig) WithoutCredentials() MountPointConfig {
+	m.AccessKey = ""
+	m.SecretKey = ""
+	return m
+}
+
+func MountPointCredentialKey(mountPath, bucketName string) string {
+	return mountPath + "\x00" + bucketName
+}
+
 func (m *MountPointConfig) ToProto() *pb.MountPointConfig {
 	return &pb.MountPointConfig{
 		BucketName:     m.BucketName,
@@ -362,6 +516,17 @@ func NewMountPointConfigFromProto(in *pb.MountPointConfig) *MountPointConfig {
 	}
 }
 
+// JobResourceOverheadConfig is extra CPU/memory added to the worker pod's
+// requests and limits on top of the capacity the scheduler hands out to
+// containers. When jobResourcesEnforced is on, the pod limit is otherwise
+// exactly the schedulable capacity, so a fully packed worker leaves nothing
+// for the worker process itself (FUSE image/volume servers, log shipping,
+// runtime) and container I/O gets throttled with the containers.
+type JobResourceOverheadConfig struct {
+	CPU    string `key:"cpu" json:"cpu"`
+	Memory string `key:"memory" json:"memory"`
+}
+
 type WorkerConfig struct {
 	Pools                        map[string]WorkerPoolConfig   `key:"pools" json:"pools"`
 	HostNetwork                  bool                          `key:"hostNetwork" json:"host_network"`
@@ -370,12 +535,11 @@ type WorkerConfig struct {
 	ImageTag                     string                        `key:"imageTag" json:"image_tag"`
 	ImageName                    string                        `key:"imageName" json:"image_name"`
 	ImageRegistry                string                        `key:"imageRegistry" json:"image_registry"`
-	ExternalRegistryPort         int                           `key:"externalRegistryPort" json:"external_registry_port"`
-	ExternalImageRegistry        string                        `key:"externalImageRegistry" json:"external_image_registry"` // HTTPS registry URL for external workers (e.g., registry.agentosaurus.com)
 	ImagePullSecrets             []string                      `key:"imagePullSecrets" json:"image_pull_secrets"`
 	Namespace                    string                        `key:"namespace" json:"namespace"`
 	ServiceAccountName           string                        `key:"serviceAccountName" json:"service_account_name"`
 	JobResourcesEnforced         bool                          `key:"jobResourcesEnforced" json:"job_resources_enforced"`
+	JobResourceOverhead          JobResourceOverheadConfig     `key:"jobResourceOverhead" json:"job_resource_overhead"`
 	ContainerResourceLimits      ContainerResourceLimitsConfig `key:"containerResourceLimits" json:"container_resource_limits"`
 	DefaultWorkerCPURequest      int64                         `key:"defaultWorkerCPURequest" json:"default_worker_cpu_request"`
 	DefaultWorkerMemoryRequest   int64                         `key:"defaultWorkerMemoryRequest" json:"default_worker_memory_request"`
@@ -383,60 +547,272 @@ type WorkerConfig struct {
 	CleanupWorkerInterval        time.Duration                 `key:"cleanupWorkerInterval" json:"cleanup_worker_interval"`
 	CleanupPendingWorkerAgeLimit time.Duration                 `key:"cleanupPendingWorkerAgeLimit" json:"cleanup_pending_worker_age_limit"`
 	TerminationGracePeriod       int64                         `key:"terminationGracePeriod"`
-	BlobCacheEnabled             bool                          `key:"blobCacheEnabled" json:"blob_cache_enabled"`
+	CacheEnabled                 bool                          `key:"cacheEnabled" json:"cache_enabled"`
 	CRIU                         CRIUConfig                    `key:"criu" json:"criu"`
 	TmpSizeLimit                 string                        `key:"tmpSizeLimit" json:"tmp_size_limit"`
 	ContainerLogLinesPerHour     int                           `key:"containerLogLinesPerHour" json:"container_log_lines_per_hour"`
-	Failover                     FailoverConfig                `key:"failover" json:"failover"`
 	ContainerRuntime             string                        `key:"containerRuntime" json:"container_runtime"`
+	// HeadroomWorkerMaxAge bounds how long pool headroom alone keeps an idle
+	// worker up. Zero disables the bound.
+	HeadroomWorkerMaxAge time.Duration `key:"headroomWorkerMaxAge" json:"headroom_worker_max_age"`
+	// MaxAge bounds any non-persistent worker's lifetime, busy or idle: past it
+	// the worker disables scheduling, lets running containers finish and exits.
+	// Zero disables the bound.
+	MaxAge time.Duration `key:"maxAge" json:"max_age"`
 }
 
 type ContainerResourceLimitsConfig struct {
-	CPUEnforced    bool `key:"cpuEnforced" json:"cpu_enforced"`
-	MemoryEnforced bool `key:"memoryEnforced" json:"memory_enforced"`
+	CPUEnforced         bool `key:"cpuEnforced" json:"cpu_enforced"`
+	CPUAffinityEnforced bool `key:"cpuAffinityEnforced" json:"cpu_affinity_enforced"`
+	MemoryEnforced      bool `key:"memoryEnforced" json:"memory_enforced"`
 }
 
+type PoolMode string
+
+type WorkerPoolManagementSource string
+type WorkerPoolController string
+
+var (
+	PoolModeLocal       PoolMode = "local"
+	PoolModeExternal    PoolMode = "external"
+	PoolModePrivate     PoolMode = "private"
+	PoolModeMarketplace PoolMode = "marketplace"
+)
+
+const (
+	WorkerPoolManagementSourceConfig WorkerPoolManagementSource = "config"
+	WorkerPoolManagementSourceAPI    WorkerPoolManagementSource = "api"
+
+	WorkerPoolControllerLocal    WorkerPoolController = "local"
+	WorkerPoolControllerAgent    WorkerPoolController = "agent"
+	WorkerPoolControllerProvider WorkerPoolController = "provider"
+)
+
+// AgentHosted reports whether pools of this mode run on agent-managed
+// machines outside the cluster. Such workers hold no static credentials and
+// use gateway-brokered access for images and caches.
+func (m PoolMode) AgentHosted() bool {
+	return m == PoolModePrivate || m == PoolModeMarketplace
+}
+
+type WorkerPoolConfig struct {
+	GPUType                   string                            `key:"gpuType" json:"gpu_type"`
+	Runtime                   string                            `key:"runtime" json:"runtime"`                                 // Kubernetes RuntimeClass for pod (e.g., "nvidia")
+	ContainerRuntime          string                            `key:"containerRuntime" json:"container_runtime"`              // Pool-specific container runtime: "runc" or "gvisor"
+	ContainerRuntimeConfig    RuntimeConfig                     `key:"containerRuntimeConfig" json:"container_runtime_config"` // Pool-specific container runtime configuration
+	CPUAffinityEnforced       bool                              `key:"cpuAffinityEnforced" json:"cpu_affinity_enforced"`
+	GPUVirtualized            bool                              `key:"gpuVirtualized" json:"gpu_virtualized"`
+	ContainerStartConcurrency int                               `key:"containerStartConcurrency" json:"container_start_concurrency"`
+	NetworkPreallocation      *bool                             `key:"networkPreallocation" json:"network_preallocation"`
+	NetworkSlotPoolSize       int                               `key:"networkSlotPoolSize" json:"network_slot_pool_size"`
+	Mode                      PoolMode                          `key:"mode" json:"mode"`
+	Provider                  *MachineProvider                  `key:"provider" json:"provider"`
+	JobSpec                   WorkerPoolJobSpecConfig           `key:"jobSpec" json:"job_spec"`
+	PoolSizing                WorkerPoolJobSpecPoolSizingConfig `key:"poolSizing" json:"pool_sizing"`
+	RequiresPoolSelector      bool                              `key:"requiresPoolSelector" json:"requires_pool_selector"`
+	Priority                  int32                             `key:"priority" json:"priority"`
+	Preemptable               bool                              `key:"preemptable" json:"preemptable"`
+	UserData                  string                            `key:"userData" json:"user_data"`
+	CRIUEnabled               bool                              `key:"criuEnabled" json:"criu_enabled"`
+	TmpSizeLimit              string                            `key:"tmpSizeLimit" json:"tmp_size_limit"`
+	ConfigGroup               string                            `key:"configGroup" json:"config_group"`
+	K3sInstallDir             string                            `key:"k3sInstallDir" json:"k3s_install_dir"` // Provider/Kubernetes install path; agent-hosted pools do not run K3s.
+	StoragePath               string                            `key:"storagePath" json:"storage_path"`      // Host storage root; agent workers mount it at /data.
+	StorageMode               string                            `key:"storageMode" json:"storage_mode"`
+	ImagesPath                string                            `key:"imagesPath" json:"images_path"`              // Host path backing the worker's /images volume; agent pools fall back to the installer state dir.
+	DurableDisksPath          string                            `key:"durableDisksPath" json:"durable_disks_path"` // Host path backing durable disks; agent pools fall back to storagePath or the installer state dir.
+	Cache                     WorkerPoolCacheConfig             `key:"cache" json:"cache"`
+	HourlyCostCents           int64                             `key:"hourlyCostCents" json:"hourly_cost_cents"` // Cost of one machine in this pool, in cents per hour (e.g. 120 for $1.20/hr)
+}
+
+// AgentHosted reports whether this concrete pool uses the agent control path.
+func (c WorkerPoolConfig) AgentHosted() bool {
+	return c.Mode.AgentHosted() || (c.Mode == PoolModeExternal && (c.Provider == nil || *c.Provider == ProviderAgent))
+}
+
+type WorkerPoolCacheConfig struct {
+	Enabled *bool                     `key:"enabled" json:"enabled"`
+	Disk    WorkerPoolCacheDiskConfig `key:"disk" json:"disk"`
+}
+
+type WorkerPoolCacheDiskConfig struct {
+	Enabled      *bool   `key:"enabled" json:"enabled"`
+	HostPath     string  `key:"hostPath" json:"host_path"`
+	MountPath    string  `key:"mountPath" json:"mount_path"`
+	MaxUsagePct  float64 `key:"maxUsagePct" json:"max_usage_pct"`
+	MinFreeBytes int64   `key:"minFreeBytes" json:"min_free_bytes"`
+}
+
+type SchedulingConfig struct {
+	Failover FailoverConfig `key:"failover" json:"failover"`
+}
+
+// FailoverConfig routes container requests to alternate pools when the pools
+// matching the requested GPU have no free capacity. Capacity decides placement,
+// never a clock: a chain is a preference order, not a schedule.
 type FailoverConfig struct {
-	Enabled                bool  `key:"enabled" json:"enabled"`
+	Enabled bool `key:"enabled" json:"enabled"`
+
+	// Chains is keyed by GPU type (e.g. "A10G"). A request binds to the chain
+	// of the first GPU in its request list that has one.
+	Chains map[string]FailoverChain `key:"chains" json:"chains"`
+
+	// Health thresholds drive pool.schedulable/unschedulable events. They are
+	// observability only and are never an input to placement decisions.
+	Health FailoverHealthConfig `key:"health" json:"health"`
+
+	OnDemand OnDemandConfig `key:"onDemand" json:"on_demand"`
+}
+
+// FailoverOnDemandPoolCreator marks pools owned by the failover reconciler.
+const FailoverOnDemandPoolCreator = "scheduling.failover"
+
+// FailoverChain is the failover preference order for one GPU type. Pools
+// matching the requested GPU type are always preferred over any chain entry.
+type FailoverChain struct {
+	// Pools are tried in order once the requested GPU type lacks free capacity.
+	Pools []string `key:"pools" json:"pools"`
+
+	// OnDemand, when set, is the terminal step: real hardware is reserved only
+	// once every pool in {requested GPU pools ∪ Pools} has refused for capacity.
+	OnDemand *FailoverOnDemandStep `key:"onDemand" json:"on_demand"`
+}
+
+// FailoverOnDemandStep bounds what the control plane may reserve for a chain.
+type FailoverOnDemandStep struct {
+	GPUs      []GpuType         `key:"gpus" json:"gpus"`
+	Providers []MachineProvider `key:"providers" json:"providers"`
+	MaxNodes  int               `key:"maxNodes" json:"max_nodes"`
+}
+
+const failoverOnDemandPoolPrefix = "ondemand-"
+
+// FailoverOnDemandPoolName returns the managed pool name for a GPU chain.
+func FailoverOnDemandPoolName(gpu string) string {
+	return failoverOnDemandPoolPrefix + strings.ToLower(strings.TrimSpace(gpu))
+}
+
+type FailoverHealthConfig struct {
 	MaxPendingWorkers      int64 `key:"maxPendingWorkers" json:"max_pending_workers"`
 	MaxSchedulingLatencyMs int64 `key:"maxSchedulingLatencyMs" json:"max_scheduling_latency_ms"`
 	MinMachinesAvailable   int64 `key:"minMachinesAvailable" json:"min_machines_available"`
 }
 
-type PoolMode string
+type OnDemandConfig struct {
+	Budget             OnDemandBudgetConfig `key:"budget" json:"budget"`
+	ScaleDownAfterIdle time.Duration        `key:"scaleDownAfterIdle" json:"scale_down_after_idle"`
+}
 
-var (
-	PoolModeLocal    PoolMode = "local"
-	PoolModeExternal PoolMode = "external"
-)
+// OnDemandBudgetConfig caps platform spend on failover hardware. Operators type
+// cents; micro-dollars stay internal to the reservation wire format.
+type OnDemandBudgetConfig struct {
+	MaxHourlyCents int64 `key:"maxHourlyCents" json:"max_hourly_cents"`
+	MaxDailyCents  int64 `key:"maxDailyCents" json:"max_daily_cents"`
+}
 
-type WorkerPoolConfig struct {
-	GPUType                string                            `key:"gpuType" json:"gpu_type"`
-	Runtime                string                            `key:"runtime" json:"runtime"`                                 // Kubernetes RuntimeClass for pod (e.g., "nvidia")
-	ContainerRuntime       string                            `key:"containerRuntime" json:"container_runtime"`              // Pool-specific container runtime: "runc" or "gvisor"
-	ContainerRuntimeConfig RuntimeConfig                     `key:"containerRuntimeConfig" json:"container_runtime_config"` // Pool-specific container runtime configuration
-	Mode                   PoolMode                          `key:"mode" json:"mode"`
-	Provider               *MachineProvider                  `key:"provider" json:"provider"`
-	JobSpec                WorkerPoolJobSpecConfig           `key:"jobSpec" json:"job_spec"`
-	PoolSizing             WorkerPoolJobSpecPoolSizingConfig `key:"poolSizing" json:"pool_sizing"`
-	DefaultMachineCost     float64                           `key:"defaultMachineCost" json:"default_machine_cost"`
-	RequiresPoolSelector   bool                              `key:"requiresPoolSelector" json:"requires_pool_selector"`
-	Priority               int32                             `key:"priority" json:"priority"`
-	Preemptable            bool                              `key:"preemptable" json:"preemptable"`
-	UserData               string                            `key:"userData" json:"user_data"`
-	CRIUEnabled            bool                              `key:"criuEnabled" json:"criu_enabled"`
-	TmpSizeLimit           string                            `key:"tmpSizeLimit" json:"tmp_size_limit"`
-	ConfigGroup            string                            `key:"configGroup" json:"config_group"`
-	K3sInstallDir          string                            `key:"k3sInstallDir" json:"k3s_install_dir"`
-	StoragePath            string                            `key:"storagePath" json:"storage_path"`
-	StorageMode            string                            `key:"storageMode" json:"storage_mode"`
-	CheckpointPath         string                            `key:"checkpointPath" json:"checkpoint_path"`
+// MicrosPerCent converts between the operator-facing unit (cents) and the
+// micro-dollars used internally by reservations and offers.
+const MicrosPerCent = 10_000
+
+func CentsToMicros(cents int64) int64 { return cents * MicrosPerCent }
+
+func MicrosToCents(micros int64) int64 {
+	if micros <= 0 {
+		return 0
+	}
+	return (micros + MicrosPerCent/2) / MicrosPerCent
+}
+
+// Validate reports configuration that can never behave as an operator intends:
+// an empty chain, a pool listed twice, a chain that fails over to a pool
+// already serving the chain's own GPU type, or an on-demand step with no cap.
+//
+// A name that matches no configured pool is not an error: chains may target
+// pools created through the managed-pool API, which are absent from the config
+// file. The scheduler skips chain pools it cannot resolve.
+func (c FailoverConfig) Validate(pools map[string]WorkerPoolConfig) error {
+	if !c.Enabled {
+		return nil
+	}
+
+	if c.Health.MaxPendingWorkers < 0 || c.Health.MaxSchedulingLatencyMs < 0 || c.Health.MinMachinesAvailable < 0 {
+		return fmt.Errorf("failover health thresholds cannot be negative")
+	}
+	if c.OnDemand.Budget.MaxHourlyCents < 0 || c.OnDemand.Budget.MaxDailyCents < 0 {
+		return fmt.Errorf("failover onDemand budgets cannot be negative")
+	}
+	if c.OnDemand.ScaleDownAfterIdle < 0 {
+		return fmt.Errorf("failover onDemand scaleDownAfterIdle cannot be negative")
+	}
+
+	chainNames := map[string]string{}
+	for gpu, chain := range c.Chains {
+		normalizedGPU := strings.ToUpper(strings.TrimSpace(gpu))
+		if normalizedGPU == "" {
+			return fmt.Errorf("failover chain GPU cannot be empty")
+		}
+		if previous, duplicate := chainNames[normalizedGPU]; duplicate {
+			return fmt.Errorf("failover chains %q and %q name the same GPU", previous, gpu)
+		}
+		chainNames[normalizedGPU] = gpu
+
+		if len(chain.Pools) == 0 && chain.OnDemand == nil {
+			return fmt.Errorf("failover chain %s has no pools and no onDemand step", gpu)
+		}
+
+		seen := map[string]bool{}
+		for _, poolName := range chain.Pools {
+			if strings.TrimSpace(poolName) == "" {
+				return fmt.Errorf("failover chain %s contains an empty pool name", gpu)
+			}
+			if seen[poolName] {
+				return fmt.Errorf("failover chain %s lists pool %q twice", gpu, poolName)
+			}
+			seen[poolName] = true
+
+			if pool, ok := pools[poolName]; ok && strings.EqualFold(pool.GPUType, gpu) {
+				return fmt.Errorf("failover chain %s references pool %q, which already serves %s", gpu, poolName, gpu)
+			}
+		}
+
+		if chain.OnDemand != nil && chain.OnDemand.MaxNodes <= 0 {
+			return fmt.Errorf("failover chain %s onDemand step requires maxNodes > 0", gpu)
+		}
+		if chain.OnDemand != nil {
+			poolName := FailoverOnDemandPoolName(gpu)
+			if seen[poolName] {
+				return fmt.Errorf("failover chain %s lists managed onDemand pool %q explicitly", gpu, poolName)
+			}
+			if _, conflict := pools[poolName]; conflict {
+				return fmt.Errorf("failover chain %s onDemand pool %q conflicts with a configured worker pool", gpu, poolName)
+			}
+		}
+	}
+
+	return nil
 }
 
 type RuntimeConfig struct {
 	// gVisor-specific configuration
-	GVisorPlatform string `key:"gvisorPlatform" json:"gvisor_platform"` // "kvm" or "ptrace"
-	GVisorRoot     string `key:"gvisorRoot" json:"gvisor_root"`         // Root directory for gVisor state (default: "/run/gvisor")
+	GVisorPlatform  string   `key:"gvisorPlatform" json:"gvisor_platform"`    // "kvm", "systrap", or "ptrace"
+	GVisorRoot      string   `key:"gvisorRoot" json:"gvisor_root"`            // Root directory for gVisor state (default: "/run/gvisor")
+	GVisorExtraArgs []string `key:"gvisorExtraArgs" json:"gvisor_extra_args"` // Additional runsc flags appended for this pool
+}
+
+func (c RuntimeConfig) WithDefaults(runtime string) RuntimeConfig {
+	if runtime != ContainerRuntimeGvisor.String() {
+		return c
+	}
+	if c.GVisorPlatform == "" {
+		c.GVisorPlatform = "systrap"
+	}
+	if c.GVisorRoot == "" {
+		c.GVisorRoot = "/run/gvisor"
+	}
+	if len(c.GVisorExtraArgs) == 0 {
+		c.GVisorExtraArgs = []string{"--dcache=32768", "--overlay2=none", "--file-access=exclusive"}
+	}
+	return c
 }
 
 type WorkerPoolJobSpecConfig struct {
@@ -474,6 +850,7 @@ var (
 	ProviderCrusoe     MachineProvider = "crusoe"
 	ProviderHydra      MachineProvider = "hydra"
 	ProviderGeneric    MachineProvider = "generic"
+	ProviderAgent      MachineProvider = MachineProvider(DefaultAgentName)
 )
 
 type ProviderConfig struct {
@@ -483,28 +860,61 @@ type ProviderConfig struct {
 	Crusoe     CrusoeProviderConfig     `key:"crusoe" json:"crusoe"`
 	Hydra      HydraProviderConfig      `key:"hydra" json:"hydra"`
 	Generic    GenericProviderConfig    `key:"generic" json:"generic"`
+	Vast       VastProviderConfig       `key:"vast" json:"vast"`
+	Shadeform  ShadeformProviderConfig  `key:"shadeform" json:"shadeform"`
+	Hetzner    HetznerProviderConfig    `key:"hetzner" json:"hetzner"`
+}
+
+type VastProviderConfig struct {
+	ApiKey  string `key:"apiKey" json:"api_key"`
+	BaseURL string `key:"baseURL" json:"base_url"`
+}
+
+type ShadeformProviderConfig struct {
+	ApiKey  string `key:"apiKey" json:"api_key"`
+	BaseURL string `key:"baseURL" json:"base_url"`
+}
+
+type HetznerProviderConfig struct {
+	ApiToken             string                         `key:"apiToken" json:"api_token"`
+	BaseURL              string                         `key:"baseURL" json:"base_url"`
+	Image                string                         `key:"image" json:"image"`
+	ImageByRegion        map[string]string              `key:"imageByRegion" json:"image_by_region"`
+	SSHKeys              []string                       `key:"sshKeys" json:"ssh_keys"`
+	SSHKeysByRegion      map[string][]string            `key:"sshKeysByRegion" json:"ssh_keys_by_region"`
+	PrivateNetwork       HetznerPrivateNetworkConfig    `key:"privateNetwork" json:"private_network"`
+	ServerTypePrices     map[string]float64             `key:"serverTypePrices" json:"server_type_prices"`
+	ServerTypeCategories map[string]string              `key:"serverTypeCategories" json:"server_type_categories"`
+	RegionMetadata       map[string]HetznerRegionConfig `key:"regionMetadata" json:"region_metadata"`
+	DefaultRegions       []string                       `key:"defaultRegions" json:"default_regions"`
+}
+
+type HetznerPrivateNetworkConfig struct {
+	ID            int64             `key:"id" json:"id"`
+	Name          string            `key:"name" json:"name"`
+	RegionIDs     map[string]int64  `key:"regionIds" json:"region_ids"`
+	RegionNames   map[string]string `key:"regionNames" json:"region_names"`
+	RequireSubnet *bool             `key:"requireSubnet" json:"require_subnet"`
+}
+
+type HetznerRegionConfig struct {
+	DisplayName string  `key:"displayName" json:"display_name"`
+	Latitude    float64 `key:"latitude" json:"latitude"`
+	Longitude   float64 `key:"longitude" json:"longitude"`
 }
 
 type AgentConfig struct {
-	ElasticSearch  ElasticSearchConfig `key:"elasticSearch" json:"elastic_search"`
-	VictoriaLogs   VictoriaLogsConfig  `key:"victoriaLogs" json:"victoria_logs"`
-	UpstreamURL    string              `key:"upstreamURL" json:"upstream_url"`
-	UpstreamBranch string              `key:"upstreamBranch" json:"upstream_branch"`
-	UpstreamToken  string              `key:"upstreamToken" json:"upstream_token"`
-	Configman      ConfigmanConfig     `key:"configman" json:"configman"`
+	VictoriaLogs   VictoriaLogsConfig `key:"victoriaLogs" json:"victoria_logs"`
+	UpstreamURL    string             `key:"upstreamURL" json:"upstream_url"`
+	UpstreamBranch string             `key:"upstreamBranch" json:"upstream_branch"`
+	UpstreamToken  string             `key:"upstreamToken" json:"upstream_token"`
+	Configman      ConfigmanConfig    `key:"configman" json:"configman"`
 }
 
 type ConfigmanConfig struct {
 	ControllerAddress      string `key:"controllerAddress" json:"controller_address"`
 	ControllerToken        string `key:"controllerToken" json:"controller_token"`
 	ControllerDefaultGroup string `key:"controllerDefaultGroup" json:"controller_default_group"`
-}
-
-type ElasticSearchConfig struct {
-	Host       string `key:"host" json:"host"`
-	Port       string `key:"port" json:"port"`
-	HttpUser   string `key:"httpUser" json:"http_user"`
-	HttpPasswd string `key:"httpPasswd" json:"http_passwd"`
 }
 
 type VictoriaLogsConfig struct {
@@ -553,17 +963,144 @@ type MetricsCollector string
 var (
 	MetricsCollectorPrometheus MetricsCollector = "prometheus"
 	MetricsCollectorOpenMeter  MetricsCollector = "openmeter"
+	MetricsCollectorNone       MetricsCollector = "none"
 )
 
 type MonitoringConfig struct {
 	MetricsCollector         string                  `key:"metricsCollector" json:"metrics_collector"`
 	Prometheus               PrometheusConfig        `key:"prometheus" json:"prometheus"`
 	OpenMeter                OpenMeterConfig         `key:"openmeter" json:"openmeter"`
-	FluentBit                FluentBitConfig         `key:"fluentbit" json:"fluentbit"`
 	Telemetry                TelemetryConfig         `key:"telemetry" json:"telemetry"`
 	ContainerMetricsInterval time.Duration           `key:"containerMetricsInterval" json:"container_metrics_interval"`
 	VictoriaMetrics          VictoriaMetricsConfig   `key:"victoriametrics" json:"victoriametrics"`
 	ContainerCostHookConfig  ContainerCostHookConfig `key:"containerCostHook" json:"container_cost_hook"`
+}
+
+const (
+	ManagedComputeDefaultMinimumCreditCents int64   = 2500
+	ManagedComputeDefaultBillableMarginPct  float64 = 0.10
+
+	ManagedComputeDefaultBYOCMemoryHourlyMicrosPerGB int64 = 4_500
+	ManagedComputeDefaultBYOCCPUHourlyMicrosPerVCPU  int64 = 9_500
+)
+
+type ManagedComputeConfig struct {
+	BillableMarginPct *float64                    `key:"billableMarginPct" json:"billable_margin_pct"`
+	Billing           ManagedComputeBillingConfig `key:"billing" json:"billing"`
+	BYOC              ManagedComputeBYOCConfig    `key:"byoc" json:"byoc"`
+	SSH               ManagedComputeSSHConfig     `key:"ssh" json:"ssh"`
+	// Marketplace identity of the machine this worker runs on, set by the
+	// agent in the generated worker config. Buyer usage on the worker is
+	// billed against this listing.
+	MarketplaceListingID string `key:"marketplaceListingID" json:"marketplace_listing_id"`
+	SellerWorkspaceID    string `key:"sellerWorkspaceID" json:"seller_workspace_id"`
+}
+
+type ManagedComputeSSHConfig struct {
+	Enabled bool `key:"enabled" json:"enabled"`
+}
+
+func (c ManagedComputeConfig) BillableMarginPctOrDefault() float64 {
+	if c.BillableMarginPct == nil {
+		return ManagedComputeDefaultBillableMarginPct
+	}
+	if *c.BillableMarginPct < 0 {
+		return 0
+	}
+	return *c.BillableMarginPct
+}
+
+type ManagedComputeBYOCConfig struct {
+	Pricing ManagedComputeBYOCPricingConfig `key:"pricing" json:"pricing"`
+	AWS     ManagedComputeBYOCAWSConfig     `key:"aws" json:"aws"`
+}
+
+type ManagedComputeBYOCPricingConfig struct {
+	MemoryHourlyMicrosPerGB int64 `key:"memoryHourlyMicrosPerGB" json:"memory_hourly_micros_per_gb"`
+	CPUHourlyMicrosPerVCPU  int64 `key:"cpuHourlyMicrosPerVCPU" json:"cpu_hourly_micros_per_vcpu"`
+}
+
+func (c ManagedComputeBYOCPricingConfig) MemoryHourlyMicrosPerGBOrDefault() int64 {
+	if c.MemoryHourlyMicrosPerGB > 0 {
+		return c.MemoryHourlyMicrosPerGB
+	}
+	return ManagedComputeDefaultBYOCMemoryHourlyMicrosPerGB
+}
+
+func (c ManagedComputeBYOCPricingConfig) CPUHourlyMicrosPerVCPUOrDefault() int64 {
+	if c.CPUHourlyMicrosPerVCPU > 0 {
+		return c.CPUHourlyMicrosPerVCPU
+	}
+	return ManagedComputeDefaultBYOCCPUHourlyMicrosPerVCPU
+}
+
+type ManagedComputeBYOCAWSConfig struct {
+	TemplateURL             string `key:"templateUrl" json:"template_url"`
+	ControlRolePrincipalARN string `key:"controlRolePrincipalArn" json:"control_role_principal_arn"`
+}
+
+type ManagedComputeBillingConfig struct {
+	Mode               string                                 `key:"mode" json:"mode"`
+	Endpoint           string                                 `key:"endpoint" json:"endpoint"`
+	AuthToken          string                                 `key:"authToken" json:"auth_token"`
+	PoolRoutes         []ManagedComputeBillingPoolRouteConfig `key:"poolRoutes" json:"pool_routes"`
+	Required           bool                                   `key:"required" json:"required"`
+	Timeout            time.Duration                          `key:"timeout" json:"timeout"`
+	ReconcileInterval  time.Duration                          `key:"reconcileInterval" json:"reconcile_interval"`
+	MinimumCreditCents int64                                  `key:"minimumCreditCents" json:"minimum_credit_cents"`
+	// FailureGracePeriod is how long balance checks may fail before managed
+	// reservations are terminated.
+	FailureGracePeriod time.Duration `key:"failureGracePeriod" json:"failure_grace_period"`
+}
+
+type ManagedComputeBillingPoolRouteConfig struct {
+	PoolNamePrefix     string `key:"poolNamePrefix" json:"pool_name_prefix"`
+	Endpoint           string `key:"endpoint" json:"endpoint"`
+	AuthToken          string `key:"authToken" json:"auth_token"`
+	MinimumCreditCents int64  `key:"minimumCreditCents" json:"minimum_credit_cents"`
+}
+
+func (r ManagedComputeBillingPoolRouteConfig) BillingConfig(base ManagedComputeBillingConfig) ManagedComputeBillingConfig {
+	base.PoolRoutes = nil
+	if endpoint := strings.TrimSpace(r.Endpoint); endpoint != "" {
+		base.Endpoint = endpoint
+		base.Mode = ""
+	}
+	if strings.TrimSpace(r.AuthToken) != "" {
+		base.AuthToken = r.AuthToken
+	}
+	if r.MinimumCreditCents > 0 {
+		base.MinimumCreditCents = r.MinimumCreditCents
+	}
+	return base
+}
+
+func (c ManagedComputeBillingConfig) MinimumCreditCentsOrDefault() int64 {
+	if c.MinimumCreditCents > 0 {
+		return c.MinimumCreditCents
+	}
+	return ManagedComputeDefaultMinimumCreditCents
+}
+
+func (c ManagedComputeBillingConfig) FailureGracePeriodOrDefault() time.Duration {
+	if c.FailureGracePeriod > 0 {
+		return c.FailureGracePeriod
+	}
+	return 10 * time.Minute
+}
+
+func (c ManagedComputeBillingConfig) TimeoutOrDefault() time.Duration {
+	if c.Timeout > 0 {
+		return c.Timeout
+	}
+	return 5 * time.Second
+}
+
+func (c ManagedComputeBillingConfig) ReconcileIntervalOrDefault() time.Duration {
+	if c.ReconcileInterval > 0 {
+		return c.ReconcileInterval
+	}
+	return time.Minute
 }
 
 type VictoriaMetricsConfig struct {
@@ -597,13 +1134,13 @@ type OpenMeterConfig struct {
 }
 
 type TailscaleConfig struct {
-	ControlURL      string `key:"controlUrl" json:"control_url"`
-	User            string `key:"user" json:"user"`
-	AuthKey         string `key:"authKey" json:"auth_key"`
-	HostName        string `key:"hostName" json:"host_name"`
-	Enabled         bool   `key:"enabled" json:"enabled"`
-	Debug           bool   `key:"debug" json:"debug"`
-	DirectRedisHost string `key:"directRedisHost" json:"direct_redis_host"` // Skip Tailscale resolution, use this IP directly for Redis connections
+	ControlURL   string `key:"controlUrl" json:"control_url"`
+	User         string `key:"user" json:"user"`
+	AuthKey      string `key:"authKey" json:"auth_key"`
+	AgentAuthKey string `key:"agentAuthKey" json:"agent_auth_key"`
+	HostName     string `key:"hostName" json:"host_name"`
+	Enabled      bool   `key:"enabled" json:"enabled"`
+	Debug        bool   `key:"debug" json:"debug"`
 }
 
 type ProxyConfig struct {
@@ -617,15 +1154,6 @@ type InternalService struct {
 	Destination string `key:"destination" json:"destination"`
 }
 
-type FluentBitConfig struct {
-	Events FluentBitEventConfig `key:"events" json:"events"`
-}
-
-type FluentBitEventMapping struct {
-	Name string `key:"name" json:"name"`
-	Tag  string `key:"tag" json:"tag"`
-}
-
 type ObjectStoreConfig struct {
 	BucketName     string `key:"bucketName" json:"bucket_name"`
 	AccessKey      string `key:"accessKey" json:"access_key"`
@@ -636,45 +1164,19 @@ type ObjectStoreConfig struct {
 	ForcePathStyle bool   `key:"forcePathStyle" json:"force_path_style"`
 }
 
-type FluentBitEventConfig struct {
-	Endpoint        string                  `key:"endpoint" json:"endpoint"`
-	MaxConns        int                     `key:"maxConns" json:"max_conns"`
-	MaxIdleConns    int                     `key:"maxIdleConns" json:"max_idle_conns"`
-	IdleConnTimeout time.Duration           `key:"idleConnTimeout" json:"idle_conn_timeout"`
-	DialTimeout     time.Duration           `key:"dialTimeout" json:"dial_timeout"`
-	KeepAlive       time.Duration           `key:"keepAlive" json:"keep_alive"`
-	Mapping         []FluentBitEventMapping `key:"mapping" json:"mapping"`
-}
-
 type CRIUConfigMode string
 
 var (
-	CRIUConfigModeCedana CRIUConfigMode = "cedana"
 	CRIUConfigModeNvidia CRIUConfigMode = "nvidia"
 )
 
 type CRIUConfig struct {
-	Mode    CRIUConfigMode          `key:"mode" json:"mode"`
-	Storage CheckpointStorageConfig `key:"storage" json:"storage"`
-	Cedana  cedana.Config           `key:"cedana" json:"cedana"`
-	Nvidia  NvidiaCRIUConfig        `key:"nvidia" json:"nvidia"`
+	Mode   CRIUConfigMode   `key:"mode" json:"mode"`
+	Nvidia NvidiaCRIUConfig `key:"nvidia" json:"nvidia"`
 }
 
 type NvidiaCRIUConfig struct {
 }
-
-type CheckpointStorageConfig struct {
-	MountPath   string            `key:"mountPath" json:"mount_path"`
-	Mode        string            `key:"mode" json:"mode"`
-	ObjectStore ObjectStoreConfig `key:"objectStore" json:"object_store"`
-}
-
-type CheckpointStorageMode string
-
-var (
-	CheckpointStorageModeLocal CheckpointStorageMode = "local"
-	CheckpointStorageModeS3    CheckpointStorageMode = "s3"
-)
 
 type AbstractionConfig struct {
 	Bot BotConfig `key:"bot" json:"bot"`
@@ -693,7 +1195,7 @@ type PodConfig struct {
 
 func (p *PodTCPConfig) GetExternalURL() string {
 	baseUrl := "http"
-	if p.CertFile != "" && p.KeyFile != "" {
+	if p.Enabled {
 		baseUrl += "s"
 	}
 	baseUrl += "://" + p.ExternalHost

@@ -1,0 +1,600 @@
+package compute
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/auth"
+	model "github.com/beam-cloud/beta9/pkg/compute"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+)
+
+func (s *Service) ListPoolOffers(ctx context.Context, in *pb.ListPoolOffersRequest) (*pb.ListPoolOffersResponse, error) {
+	pool, err := computePoolFromProto(normalizePoolConfig(in.Pool), 0, false)
+	if err != nil {
+		return &pb.ListPoolOffersResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+
+	offers, err := s.collectPoolOffers(ctx, pool)
+	if err != nil {
+		return &pb.ListPoolOffersResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+	sort.SliceStable(offers, func(i, j int) bool {
+		return offerCostForPool(offers[i], pool) < offerCostForPool(offers[j], pool)
+	})
+
+	out := make([]*pb.PoolOffer, 0, len(offers))
+	for _, offer := range offers {
+		out = append(out, poolOfferToProto(s.billableOffer(offer)))
+	}
+	return &pb.ListPoolOffersResponse{Ok: true, Offers: out}, nil
+}
+
+func (s *Service) LaunchPoolCapacity(ctx context.Context, in *pb.LaunchPoolCapacityRequest) (*pb.LaunchPoolCapacityResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+	workspaceID := computeWorkspaceID(authInfo)
+	actorTokenID := computeActorTokenID(authInfo)
+	if workspaceID == "" || actorTokenID == "" {
+		return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: "missing workspace auth"}, nil
+	}
+	config := normalizePoolConfig(in.Pool)
+	pool, err := computePoolFromProto(config, in.Nodes, true)
+	if err != nil {
+		return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+	config.Gpu = pool.GPUs
+	config.Nodes = pool.Nodes
+	if pool.Name == "" {
+		return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: "pool name is required"}, nil
+	}
+	if pool.Selector == "" {
+		pool.Selector = pool.Name
+	}
+	if err := s.validateAgentTransportConfig(config.Transport); err != nil {
+		return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+	for _, name := range []string{pool.Name, pool.Selector} {
+		if _, exists := s.appConfig.Worker.Pools[name]; exists {
+			return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: fmt.Sprintf("pool %q conflicts with a configured worker pool", name)}, nil
+		}
+	}
+
+	offers, err := s.collectPoolOffers(ctx, pool)
+	if err != nil {
+		return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+
+	// Serialize against the reconciler and release paths.
+	var response *pb.LaunchPoolCapacityResponse
+	lockErr := s.withPoolStateLock(ctx, workspaceID, pool.Name, func(lockCtx context.Context) error {
+		var err error
+		response, err = s.launchPoolCapacityLocked(lockCtx, workspaceID, actorTokenID, config, pool, offers)
+		return err
+	})
+	if lockErr != nil {
+		return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: lockErr.Error()}, nil
+	}
+	return response, nil
+}
+
+func (s *Service) launchPoolCapacityLocked(ctx context.Context, workspaceID, actorTokenID string, config *pb.PoolConfig, pool model.Pool, offers []model.Offer) (*pb.LaunchPoolCapacityResponse, error) {
+	existing, err := s.getPrivatePoolState(ctx, workspaceID, pool.Name)
+	if err != nil {
+		return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+	if existing != nil && !poolStateIsPrivate(existing) {
+		return &pb.LaunchPoolCapacityResponse{Ok: false, ErrMsg: "pool already exists in this workspace"}, nil
+	}
+	if existing != nil {
+		// Adding capacity to an existing pool must not rewrite the pool's
+		// identity. The launch request only describes the new machine(s); the
+		// region lives on the reservation, and the pool config accumulates.
+		if err := validatePoolLaunchCompatible(existing, pool); err != nil {
+			return launchPoolError("pool_gpu_mismatch", err.Error(), billingDecision{}), nil
+		}
+		config = mergePoolConfigForLaunch(existing.Config, config)
+	}
+	poolCreatedAt := time.Now()
+	if existing != nil && !existing.CreatedAt.IsZero() {
+		poolCreatedAt = existing.CreatedAt
+	}
+	reservations := []model.Reservation{}
+	if existing != nil {
+		reservations = existing.Reservations
+	}
+	providerMaxSpendMicros := s.providerBudgetMicros(pool.MaxSpendMicros)
+
+	plan := model.NewSolver().Solve(model.SolveInput{
+		Demand: model.Demand{
+			PoolName:       pool.Name,
+			Selector:       pool.Selector,
+			GPUs:           pool.GPUs,
+			Nodes:          pool.Nodes,
+			OfferID:        pool.OfferID,
+			TTL:            pool.TTL,
+			MaxSpendMicros: providerMaxSpendMicros,
+			Providers:      pool.Providers,
+			Regions:        pool.Regions,
+			MinReliability: pool.MinReliability,
+		},
+		Offers:       offers,
+		Reservations: nil,
+		Now:          time.Now(),
+	})
+	if !plan.Feasible {
+		return launchPoolError("no_compatible_capacity", plan.Reason, billingDecision{}), nil
+	}
+
+	if planRequiresManagedCreate(plan.Actions) {
+		decision, err := s.checkManagedLaunchCredit(ctx, workspaceID, pool.Name, plan, existing)
+		if err != nil {
+			return launchPoolError(launchErrorBillingUnavailable, err.Error(), decision), nil
+		}
+		if !decision.OK {
+			code := firstNonEmpty(decision.ErrorCode, launchErrorInsufficientCredit)
+			msg := firstNonEmpty(decision.Message, "not enough credits to launch managed compute")
+			return launchPoolError(code, msg, decision), nil
+		}
+	}
+
+	vendors := s.computeVendors()
+	createdReservations, code, err := s.createPlanReservations(ctx, workspaceID, plan, vendors, poolLaunchSpec{
+		poolName:       pool.Name,
+		selector:       pool.Selector,
+		ttl:            pool.TTL,
+		maxSpendMicros: providerMaxSpendMicros,
+		bootstrap: func(ctx context.Context, machineID string) (string, string, error) {
+			// Persistent: provider boot times routinely exceed any fixed TTL.
+			return s.createPersistentPrivatePoolJoinCommandForWorkspace(ctx, workspaceID, pool.Name, poolCreatedAt, machineID)
+		},
+	})
+	if err != nil {
+		err = s.compensatePoolLaunchFailure(ctx, workspaceID, pool.Name, existing, vendors, createdReservations, err)
+		return launchPoolError(code, err.Error(), billingDecision{}), nil
+	}
+	for i := range createdReservations {
+		reservation := &createdReservations[i]
+		if err := s.createMachineSSHState(ctx, workspaceID, pool.Name, reservation.MachineID, reservation); err != nil {
+			err = s.compensatePoolLaunchFailure(ctx, workspaceID, pool.Name, existing, vendors, createdReservations, err)
+			return launchPoolError("ssh_bootstrap_failed", err.Error(), billingDecision{}), nil
+		}
+	}
+	newReservations := append(append([]model.Reservation{}, reservations...), createdReservations...)
+
+	now := time.Now()
+	state := &model.PoolState{
+		Name:                 pool.Name,
+		Selector:             firstNonEmpty(config.Selector, pool.Selector),
+		Config:               config,
+		Reservations:         newReservations,
+		ReservedNodes:        activeReservationNodes(newReservations, now),
+		CommittedSpendMicros: existingCommittedSpendMicros(existing) + s.billableMicros(plan.CommittedCostMicros),
+		Status:               types.ComputePoolStatusActive,
+		Source:               model.SourceCLIReservation,
+		Mode:                 config.Mode,
+		Transport:            config.Transport,
+		Fallback:             config.Fallback,
+		Priority:             config.Priority,
+		CreatedByTokenID:     actorTokenID,
+		CreatedAt:            poolCreatedAt,
+		UpdatedAt:            now,
+		ExpiresAt:            now.Add(pool.TTL),
+	}
+	if existing != nil {
+		state.CreatedByTokenID = firstNonEmpty(existing.CreatedByTokenID, actorTokenID)
+		// Adding a machine never shortens the pool's life.
+		if existing.ExpiresAt.After(state.ExpiresAt) {
+			state.ExpiresAt = existing.ExpiresAt
+		}
+		if !existing.BillingDegradedSince.IsZero() {
+			state.BillingDegradedSince = existing.BillingDegradedSince
+		}
+	}
+	if err := s.savePrivatePoolState(ctx, workspaceID, state); err != nil {
+		err = s.compensatePoolLaunchFailure(ctx, workspaceID, pool.Name, existing, vendors, createdReservations, err)
+		return launchPoolError("store_failed", err.Error(), billingDecision{}), nil
+	}
+	if s.scheduler != nil {
+		if err := s.scheduler.EnsureAgentPool(workspaceID, state); err != nil {
+			err = s.compensatePoolLaunchFailure(ctx, workspaceID, pool.Name, existing, vendors, createdReservations, err)
+			return launchPoolError("scheduler_failed", err.Error(), billingDecision{}), nil
+		}
+	}
+	s.emitComputeEvent(types.EventComputePool, computePoolEvent(workspaceID, state, types.EventComputeActionPoolReserved, ""))
+
+	return &pb.LaunchPoolCapacityResponse{Ok: true, Pool: s.privatePoolStateToProto(state)}, nil
+}
+
+// poolLaunchSpec is the pool-shaped half of a launch: where machines land and
+// how they bootstrap. Tenant launches join a private pool; on-demand failover
+// capacity joins a control-plane managed pool. Everything else about creating
+// reservations is identical, so both paths share createPlanReservations.
+type poolLaunchSpec struct {
+	poolName       string
+	selector       string
+	ttl            time.Duration
+	maxSpendMicros int64
+	// bootstrap returns the machine's install command and registration token.
+	bootstrap func(ctx context.Context, machineID string) (command string, token string, err error)
+}
+
+const (
+	launchErrorProviderUnavailable = "provider_unavailable"
+	launchErrorBootstrapFailed     = "bootstrap_failed"
+	launchErrorProviderFailure     = "provider_failure"
+)
+
+// createPlanReservations executes a solved plan's create actions against the
+// vendors. On failure it returns the reservations created so far, so the caller
+// can release them with the rollback appropriate to its pool state.
+func (s *Service) createPlanReservations(ctx context.Context, workspaceID string, plan model.SolvePlan, vendors map[string]model.Vendor, spec poolLaunchSpec) ([]model.Reservation, string, error) {
+	created := []model.Reservation{}
+	for _, action := range plan.Actions {
+		if action.Type != model.ActionCreate {
+			continue
+		}
+		vendor := vendors[action.Offer.Provider]
+		if vendor == nil {
+			return created, launchErrorProviderUnavailable, fmt.Errorf("vendor %q is not configured", action.Offer.Provider)
+		}
+		for i := uint32(0); i < action.Count; i++ {
+			machineSeed, err := generateComputeToken()
+			if err != nil {
+				return created, launchErrorBootstrapFailed, err
+			}
+			machineID := model.ManagedMachineID(workspaceID, spec.poolName, machineSeed)
+			nodeName := model.ManagedNodeName(workspaceID, spec.poolName, machineID)
+
+			bootstrapCommand, registrationToken, err := spec.bootstrap(ctx, machineID)
+			if err != nil {
+				return created, launchErrorBootstrapFailed, err
+			}
+			reservation, err := vendor.CreateReservation(ctx, model.ReservationRequest{
+				PoolName:          spec.poolName,
+				MachineID:         machineID,
+				Name:              nodeName,
+				Selector:          spec.selector,
+				Offer:             action.Offer,
+				Count:             1,
+				TTL:               spec.ttl,
+				MaxSpendMicros:    spec.maxSpendMicros,
+				Source:            model.SourceCLIReservation,
+				RegistrationToken: registrationToken,
+				BootstrapCommand:  bootstrapCommand,
+			})
+			if err != nil {
+				_ = s.revokeComputeJoinTokenHash(ctx, hashComputeToken(registrationToken))
+				return created, launchErrorProviderFailure, err
+			}
+			if reservation == nil {
+				_ = s.revokeComputeJoinTokenHash(ctx, hashComputeToken(registrationToken))
+				return created, launchErrorProviderFailure, fmt.Errorf("vendor returned empty reservation")
+			}
+			reservation.MachineID = firstNonEmpty(reservation.MachineID, machineID)
+			reservation.Name = firstNonEmpty(reservation.Name, nodeName)
+			reservation.RegistrationTokenHash = hashComputeToken(registrationToken)
+			created = append(created, *reservation)
+		}
+	}
+	return created, "", nil
+}
+
+// releaseReservations revokes registration tokens and deletes machines at the
+// vendor, reporting whatever it could not clean up.
+func (s *Service) releaseReservations(ctx context.Context, vendors map[string]model.Vendor, reservations []model.Reservation) []string {
+	failures := []string{}
+	for _, reservation := range reservations {
+		// Rolled-back reservations must not leave live registration tokens.
+		s.revokeReservationJoinToken(ctx, &reservation)
+		vendor := vendors[reservation.Provider]
+		if vendor == nil {
+			failures = append(failures, fmt.Sprintf("vendor %q is not configured", reservation.Provider))
+			continue
+		}
+		instanceID := computeReservationInstanceID(reservation)
+		if err := vendor.DeleteReservation(ctx, instanceID); err != nil {
+			failures = append(failures, fmt.Sprintf("delete reservation %q: %v", instanceID, err))
+		}
+	}
+	return failures
+}
+
+// validatePoolLaunchCompatible rejects launches that would change the node
+// hardware profile; a pool should not mix CPU-only and GPU-attributed nodes.
+func validatePoolLaunchCompatible(existing *model.PoolState, pool model.Pool) error {
+	existingConfig := normalizePoolConfig(existing.Config)
+	if existingConfig == nil {
+		return nil
+	}
+	if existing.ReservedNodes > 0 && existingPoolIsCPUOnly(existing) && len(pool.GPUs) > 0 {
+		return fmt.Errorf("pool %q is configured for CPU-only nodes; create a separate pool for nodes with GPU attributes", existing.Name)
+	}
+	if existingPoolHasGPU(existing) && pool.Nodes > 0 && len(pool.GPUs) == 0 {
+		return fmt.Errorf("pool %q is configured for nodes with GPU attributes; create a separate pool for CPU-only nodes", existing.Name)
+	}
+	if len(existingConfig.Gpu) == 0 || len(pool.GPUs) == 0 {
+		return nil
+	}
+	for _, gpu := range pool.GPUs {
+		if !slices.Contains(existingConfig.Gpu, gpu) {
+			return fmt.Errorf("pool %q is configured for %s node attributes; create a new pool for %s", existing.Name, strings.Join(existingConfig.Gpu, ", "), gpu)
+		}
+	}
+	return nil
+}
+
+func existingPoolHasGPU(existing *model.PoolState) bool {
+	if existing == nil {
+		return false
+	}
+	config := normalizePoolConfig(existing.Config)
+	if config != nil && len(config.Gpu) > 0 {
+		return true
+	}
+	for _, reservation := range existing.Reservations {
+		if reservation.GPUCount > 0 || reservation.GPU != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func existingPoolIsCPUOnly(existing *model.PoolState) bool {
+	return existing != nil && existing.ReservedNodes > 0 && !existingPoolHasGPU(existing)
+}
+
+// mergePoolConfigForLaunch combines an add-capacity request into the existing
+// pool config: identity fields (name, gpu, transport, ...) are kept, regions
+// and providers accumulate, and the budget grows by the request's budget.
+func mergePoolConfigForLaunch(existing, request *pb.PoolConfig) *pb.PoolConfig {
+	merged := normalizePoolConfig(existing)
+	if merged == nil {
+		return request
+	}
+	if request == nil {
+		return merged
+	}
+	merged.Regions = unionStrings(merged.Regions, request.Regions)
+	merged.Providers = unionStrings(merged.Providers, request.Providers)
+	merged.MaxSpend += request.MaxSpend
+	merged.Nodes += request.Nodes
+	if merged.Ttl == "" {
+		merged.Ttl = request.Ttl
+	}
+	return merged
+}
+
+func unionStrings(a, b []string) []string {
+	out := append([]string(nil), a...)
+	for _, value := range b {
+		if !slices.Contains(out, value) {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func activeReservationNodes(reservations []model.Reservation, now time.Time) uint32 {
+	var total uint32
+	for _, reservation := range reservations {
+		if reservation.ActiveAt(now) {
+			if reservation.NodeCount > 0 {
+				total += reservation.NodeCount
+			} else {
+				total++
+			}
+		}
+	}
+	return total
+}
+
+func existingCommittedSpendMicros(state *model.PoolState) int64 {
+	if state == nil || state.CommittedSpendMicros < 0 {
+		return 0
+	}
+	return state.CommittedSpendMicros
+}
+
+func (s *Service) checkManagedLaunchCredit(ctx context.Context, workspaceID, poolName string, plan model.SolvePlan, existing *model.PoolState) (billingDecision, error) {
+	if s.billing == nil {
+		return billingDecision{}, errManagedBillingUnavailable
+	}
+	quantity := uint32(0)
+	for _, action := range plan.Actions {
+		if action.Type == model.ActionCreate {
+			quantity += action.Count
+		}
+	}
+	// Include outstanding commitments so back-to-back launches cannot each
+	// pass the same balance.
+	committedMicros := s.billableMicros(plan.CommittedCostMicros) + s.billableMicros(outstandingCommittedMicros(existing, time.Now().UTC()))
+	return s.billing.CheckLaunchCredit(ctx, billingCreditRequest{
+		WorkspaceID:               workspaceID,
+		PoolName:                  poolName,
+		RequiredCents:             s.appConfig.ManagedCompute.Billing.MinimumCreditCentsOrDefault(),
+		Quantity:                  quantity,
+		EstimatedHourlyCostMicros: s.billableMicros(managedHourlyCostMicros(plan.Actions)),
+		EstimatedCommittedMicros:  committedMicros,
+	})
+}
+
+// outstandingCommittedMicros estimates the provider cost still owed for the
+// pool's open managed reservations.
+func outstandingCommittedMicros(state *model.PoolState, now time.Time) int64 {
+	if state == nil {
+		return 0
+	}
+	var total int64
+	for i := range state.Reservations {
+		reservation := &state.Reservations[i]
+		if !reservation.Managed() || !reservation.ActiveAt(now) {
+			continue
+		}
+		if reservation.ExpiresAt.IsZero() || reservation.HourlyCostMicros <= 0 {
+			continue
+		}
+		remaining := reservation.ExpiresAt.Sub(now)
+		if remaining <= 0 {
+			continue
+		}
+		total += reservation.HourlyCostMicros * model.WholeHours(remaining)
+	}
+	return total
+}
+
+func planRequiresManagedCreate(actions []model.SolveAction) bool {
+	for _, action := range actions {
+		if action.Type == model.ActionCreate {
+			return true
+		}
+	}
+	return false
+}
+
+func managedHourlyCostMicros(actions []model.SolveAction) int64 {
+	var total int64
+	for _, action := range actions {
+		if action.Type == model.ActionCreate {
+			total += action.Offer.HourlyCostMicros * int64(action.Count)
+		}
+	}
+	return total
+}
+
+func launchPoolError(code, msg string, decision billingDecision) *pb.LaunchPoolCapacityResponse {
+	return &pb.LaunchPoolCapacityResponse{
+		Ok:             false,
+		ErrMsg:         msg,
+		ErrorCode:      code,
+		RequiredCents:  decision.RequiredCents,
+		AvailableCents: decision.AvailableCents,
+	}
+}
+
+func (s *Service) compensatePoolLaunchFailure(ctx context.Context, workspaceID, poolName string, previous *model.PoolState, vendors map[string]model.Vendor, reservations []model.Reservation, cause error) error {
+	failures := s.releaseReservations(ctx, vendors, reservations)
+	for _, reservation := range reservations {
+		if reservation.MachineID != "" && s.computeRepo != nil {
+			if err := s.computeRepo.DeleteMachineSSHState(ctx, workspaceID, poolName, reservation.MachineID); err != nil {
+				failures = append(failures, fmt.Sprintf("delete SSH state for %q: %v", reservation.MachineID, err))
+			}
+		}
+	}
+
+	if err := s.rollbackPoolState(ctx, workspaceID, poolName, previous, nil); err != nil {
+		failures = append(failures, fmt.Sprintf("restore pool state: %v", err))
+	}
+
+	if len(failures) > 0 {
+		return fmt.Errorf("%w; cleanup failed: %s", cause, strings.Join(failures, "; "))
+	}
+	return cause
+}
+
+func computeReservationInstanceID(reservation model.Reservation) string {
+	return firstNonEmpty(reservation.InstanceID, reservation.ID)
+}
+
+func (s *Service) computeVendors() map[string]model.Vendor {
+	vendors := map[string]model.Vendor{}
+	if s.appConfig.Providers.Vast.ApiKey != "" {
+		vendors["vast"] = model.NewVast(model.VastConfig{
+			APIKey:  s.appConfig.Providers.Vast.ApiKey,
+			BaseURL: s.appConfig.Providers.Vast.BaseURL,
+		})
+	}
+	if s.appConfig.Providers.Shadeform.ApiKey != "" {
+		vendors["shadeform"] = model.NewShadeform(model.ShadeformConfig{
+			APIKey:  s.appConfig.Providers.Shadeform.ApiKey,
+			BaseURL: s.appConfig.Providers.Shadeform.BaseURL,
+		})
+	}
+	if s.appConfig.Providers.Hetzner.ApiToken != "" {
+		regionMetadata := map[string]model.HetznerRegionMetadata{}
+		for region, metadata := range s.appConfig.Providers.Hetzner.RegionMetadata {
+			regionMetadata[region] = model.HetznerRegionMetadata{
+				DisplayName: metadata.DisplayName,
+				Latitude:    metadata.Latitude,
+				Longitude:   metadata.Longitude,
+			}
+		}
+		vendors["hetzner"] = model.NewHetzner(model.HetznerConfig{
+			APIToken:        s.appConfig.Providers.Hetzner.ApiToken,
+			BaseURL:         s.appConfig.Providers.Hetzner.BaseURL,
+			Image:           s.appConfig.Providers.Hetzner.Image,
+			ImageByRegion:   s.appConfig.Providers.Hetzner.ImageByRegion,
+			SSHKeys:         s.appConfig.Providers.Hetzner.SSHKeys,
+			SSHKeysByRegion: s.appConfig.Providers.Hetzner.SSHKeysByRegion,
+			PrivateNetwork: model.HetznerPrivateNetworkConfig{
+				ID:            s.appConfig.Providers.Hetzner.PrivateNetwork.ID,
+				Name:          s.appConfig.Providers.Hetzner.PrivateNetwork.Name,
+				RegionIDs:     s.appConfig.Providers.Hetzner.PrivateNetwork.RegionIDs,
+				RegionNames:   s.appConfig.Providers.Hetzner.PrivateNetwork.RegionNames,
+				RequireSubnet: s.appConfig.Providers.Hetzner.PrivateNetwork.RequireSubnet,
+			},
+			ServerTypePrices:     s.appConfig.Providers.Hetzner.ServerTypePrices,
+			ServerTypeCategories: s.appConfig.Providers.Hetzner.ServerTypeCategories,
+			RegionMetadata:       regionMetadata,
+			DefaultRegions:       s.appConfig.Providers.Hetzner.DefaultRegions,
+		})
+	}
+	return vendors
+}
+
+func (s *Service) collectPoolOffers(ctx context.Context, pool model.Pool) ([]model.Offer, error) {
+	vendors := s.computeVendors()
+	if len(vendors) == 0 {
+		return nil, fmt.Errorf("no compute vendors are configured")
+	}
+
+	request := model.OfferRequest{
+		GPUs:           pool.GPUs,
+		Nodes:          pool.Nodes,
+		OfferID:        pool.OfferID,
+		Providers:      pool.Providers,
+		Regions:        pool.Regions,
+		MinReliability: pool.MinReliability,
+	}
+	offers := []model.Offer{}
+	for _, name := range orderedComputeVendorNames(vendors, pool.Providers) {
+		vendor := vendors[name]
+		vendorOffers, err := vendor.ListOffers(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		for _, offer := range vendorOffers {
+			if pool.MatchesOffer(offer) {
+				offers = append(offers, offer)
+			}
+		}
+	}
+	return offers, nil
+}
+
+func offerCostForPool(offer model.Offer, pool model.Pool) float64 {
+	return offer.CostPerNode()
+}
+
+func orderedComputeVendorNames(vendors map[string]model.Vendor, providers []string) []string {
+	if len(providers) > 0 {
+		names := make([]string, 0, len(providers))
+		for _, provider := range providers {
+			if _, ok := vendors[provider]; ok {
+				names = append(names, provider)
+			}
+		}
+		return names
+	}
+
+	names := make([]string, 0, len(vendors))
+	for name := range vendors {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}

@@ -1,4 +1,6 @@
 import os
+import shlex
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -7,6 +9,7 @@ from .. import terminal
 from ..abstractions.base.runner import (
     POD_DEPLOYMENT_STUB_TYPE,
     POD_RUN_STUB_TYPE,
+    RUNTIME_PREPARE_FAILED_MSG,
     RunnerAbstraction,
 )
 from ..abstractions.image import Image
@@ -17,8 +20,10 @@ from ..clients.gateway import (
     DeployStubRequest,
     DeployStubResponse,
     GatewayServiceStub,
+    ListTasksRequest,
     StopContainerRequest,
     StopContainerResponse,
+    StringList,
 )
 from ..clients.pod import (
     CreatePodRequest,
@@ -28,7 +33,15 @@ from ..clients.pod import (
 from ..config import ConfigContext, get_settings
 from ..runner.common import USER_CODE_DIR
 from ..sync import FileSyncer
-from ..type import GpuType, GpuTypeAlias
+from ..type import (
+    DurableDisk,
+    GpuType,
+    GpuTypeAlias,
+    LLMConfig,
+    Pool,
+    ServingConfig,
+    TaskStatus,
+)
 from ..utils import get_init_args_kwargs
 from .base import BaseAbstraction
 
@@ -41,12 +54,16 @@ class PodInstance(BaseAbstraction):
     Attributes:
         container_id: The unique ID of the created container.
         url: The URL for accessing the container over HTTP (if ports were exposed).
+        task_id: The ID of the task tracking this run (if the run is task-tracked).
+        app_id: The ID of the app this run belongs to.
     """
 
     container_id: str
     url: str
     ok: bool = field(default=False)
     error_msg: str = field(default="")
+    task_id: str = field(default="")
+    app_id: str = field(default="")
     gateway_stub: "GatewayServiceStub" = field(init=False)
 
     def __post_init__(self):
@@ -61,6 +78,43 @@ class PodInstance(BaseAbstraction):
             StopContainerRequest(container_id=self.container_id)
         )
         return res.ok
+
+    def status(self) -> TaskStatus:
+        """Return the current status of this Pod run's task."""
+
+        if not self.task_id:
+            raise RuntimeError("Pod instance does not have a task ID")
+        response = self.gateway_stub.list_tasks(
+            ListTasksRequest(
+                filters={"id": StringList(values=[self.task_id])},
+                limit=1,
+            )
+        )
+        if not response.ok:
+            raise RuntimeError(response.err_msg or "Failed to retrieve Pod task status")
+        if not response.tasks:
+            raise RuntimeError(f"Pod task not found: {self.task_id}")
+        return TaskStatus(response.tasks[0].status.upper())
+
+    def wait(self, timeout: float = 120, poll_interval: float = 1) -> TaskStatus:
+        """Wait for this Pod run to reach a terminal task status."""
+
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be greater than zero")
+
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.status()
+            if status.is_complete():
+                return status
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Pod task {self.task_id} did not complete within {timeout:g} seconds"
+                )
+            time.sleep(min(poll_interval, remaining))
 
 
 class Pod(RunnerAbstraction, DeployableMixin):
@@ -100,7 +154,8 @@ class Pod(RunnerAbstraction, DeployableMixin):
         env (Optional[Dict[str, str]]):
             A dictionary of environment variables to be injected into the container. Default is {}.
         keep_warm_seconds (int):
-            The number of seconds to keep the container up the last request. -1 means never scale down to zero.
+            The number of seconds to keep an idle container warm. Use 0 to scale to zero as soon
+            as the container is idle, and -1 to keep it running until it exits or is stopped.
             Default is 600 seconds (10 minutes).
         authorized (bool):
             If false, allows the pod to be accessed without an auth token.
@@ -131,6 +186,7 @@ class Pod(RunnerAbstraction, DeployableMixin):
         gpu_count: int = 0,
         image: Image = Image(),
         volumes: Optional[List[Union[Volume, CloudBucket]]] = None,
+        disks: Optional[List[DurableDisk]] = None,
         secrets: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = {},
         keep_warm_seconds: int = 600,
@@ -139,6 +195,17 @@ class Pod(RunnerAbstraction, DeployableMixin):
         block_network: bool = False,
         allow_list: Optional[List[str]] = None,
         docker_enabled: bool = False,
+        pool: Optional[Union[str, Pool]] = None,
+        allow_marketplace: bool = False,
+        checkpoint_enabled: bool = False,
+        checkpoint_readiness_path: Optional[str] = None,
+        checkpoint_readiness_port: Optional[int] = None,
+        checkpoint_readiness_timeout: int = 600,
+        checkpoint_readiness_interval: int = 1,
+        app_kind: str = "",
+        serving_protocol: str = "",
+        llm: Optional[LLMConfig] = None,
+        serving: Optional[ServingConfig] = None,
     ) -> None:
         super().__init__(
             cpu=cpu,
@@ -147,6 +214,7 @@ class Pod(RunnerAbstraction, DeployableMixin):
             gpu_count=gpu_count,
             image=image,
             volumes=volumes,
+            disks=disks,
             secrets=secrets,
             env=env,
             entrypoint=entrypoint,
@@ -159,6 +227,17 @@ class Pod(RunnerAbstraction, DeployableMixin):
             app=app,
             tcp=tcp,
             docker_enabled=docker_enabled,
+            pool=pool,
+            allow_marketplace=allow_marketplace,
+            checkpoint_enabled=checkpoint_enabled,
+            checkpoint_readiness_path=checkpoint_readiness_path,
+            checkpoint_readiness_port=checkpoint_readiness_port,
+            checkpoint_readiness_timeout=checkpoint_readiness_timeout,
+            checkpoint_readiness_interval=checkpoint_readiness_interval,
+            app_kind=app_kind,
+            serving_protocol=serving_protocol,
+            llm=llm,
+            serving=serving,
         )
         self.parent = self
         self.func = None
@@ -186,7 +265,7 @@ class Pod(RunnerAbstraction, DeployableMixin):
         image.ignore_python = True
         return image
 
-    def create(self, entrypoint: List[str] = []) -> PodInstance:
+    def create(self, entrypoint: List[str] = [], machine_id: str = "") -> PodInstance:
         """
         Create a new container that will run until either it completes normally, or times out.
 
@@ -196,7 +275,7 @@ class Pod(RunnerAbstraction, DeployableMixin):
         if entrypoint:
             self.entrypoint = entrypoint
 
-        is_custom_image = self.image.base_image != "" or self.image.dockerfile != ""
+        is_custom_image = self._uses_custom_image_entrypoint()
 
         if not self.entrypoint and not is_custom_image:
             terminal.error("You must specify an entrypoint.")
@@ -206,7 +285,7 @@ class Pod(RunnerAbstraction, DeployableMixin):
             ignore_patterns = ["**"]
 
         if not is_custom_image and self.entrypoint:
-            self.entrypoint = ["sh", "-c", f"cd {USER_CODE_DIR} && {' '.join(self.entrypoint)}"]
+            self.entrypoint = self._wrap_user_code_entrypoint(self.entrypoint)
 
         if not self.prepare_runtime(
             stub_type=POD_RUN_STUB_TYPE, force_create_stub=True, ignore_patterns=ignore_patterns
@@ -215,22 +294,25 @@ class Pod(RunnerAbstraction, DeployableMixin):
                 container_id="",
                 url="",
                 ok=False,
-                error_msg="Failed to prepare runtime",
+                error_msg=RUNTIME_PREPARE_FAILED_MSG,
             )
 
         terminal.header("Creating container")
         create_response: CreatePodResponse = self.stub.create_pod(
             CreatePodRequest(
                 stub_id=self.stub_id,
+                machine_id=machine_id or None,
             )
         )
 
         url = ""
         if create_response.ok:
-            terminal.header(f"Container created successfully ===> {create_response.container_id}")
+            terminal.done(f"Container created ===> {create_response.container_id}")
 
             if self.keep_warm_seconds < 0:
                 terminal.header("This container has no timeout, it will run until it completes.")
+            elif self.keep_warm_seconds == 0:
+                terminal.header("This container will stop as soon as it is idle.")
             else:
                 terminal.header(
                     f"This container will timeout after {self.keep_warm_seconds} seconds."
@@ -244,6 +326,8 @@ class Pod(RunnerAbstraction, DeployableMixin):
             url=url,
             ok=create_response.ok,
             error_msg=create_response.error_msg,
+            task_id=create_response.task_id,
+            app_id=create_response.app_id,
         )
 
     def deploy(
@@ -251,6 +335,7 @@ class Pod(RunnerAbstraction, DeployableMixin):
         name: Optional[str] = None,
         context: Optional[ConfigContext] = None,
         invocation_details_func: Optional[Callable[..., None]] = None,
+        rollout: str = "auto",
         **invocation_details_options: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], bool]:
         """
@@ -260,6 +345,7 @@ class Pod(RunnerAbstraction, DeployableMixin):
             name (Optional[str]): The name of the pod.
             context (Optional[ConfigContext]): The context of the pod.
             invocation_details_func (Optional[Callable[..., None]]): The function to call to print invocation details.
+            rollout (str): Rollout strategy for always-on deployments.
             **invocation_details_options: The options to pass to the invocation details function.
 
         Returns:
@@ -278,8 +364,9 @@ class Pod(RunnerAbstraction, DeployableMixin):
             terminal.error(
                 "You must specify an app name (either in the decorator or via the --name argument)."
             )
+            return {}, False
 
-        is_custom_image = self.image.base_image != "" or self.image.dockerfile != ""
+        is_custom_image = self._uses_custom_image_entrypoint()
 
         if not self.entrypoint and not is_custom_image:
             terminal.error("You must specify an entrypoint.")
@@ -290,7 +377,7 @@ class Pod(RunnerAbstraction, DeployableMixin):
             ignore_patterns = ["**"]
 
         if not is_custom_image and self.entrypoint:
-            self.entrypoint = ["sh", "-c", f"cd {USER_CODE_DIR} && {' '.join(self.entrypoint)}"]
+            self.entrypoint = self._wrap_user_code_entrypoint(self.entrypoint)
 
         if context is not None:
             self.config_context = context
@@ -304,25 +391,41 @@ class Pod(RunnerAbstraction, DeployableMixin):
 
         terminal.header("Deploying")
         deploy_response: DeployStubResponse = self.gateway_stub.deploy_stub(
-            DeployStubRequest(stub_id=self.stub_id, name=self.name)
+            DeployStubRequest(stub_id=self.stub_id, name=self.name, rollout=rollout)
         )
 
         self.deployment_id = deploy_response.deployment_id
+        invoke_url = deploy_response.invoke_url
+        warn_msg = deploy_response.warn_msg if isinstance(deploy_response.warn_msg, str) else ""
+        rollout_action = (
+            deploy_response.rollout_action
+            if isinstance(deploy_response.rollout_action, str)
+            else ""
+        )
         if deploy_response.ok:
-            terminal.header("Deployed 🎉")
+            if warn_msg:
+                terminal.warn(warn_msg)
+            terminal.done("Deployed 🎉")
             if invocation_details_func:
                 invocation_details_func(
                     **invocation_details_options,
                 )
 
             elif len(self.ports) > 0:
-                self.print_invocation_snippet()
+                url_res = self.print_invocation_snippet()
+                if url_res and getattr(url_res, "ok", False):
+                    invoke_url = url_res.url.replace("<PORT>", str(self.ports[0]))
+
+        elif deploy_response.err_msg:
+            terminal.error(deploy_response.err_msg, exit=False)
 
         return {
             "deployment_id": deploy_response.deployment_id,
             "deployment_name": self.name,
-            "invoke_url": deploy_response.invoke_url,
+            "invoke_url": invoke_url,
             "version": deploy_response.version,
+            "warning": warn_msg,
+            "rollout_action": rollout_action,
         }, deploy_response.ok
 
     def generate_deployment_artifacts(self, **kwargs):
@@ -370,6 +473,15 @@ app = Pod(
         with open(f"pod-{self._id}.py", "w") as f:
             f.write(content)
 
+    def _uses_custom_image_entrypoint(self) -> bool:
+        return (
+            self.image.base_image != "" or self.image.dockerfile != "" or self.image.image_id != ""
+        )
+
+    @staticmethod
+    def _wrap_user_code_entrypoint(entrypoint: List[str]) -> List[str]:
+        return ["sh", "-c", f"cd {USER_CODE_DIR} && {shlex.join(entrypoint)}"]
+
     def cleanup_deployment_artifacts(self):
         """
         Cleans up the deployment artifacts for the pod (removes the generated python file).
@@ -379,10 +491,19 @@ app = Pod(
 
     @with_grpc_error_handling
     def shell(
-        self, url_type: str = "", sync_dir: Optional[str] = None, container_id: Optional[str] = None
+        self,
+        url_type: str = "",
+        sync_dir: Optional[str] = None,
+        container_id: Optional[str] = None,
+        machine_id: Optional[str] = None,
     ):
         self.authorized = True
-        super().shell(url_type=url_type, sync_dir=sync_dir, container_id=container_id)
+        return super().shell(
+            url_type=url_type,
+            sync_dir=sync_dir,
+            container_id=container_id,
+            machine_id=machine_id,
+        )
 
     def serve(self, **kwargs):
         terminal.error("Serve has not yet been implemented for Pods.")

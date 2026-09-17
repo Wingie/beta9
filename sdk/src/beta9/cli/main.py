@@ -2,14 +2,6 @@ import os
 
 os.environ["GRPC_VERBOSITY"] = os.getenv("GRPC_VERBOSITY") or "NONE"
 
-import sentry_sdk
-
-if os.getenv("SENTRY_DSN"):
-    sentry_sdk.init(
-        dsn=os.getenv("SENTRY_DSN"),
-        traces_sample_rate=1.0,
-    )
-
 import shutil
 from types import ModuleType
 from typing import Any, Optional
@@ -22,8 +14,10 @@ from ..config import SDKSettings, is_config_empty, set_settings
 from . import (
     config,
     container,
+    database,
     deployment,
     dev,
+    disk,
     machine,
     pool,
     run,
@@ -105,8 +99,10 @@ def load_cli(check_config=True, **kwargs: Any) -> CLI:
     cli = CLI(**kwargs)
     cli.register(task)
     cli.register(deployment)
+    cli.register(database)
     cli.register(serve)
     cli.register(volume)
+    cli.register(disk)
     cli.register(config)
     cli.register(pool)
     cli.register(container)

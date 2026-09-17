@@ -14,22 +14,75 @@ config:
   imageService:
     runner:
       baseImageRegistry: public.ecr.aws/n4e0e1y0
+  managedCompute:
+    billableMarginPct: 0.10
+    byoc:
+      pricing:
+        memoryHourlyMicrosPerGB: 4500
+        cpuHourlyMicrosPerVCPU: 9500
+      aws:
+        templateUrl: ""
+    billing:
+      mode: noop
+      endpoint: ""
+      authToken: ""
+      required: false
+      timeout: 5s
+      reconcileInterval: 1m
+      minimumCreditCents: 2500
 
 images:
   gateway:
     repository: public.ecr.aws/n4e0e1y0/beta9-gateway
     tag:        # Defaults to chart's app version
     pullPolicy: # Defaults to IfNotPresent
+  worker:
+    repository: public.ecr.aws/n4e0e1y0/beta9-worker
+    tag:        # Defaults to chart's app version
+    pullPolicy: # Defaults to IfNotPresent
+
+cacheServer:
+  enabled: false
+  configSecretName: beta9-config-helm
+  poolName: default
+  locality: default
+  serverPort: 2050
+  hostPath: /var/lib/beta9/cache
+  mountPath: /var/lib/beta9/cache
+  # Must match the host path mounted at /images on workers in this locality.
+  # Ignored when config.worker.imagePVCName is set.
+  imagesHostPath: /images
+  hostNetwork: true
+  priorityClassName:
+  image:
+    repository: # Defaults to images.worker.repository
+    tag:        # Defaults to images.worker.tag or chart app version
+    pullPolicy: # Defaults to images.worker.pullPolicy or IfNotPresent
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  securityContext:
+    privileged: true
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
 
 controllers:
   gateway:
     annotations: {}
     labels: {}
     replicas: 1
-    strategy: Recreate # Can be Recreate or RollingUpdate
+    pod:
+      # 180s gateway shutdownTimeout + 10s readiness propagation + 5s buffer.
+      terminationGracePeriodSeconds: "195"
+    strategy: RollingUpdate
     rollingUpdate:
-      unavailable:
-      surge:
+      unavailable: 1
+      surge: "0"
     initContainers:
       wait-on-backends:
         image:
@@ -138,7 +191,7 @@ juicefs-redis:
     persistence:
       size: 1Gi
 
-# -- Enables deployment of victoria-metrics, grafana, and fluent-bit
+# -- Enables deployment of victoria-metrics and grafana
 metrics:
   enabled: false
 
@@ -183,90 +236,6 @@ victoria-metrics-agent:
 victoria-metrics-single:
   server:
     fullnameOverride: victoria-metrics-single
-
-victoria-logs-single:
-  server:
-    fullnameOverride: victoria-logs-single
-
-fluent-bit:
-  nameOverride: fluent-bit
-  fullnameOverride: fluent-bit
-  image:
-    repository: docker.io/fluent/fluent-bit
-  envFrom:
-  - secretRef:
-      name: fluent-bit
-  extraPorts:
-  # -- The events server
-  - name: tcp
-    port: 9880
-    containerPort: 9880
-    protocol: TCP
-  config:
-    service: |
-      [SERVICE]
-          Flush        1
-          Log_Level    info
-          HTTP_Server  On
-          HTTP_Listen  0.0.0.0
-          HTTP_Port    2020
-    customParsers: |
-      [PARSER]
-          Name        json-parser
-          Format      json
-          Time_Key    time
-          Time_Format %Y-%m-%dT%H:%M:%SZ
-          Time_Keep   On
-    inputs: |
-      [INPUT]
-          Name             tail
-          Tag              worker-logs
-          Path             /var/log/worker/*.log
-          Parser           json-parser
-          Mem_Buf_Limit    100MB
-          Skip_Long_Lines  Off
-          Refresh_Interval 5
-      [INPUT]
-          Name   http
-          Tag    events
-          Listen 0.0.0.0
-          Port   9880
-    outputs: |
-      [OUTPUT]
-          Name  stdout
-          Match *
-      [OUTPUT]
-          Name             http
-          Match            *
-          host             ${VICTORIA_LOGS_HOST}
-          port             ${VICTORIA_LOGS_PORT}
-          uri              /insert/jsonline?_stream_fields=stream&_msg_field=log&_time_field=date
-          format           json_lines
-          json_date_format iso8601
-      [OUTPUT]
-          Name            s3
-          Match           worker-logs
-          bucket          ${AWS_S3_BUCKET_NAME}
-          endpoint        ${AWS_ENDPOINT_URL}
-          use_put_object  On
-          total_file_size 1M
-          upload_timeout  1m
-  volumeMounts:
-  - name: config
-    mountPath: /fluent-bit/etc/conf
-  daemonSetVolumes:
-  - name: varlog
-    hostPath:
-      path: /var/log
-  - name: varlibdockercontainers
-    hostPath:
-      path: /var/lib/docker/containers
-  daemonSetVolumeMounts:
-  - name: varlog
-    mountPath: /var/log
-  - name: varlibdockercontainers
-    mountPath: /var/lib/docker/containers
-    readOnly: true
 
 # -- Used to add any custom manifests
 manifests:

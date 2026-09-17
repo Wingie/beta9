@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+option go_package = "github.com/beam-cloud/beta9/proto";
+
+package cache;
+
+service Cache {
+  rpc GetContent(CacheGetContentRequest) returns (CacheGetContentResponse) {}
+  rpc HasContent(CacheHasContentRequest) returns (CacheHasContentResponse) {}
+  rpc GetContentStream(CacheGetContentRequest) returns (stream CacheGetContentResponse) {}
+  rpc StoreContent(stream CacheStoreContentRequest) returns (CacheStoreContentResponse) {}
+  rpc StoreContentFromSource(CacheStoreContentFromSourceRequest)
+      returns (CacheStoreContentFromSourceResponse) {}
+  rpc StoreContentFromSourceWithLock(CacheStoreContentFromSourceRequest)
+      returns (CacheStoreContentFromSourceWithLockResponse) {}
+  rpc GetState(CacheGetStateRequest) returns (CacheGetStateResponse) {}
+}
+
+message CacheGetContentRequest {
+  string hash = 1;  // Hash of the content to retrieve
+  int64 offset = 2; // Offset into the content
+  int64 length = 3; // Length of the content to retrieve
+}
+
+message CacheGetContentResponse {
+  bool ok = 1;
+  bytes content = 2; // Content data
+}
+
+message CacheHasContentRequest {
+  string hash = 1; // Hash of the content to check
+  int64 expected_size = 2; // Optional content size; when set, cache marker must match it
+}
+
+message CacheHasContentResponse {
+  bool ok = 1;
+  bool exists = 2;
+  string status = 3; // complete, missing, partial, size_mismatch, or incomplete
+}
+
+message CacheStoreContentRequest {
+  bytes content = 1;
+  string cache_path = 2;
+  CacheFSMetadata metadata = 3;
+}
+
+message CacheStoreContentResponse {
+  bool ok = 1;
+  string hash = 2; // Hash of the stored content
+}
+
+message CacheStoreContentFromSourceWithLockResponse {
+  string hash = 1; // Hash of the stored content
+  bool ok = 2;
+  bool failed_to_acquire_lock = 3;
+  string error_msg = 4;
+}
+
+message CacheGetStateRequest {}
+
+message CacheGetStateResponse {
+  bool ok = 1;
+  string version = 2;
+  float capacity_usage_pct = 3;
+  string private_ip_addr = 4;
+}
+
+message CacheSource {
+  string path = 1;
+  string bucket_name = 2;
+  string region = 3;
+  string endpoint_url = 4;
+  string access_key = 5;
+  string secret_key = 6;
+  string cache_path = 7;
+  bool force_path_style = 8;
+  string expected_hash = 9;
+}
+
+message CacheStoreContentFromSourceRequest { CacheSource source = 1; }
+
+message CacheStoreContentFromSourceResponse {
+  bool ok = 1;
+  string hash = 2;
+  string error_msg = 3;
+}
+
+message CacheFSMetadata {
+  string pid = 1;
+  string id = 2;
+  string name = 3;
+  string path = 4;
+  string hash = 5;
+  uint64 ino = 6;
+  uint64 size = 7;
+  uint64 blocks = 8;
+  uint64 atime = 9;
+  uint64 mtime = 10;
+  uint64 ctime = 11;
+  uint32 atimensec = 12;
+  uint32 mtimensec = 13;
+  uint32 ctimensec = 14;
+  uint32 mode = 15;
+  uint32 nlink = 16;
+  uint32 rdev = 17;
+  uint32 blksize = 18;
+  uint32 padding = 19;
+  uint32 uid = 20;
+  uint32 gid = 21;
+  uint64 gen = 22;
+}

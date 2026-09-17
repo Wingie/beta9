@@ -641,6 +641,44 @@
         ]
       }
     },
+    "/pods/{containerId}/snapshot-disks": {
+      "post": {
+        "operationId": "PodService_SandboxSnapshotDisks",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxSnapshotDisksResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxSnapshotDisksBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
     "/pods/{containerId}/snapshot-memory": {
       "post": {
         "operationId": "PodService_SandboxSnapshotMemory",
@@ -897,6 +935,16 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "wait": {
+          "type": "boolean"
+        },
+        "secrets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Secret names to resolve in the authenticated workspace."
         }
       }
     },
@@ -946,11 +994,22 @@
         }
       }
     },
+    "PodServiceSandboxSnapshotDisksBody": {
+      "type": "object",
+      "properties": {
+        "stubId": {
+          "type": "string"
+        }
+      }
+    },
     "PodServiceSandboxSnapshotMemoryBody": {
       "type": "object",
       "properties": {
         "stubId": {
           "type": "string"
+        },
+        "terminateAfterCheckpoint": {
+          "type": "boolean"
         }
       }
     },
@@ -1007,6 +1066,9 @@
         },
         "checkpointId": {
           "type": "string"
+        },
+        "machineId": {
+          "type": "string"
         }
       }
     },
@@ -1023,6 +1085,12 @@
           "type": "string"
         },
         "stubId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "appId": {
           "type": "string"
         }
       }
@@ -1088,6 +1156,21 @@
         }
       }
     },
+    "podPodSandboxDiskSnapshot": {
+      "type": "object",
+      "properties": {
+        "snapshotId": {
+          "type": "string"
+        },
+        "diskName": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "string",
+          "format": "int64"
+        }
+      }
+    },
     "podPodSandboxDownloadFileResponse": {
       "type": "object",
       "properties": {
@@ -1115,6 +1198,19 @@
         "pid": {
           "type": "integer",
           "format": "int32"
+        },
+        "done": {
+          "type": "boolean"
+        },
+        "exitCode": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
         }
       }
     },
@@ -1258,6 +1354,24 @@
         }
       }
     },
+    "podPodSandboxSnapshotDisksResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "snapshots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/podPodSandboxDiskSnapshot"
+          }
+        }
+      }
+    },
     "podPodSandboxSnapshotMemoryResponse": {
       "type": "object",
       "properties": {
@@ -1269,6 +1383,17 @@
         },
         "checkpointId": {
           "type": "string"
+        },
+        "runtime": {
+          "type": "string"
+        },
+        "diskSnapshots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/podPodSandboxDiskSnapshot"
+          },
+          "description": "Durable disk snapshots captured at the same boundary as the memory image."
         }
       }
     },

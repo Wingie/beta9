@@ -1,0 +1,144 @@
+package agent
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+)
+
+type workerContainerResourceLimits struct {
+	cpu    bool
+	memory bool
+}
+
+func dockerRunArgs(name, image, imageID, configPath string, bootstrap bootstrapConfig, slot *pb.AgentWorkerSlot, dirs workerDirs, limits workerContainerResourceLimits) []string {
+	localTargetHost := firstNonEmpty(os.Getenv(types.AgentTargetHostEnv), types.LoopbackHost)
+	cacheLocality := agentCacheLocality(bootstrap, slot)
+	args := []string{
+		"run", "--rm",
+		"--name", name,
+		"--privileged",
+		"--network", "host",
+		"--cgroupns", "host",
+		"--label", types.AgentDockerLabelManaged + "=true",
+		"--label", types.AgentDockerLabelWorkerID + "=" + slot.WorkerId,
+		"--label", types.AgentDockerLabelMachineID + "=" + slot.MachineId,
+		"--label", types.AgentDockerLabelPoolName + "=" + slot.PoolName,
+	}
+	if imageID != "" {
+		args = append(args, "--label", types.AgentDockerLabelWorkerImageID+"="+imageID)
+	}
+	if platform := strings.TrimSpace(os.Getenv(types.AgentWorkerPlatformEnv)); platform != "" {
+		args = append(args, "--platform", platform)
+	}
+	for _, alias := range agentDockerHostAliases() {
+		args = append(args, "--add-host", alias)
+	}
+
+	if limits.cpu && slot.Cpu > 0 {
+		args = append(args, "--cpus", fmt.Sprintf("%.3f", float64(slot.Cpu)/1000.0))
+	}
+	if limits.memory && slot.Memory > 0 {
+		args = append(args, "--memory", fmt.Sprintf("%dm", slot.Memory))
+	}
+	if slot.Memory > 0 {
+		args = append(args, "--shm-size", fmt.Sprintf("%dm", max(slot.Memory/2, 64)))
+	}
+	if slot.GpuCount > 0 {
+		if slot.GpuAssignment != "" {
+			args = append(args, "--gpus", fmt.Sprintf("%q", "device="+slot.GpuAssignment))
+		} else {
+			args = append(args, "--gpus", types.NvidiaVisibleDevicesAll)
+		}
+	}
+
+	volumeArgs := []string{
+		dirs.Images + ":" + types.AgentImagesPath,
+		dirs.Tmp + ":" + types.AgentTmpPath,
+		dirs.Data + ":" + types.AgentDataPath,
+		dirs.Workspace + ":" + types.AgentWorkspacePath,
+		dirs.Checkpoints + ":" + types.AgentCheckpointPath,
+		dirs.DurableDisk + ":" + types.DefaultDurableDisksPath,
+		dirs.Logs + ":" + types.AgentLogsPath,
+		configPath + ":" + types.AgentConfigPath + ":ro",
+	}
+	if dirs.CacheEnabled {
+		volumeArgs = append(volumeArgs, dirs.Cache+":"+dirs.CacheMount)
+	}
+	if pathExists(types.HostKubeletDevicePluginsPath) {
+		volumeArgs = append(volumeArgs, types.HostKubeletDevicePluginsPath+":"+types.HostKubeletDevicePluginsPath+":ro")
+	}
+	if pathExists(types.HostNetnsPath) {
+		volumeArgs = append(volumeArgs, types.HostNetnsPath+":"+types.HostNetnsPath)
+	}
+	if pathExists(types.HostCgroupPath) {
+		volumeArgs = append(volumeArgs, types.HostCgroupPath+":"+types.HostCgroupPath+":rw")
+	}
+	if pathExists(types.HostKernelModulesPath) {
+		volumeArgs = append(volumeArgs, types.HostKernelModulesPath+":"+types.HostKernelModulesPath+":ro")
+	}
+	for _, volume := range volumeArgs {
+		args = append(args, "-v", volume)
+	}
+	if pathExists(types.HostFuseDevicePath) {
+		args = append(args, "--device", types.HostFuseDevicePath)
+	}
+
+	env := map[string]string{
+		types.WorkerConfigPathEnv:     types.AgentConfigPath,
+		types.WorkerIDEnv:             slot.WorkerId,
+		types.WorkerTokenEnv:          slot.WorkerToken,
+		types.WorkerPoolEnv:           slot.PoolName,
+		types.WorkerMachineEnv:        slot.MachineId,
+		types.WorkerGenerationEnv:     slot.Generation,
+		types.WorkerCPUEnv:            strconv.FormatInt(slot.Cpu, 10),
+		types.WorkerMemoryEnv:         strconv.FormatInt(slot.Memory, 10),
+		types.WorkerGPUEnv:            slot.Gpu,
+		types.WorkerGPUCountEnv:       strconv.FormatUint(uint64(slot.GpuCount), 10),
+		types.WorkerGPUVirtualizedEnv: strconv.FormatBool(slot.GetPoolConfig().GetGpuVirtualized()),
+		types.WorkerMinimalConfigEnv:  "true",
+		types.WorkerPodHostEnv:        types.LoopbackHost,
+		types.WorkerPodIPEnv:          types.LoopbackHost,
+		types.WorkerNetworkPrefixEnv:  slot.NetworkPrefix,
+		types.CacheLocalityEnv:        cacheLocality,
+		types.CacheNodeEnv:            slot.MachineId,
+		types.CacheHostNetworkEnv:     "true",
+		types.WorkerPersistentEnv:     "true",
+		types.WorkerRouteTransportEnv: normalizeTransport(bootstrap.Transport),
+		types.WorkerRouteTargetEnv:    localTargetHost,
+		types.AgentGatewayURLEnv:      strings.TrimRight(bootstrap.GatewayHTTPURL, "/"),
+	}
+	if slot.ContainerStartConcurrency > 0 {
+		env[types.WorkerStartConcurrencyEnv] = strconv.FormatUint(uint64(slot.ContainerStartConcurrency), 10)
+	}
+	if slot.NetworkSlotPoolSize > 0 {
+		env[types.WorkerNetworkSlotsEnv] = strconv.FormatUint(uint64(slot.NetworkSlotPoolSize), 10)
+	}
+	for key, value := range agentGatewayEnv(bootstrap) {
+		env[key] = value
+	}
+	// WORKER_GPU_DEVICES is the durable copy of the assignment; the container
+	// toolkit rewrites NVIDIA_VISIBLE_DEVICES to "void" after device injection.
+	if slot.GpuCount > 0 {
+		assignment := firstNonEmpty(slot.GpuAssignment, types.NvidiaVisibleDevicesAll)
+		env[types.NvidiaVisibleDevicesEnv] = assignment
+		env[types.WorkerGPUDevicesEnv] = assignment
+	}
+	envKeys := make([]string, 0, len(env))
+	for key := range env {
+		envKeys = append(envKeys, key)
+	}
+	sort.Strings(envKeys)
+	for _, key := range envKeys {
+		value := env[key]
+		args = append(args, "-e", key+"="+value)
+	}
+
+	args = append(args, image, types.AgentWorkerEntrypoint)
+	return args
+}

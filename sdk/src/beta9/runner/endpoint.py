@@ -7,6 +7,7 @@ import traceback
 import types
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from multiprocessing import Value
 from typing import Any, Dict, Optional, Tuple, Union
 
 from fastapi import Depends, FastAPI, Request
@@ -25,6 +26,7 @@ from ..channel import runner_context
 from ..clients.gateway import (
     GatewayServiceStub,
 )
+from ..logging import ContextualStdoutJsonInterceptor
 from ..middleware import (
     TaskLifecycleData,
     TaskLifecycleMiddleware,
@@ -39,6 +41,8 @@ from ..runner.common import (
 from ..runner.common import config as cfg
 from ..type import LifeCycleMethod, TaskStatus
 from .common import is_asgi3
+
+workers_ready = Value("i", 0) if cfg.checkpoint_enabled else None
 
 
 class EndpointFilter(logging.Filter):
@@ -98,7 +102,7 @@ class GunicornApplication(BaseApplication):
 
             # If checkpointing is enabled, wait for all workers to be ready before creating a checkpoint
             if cfg.checkpoint_enabled:
-                wait_for_checkpoint()
+                wait_for_checkpoint(workers_ready)
 
         except EOFError:
             return
@@ -147,6 +151,8 @@ class EndpointManager:
         self.logger = logger
         self.pid: int = os.getpid()
         self.exit_code: int = 0
+        self.stdout_interceptor = ContextualStdoutJsonInterceptor()
+        self.stdout_interceptor.__enter__()
 
         self.handler: FunctionHandler = FunctionHandler()
         self.on_start_value = asyncio.run(OnStartMethodHandler(worker).start())

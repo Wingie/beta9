@@ -14,6 +14,8 @@ service ContainerService {
   rpc ContainerStreamLogs(ContainerStreamLogsRequest) returns (stream ContainerLogEntry) {}
   rpc ContainerArchive(ContainerArchiveRequest) returns (stream ContainerArchiveResponse) {}
   rpc ContainerCheckpoint(ContainerCheckpointRequest) returns (ContainerCheckpointResponse) {}
+  rpc ContainerSnapshotDisks(ContainerSnapshotDisksRequest)
+      returns (ContainerSnapshotDisksResponse) {}
   rpc ContainerSyncWorkspace(gateway.SyncContainerWorkspaceRequest)
       returns (gateway.SyncContainerWorkspaceResponse) {}
   rpc ContainerSandboxExec(ContainerSandboxExecRequest)
@@ -86,12 +88,32 @@ message ContainerArchiveResponse {
   string error_msg = 4;
 }
 
-message ContainerCheckpointRequest { string container_id = 1; }
+message ContainerCheckpointRequest {
+  string container_id = 1;
+  bool terminate_after_checkpoint = 2;
+}
 
 message ContainerCheckpointResponse {
   bool ok = 1;
   string checkpoint_id = 2;
   string error_msg = 3;
+  string runtime = 4;
+  // Durable disk snapshots captured at the same boundary as the memory image.
+  repeated ContainerDiskSnapshot disk_snapshots = 5;
+}
+
+message ContainerSnapshotDisksRequest { string container_id = 1; }
+
+message ContainerDiskSnapshot {
+  string snapshot_id = 1;
+  string disk_name = 2;
+  int64 generation = 3;
+}
+
+message ContainerSnapshotDisksResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated ContainerDiskSnapshot snapshots = 3;
 }
 
 message ContainerSandboxExecRequest {
@@ -100,12 +122,17 @@ message ContainerSandboxExecRequest {
   string cwd = 3;
   map<string, string> env = 4;
   bool interactive = 5;
+  bool wait = 6;
 }
 
 message ContainerSandboxExecResponse {
   bool ok = 1;
   string error_msg = 2;
   int32 pid = 3;
+  bool done = 4;
+  int32 exit_code = 5;
+  string stdout = 6;
+  string stderr = 7;
 }
 
 message ContainerSandboxStatusRequest {

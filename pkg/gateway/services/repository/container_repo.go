@@ -2,6 +2,7 @@ package repository_services
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/beam-cloud/beta9/pkg/repository"
 	"github.com/beam-cloud/beta9/pkg/types"
@@ -24,21 +25,24 @@ func (s *ContainerRepositoryService) GetContainerState(ctx context.Context, req 
 		return &pb.GetContainerStateResponse{Ok: false, ErrorMsg: err.Error()}, nil
 	}
 
-	return &pb.GetContainerStateResponse{
-		Ok:          true,
-		ContainerId: req.ContainerId,
-		State: &pb.ContainerState{
-			Status:      string(state.Status),
-			ContainerId: state.ContainerId,
-			StubId:      state.StubId,
-			ScheduledAt: state.ScheduledAt,
-			StartedAt:   state.StartedAt,
-			WorkspaceId: state.WorkspaceId,
-			Gpu:         state.Gpu,
-			GpuCount:    state.GpuCount,
-			Cpu:         state.Cpu,
-			Memory:      state.Memory,
-		}}, nil
+	return &pb.GetContainerStateResponse{Ok: true, ContainerId: req.ContainerId, State: containerStateToProto(state)}, nil
+}
+
+func containerStateToProto(state *types.ContainerState) *pb.ContainerState {
+	return &pb.ContainerState{
+		Status:      string(state.Status),
+		ContainerId: state.ContainerId,
+		StubId:      state.StubId,
+		ScheduledAt: state.ScheduledAt,
+		StartedAt:   state.StartedAt,
+		WorkspaceId: state.WorkspaceId,
+		Gpu:         state.Gpu,
+		GpuCount:    state.GpuCount,
+		Cpu:         state.Cpu,
+		Memory:      state.Memory,
+		WorkerId:    state.WorkerId,
+		MachineId:   state.MachineId,
+	}
 }
 
 func (s *ContainerRepositoryService) DeleteContainerState(ctx context.Context, req *pb.DeleteContainerStateRequest) (*pb.DeleteContainerStateResponse, error) {
@@ -51,12 +55,24 @@ func (s *ContainerRepositoryService) DeleteContainerState(ctx context.Context, r
 }
 
 func (s *ContainerRepositoryService) UpdateContainerStatus(ctx context.Context, req *pb.UpdateContainerStatusRequest) (*pb.UpdateContainerStatusResponse, error) {
+	// A non-positive expiry would make the repository expire the state on the
+	// spot; refuse it before anything is written.
+	if req.ExpirySeconds <= 0 {
+		return &pb.UpdateContainerStatusResponse{Ok: false, ErrorMsg: fmt.Sprintf("expiry_seconds must be positive, got %d", req.ExpirySeconds)}, nil
+	}
+
 	err := s.containerRepo.UpdateContainerStatus(req.ContainerId, types.ContainerStatus(req.Status), req.ExpirySeconds)
 	if err != nil {
 		return &pb.UpdateContainerStatusResponse{Ok: false, ErrorMsg: err.Error()}, nil
 	}
 
-	return &pb.UpdateContainerStatusResponse{Ok: true}, nil
+	// A refused transition (STOPPING is terminal) returns nil above; report the
+	// persisted status so the worker can react without a second round trip.
+	state, err := s.containerRepo.GetContainerState(req.ContainerId)
+	if err != nil {
+		return &pb.UpdateContainerStatusResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	return &pb.UpdateContainerStatusResponse{Ok: true, Status: string(state.Status)}, nil
 }
 
 func (s *ContainerRepositoryService) SetContainerExitCode(ctx context.Context, req *pb.SetContainerExitCodeRequest) (*pb.SetContainerExitCodeResponse, error) {
@@ -69,7 +85,16 @@ func (s *ContainerRepositoryService) SetContainerExitCode(ctx context.Context, r
 }
 
 func (s *ContainerRepositoryService) SetContainerAddress(ctx context.Context, req *pb.SetContainerAddressRequest) (*pb.SetContainerAddressResponse, error) {
-	err := s.containerRepo.SetContainerAddress(req.ContainerId, req.Address)
+	address := req.Address
+	if req.Route != nil {
+		routeAddress, err := s.registerBackendRoute(ctx, req.ContainerId, req.Route, req.Address)
+		if err != nil {
+			return &pb.SetContainerAddressResponse{Ok: false, ErrorMsg: err.Error()}, nil
+		}
+		address = routeAddress
+	}
+
+	err := s.containerRepo.SetContainerAddress(req.ContainerId, address)
 	if err != nil {
 		return &pb.SetContainerAddressResponse{Ok: false, ErrorMsg: err.Error()}, nil
 	}
@@ -82,10 +107,37 @@ func (s *ContainerRepositoryService) SetContainerAddressMap(ctx context.Context,
 	for k, v := range req.AddressMap {
 		addressMap[int32(k)] = v
 	}
+	routes := make([]types.BackendRoute, 0, len(req.Routes))
+	for _, routeProto := range req.Routes {
+		if routeProto == nil {
+			return &pb.SetContainerAddressMapResponse{Ok: false, ErrorMsg: "backend route is required"}, nil
+		}
+		route, routeAddress, err := backendRoute(req.ContainerId, routeProto, addressMap[routeProto.Port])
+		if err != nil {
+			return &pb.SetContainerAddressMapResponse{Ok: false, ErrorMsg: err.Error()}, nil
+		}
+		routes = append(routes, route)
+		addressMap[routeProto.Port] = routeAddress
+	}
+	var primaryAddress string
+	if req.PrimaryPort != 0 {
+		primaryAddress = addressMap[req.PrimaryPort]
+		if primaryAddress == "" {
+			return &pb.SetContainerAddressMapResponse{Ok: false, ErrorMsg: fmt.Sprintf("primary port %d has no address", req.PrimaryPort)}, nil
+		}
+	}
+	if err := s.containerRepo.SetBackendRoutes(ctx, routes); err != nil {
+		return &pb.SetContainerAddressMapResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
 
 	err := s.containerRepo.SetContainerAddressMap(req.ContainerId, addressMap)
 	if err != nil {
 		return &pb.SetContainerAddressMapResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	if primaryAddress != "" {
+		if err := s.containerRepo.SetContainerAddress(req.ContainerId, primaryAddress); err != nil {
+			return &pb.SetContainerAddressMapResponse{Ok: false, ErrorMsg: err.Error()}, nil
+		}
 	}
 
 	return &pb.SetContainerAddressMapResponse{Ok: true}, nil
@@ -106,10 +158,85 @@ func (s *ContainerRepositoryService) GetContainerAddressMap(ctx context.Context,
 }
 
 func (s *ContainerRepositoryService) SetWorkerAddress(ctx context.Context, req *pb.SetWorkerAddressRequest) (*pb.SetWorkerAddressResponse, error) {
-	err := s.containerRepo.SetWorkerAddress(req.ContainerId, req.Address)
+	address := req.Address
+	if req.Route != nil {
+		routeAddress, err := s.registerBackendRoute(ctx, req.ContainerId, req.Route, req.Address)
+		if err != nil {
+			return &pb.SetWorkerAddressResponse{Ok: false, ErrorMsg: err.Error()}, nil
+		}
+		address = routeAddress
+	}
+
+	err := s.containerRepo.SetWorkerAddress(req.ContainerId, address)
 	if err != nil {
 		return &pb.SetWorkerAddressResponse{Ok: false, ErrorMsg: err.Error()}, nil
 	}
 
 	return &pb.SetWorkerAddressResponse{Ok: true}, nil
+}
+
+func (s *ContainerRepositoryService) registerBackendRoute(ctx context.Context, containerID string, routeProto *pb.BackendRoute, defaultLocalTarget string) (string, error) {
+	if routeProto == nil {
+		return "", fmt.Errorf("backend route is required")
+	}
+	route, address, err := backendRoute(containerID, routeProto, defaultLocalTarget)
+	if err != nil {
+		return "", err
+	}
+	if err := s.containerRepo.SetBackendRoute(ctx, route); err != nil {
+		return "", err
+	}
+	return address, nil
+}
+
+func backendRoute(containerID string, routeProto *pb.BackendRoute, defaultLocalTarget string) (types.BackendRoute, string, error) {
+	route := backendRouteFromProto(routeProto)
+	route.ContainerID = registeredRouteContainerID(containerID, route)
+	if route.LocalTarget == "" {
+		route.LocalTarget = defaultLocalTarget
+	}
+	if route.LocalTarget == "" {
+		return types.BackendRoute{}, "", fmt.Errorf("backend route local target is required for port %d", route.Port)
+	}
+	return route, types.BackendRouteAddress(route.RouteID), nil
+}
+
+func backendRouteFromProto(in *pb.BackendRoute) types.BackendRoute {
+	if in == nil {
+		return types.BackendRoute{}
+	}
+	route := types.BackendRoute{
+		RouteID:     in.RouteId,
+		WorkspaceID: in.WorkspaceId,
+		PoolName:    in.PoolName,
+		MachineID:   in.MachineId,
+		WorkerID:    in.WorkerId,
+		ContainerID: in.ContainerId,
+		Kind:        in.Kind,
+		Port:        in.Port,
+		Protocol:    in.Protocol,
+		Transport:   in.Transport,
+		LocalTarget: in.LocalTarget,
+		ProxyTarget: in.ProxyTarget,
+		State:       in.State,
+		Error:       in.Error,
+		UpdatedAt:   in.UpdatedAt,
+	}
+	if route.Protocol == "" {
+		route.Protocol = types.BackendRouteProtocolTCP
+	}
+	if route.Transport == "" {
+		route.Transport = types.BackendRouteTransportDirect
+	}
+	if route.State == "" {
+		route.State = types.BackendRouteStateOpening
+	}
+	return route
+}
+
+func registeredRouteContainerID(containerID string, route types.BackendRoute) string {
+	if route.Kind == types.BackendRouteKindWorker && route.ContainerID == "" {
+		return ""
+	}
+	return containerID
 }

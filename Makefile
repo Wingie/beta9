@@ -1,14 +1,59 @@
 SHELL := /bin/bash
 tag := latest
 workerTag := latest
+workerPlatform := linux/$(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
 runnerTag := latest
 runnerPlatform := linux/$(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+BENCH_SDK_PYTHON ?= uv run --project ./sdk --no-sync python
+CACHE_BENCHMARK_FILE_PLAN ?=
+CACHE_BENCH_PROFILE ?=
+CACHE_BENCH_CONFIG ?=
+TOKEN ?=
+
+.PHONY: start stop start-stage stop-stage startup-benchmark startup-benchmark-build sandbox-parallel-benchmark sandbox-stage-cold-benchmark sandbox-stage-warm-benchmark cache-benchmark bench-cache-smoke worker-e2e-tag worker-e2e-check worker-e2e-push
 
 setup:
 	bash bin/setup.sh
 	make k3d-up runner worker gateway
 	# helm install beta9 deploy/charts/beta9 --create-namespace --values deploy/charts/beta9/values.local.yaml
 	kustomize build --enable-helm manifests/kustomize/overlays/cluster-dev | kubectl apply -f-
+
+startup-benchmark:
+	PYTHONPATH="$(CURDIR)/sdk/src:$(PYTHONPATH)" \
+	BENCH_SDK_PYTHON="$(BENCH_SDK_PYTHON)" \
+	"$(CURDIR)/bin/bench" startup $(ARGS)
+
+startup-benchmark-build:
+	docker build . --target build -f ./docker/Dockerfile.gateway -t localhost:5001/beta9-gateway:$(tag)
+	docker push localhost:5001/beta9-gateway:$(tag)
+	docker build . --target final --platform=$(workerPlatform) --build-arg BASE_STAGE=dev -f ./docker/Dockerfile.worker -t localhost:5001/beta9-worker:$(workerTag)
+	docker push localhost:5001/beta9-worker:$(workerTag)
+	$(MAKE) startup-benchmark BENCH_INSTALL=1
+
+sandbox-parallel-benchmark:
+	PYTHONPATH="$(CURDIR)/sdk/src:$(PYTHONPATH)" \
+	BENCH_SDK_PYTHON="$(BENCH_SDK_PYTHON)" \
+	"$(CURDIR)/bin/bench" sandbox $(ARGS)
+
+sandbox-stage-cold-benchmark:
+	$(MAKE) sandbox-parallel-benchmark ARGS="--profile staging --suite sandbox-stage-cold $(ARGS)"
+
+sandbox-stage-warm-benchmark:
+	$(MAKE) sandbox-parallel-benchmark ARGS="--profile staging --suite sandbox-stage-warm $(ARGS)"
+
+cache-benchmark:
+	PYTHONPATH="$(CURDIR)/sdk/src:$(PYTHONPATH)" \
+	BENCH_SDK_PYTHON="$(BENCH_SDK_PYTHON)" \
+	CACHE_BENCHMARK_FILE_PLAN="$(CACHE_BENCHMARK_FILE_PLAN)" \
+	CACHE_BENCH_PROFILE="$(CACHE_BENCH_PROFILE)" \
+	CACHE_BENCH_CONFIG="$(CACHE_BENCH_CONFIG)" \
+	TOKEN="$(TOKEN)" \
+	"$(CURDIR)/bin/bench" cache $(ARGS)
+
+bench-cache-smoke:
+	PYTHONPATH="$(CURDIR)/sdk/src:$(PYTHONPATH)" \
+	BENCH_SDK_PYTHON="$(BENCH_SDK_PYTHON)" \
+	"$(CURDIR)/bin/bench" cache --suite cache-smoke $(ARGS)
 
 setup-sdk:
 	@if ! command -v uv &> /dev/null; then \
@@ -34,9 +79,18 @@ gateway:
 	docker push localhost:5001/beta9-gateway:$(tag)
 
 worker:
-	docker build . --target final --build-arg BASE_STAGE=dev -f ./docker/Dockerfile.worker -t localhost:5001/beta9-worker:$(workerTag)
+	docker build . --target final --platform=$(workerPlatform) --build-arg BASE_STAGE=dev -f ./docker/Dockerfile.worker -t localhost:5001/beta9-worker:$(workerTag)
 	docker push localhost:5001/beta9-worker:$(workerTag)
-	bin/delete_workers.sh
+	BENCH_NAMESPACE="$(BENCH_NAMESPACE)" bin/delete_workers.sh
+
+worker-e2e-tag:
+	@./hack/worker-e2e-image.sh tag
+
+worker-e2e-check:
+	@./hack/worker-e2e-image.sh check
+
+worker-e2e-push:
+	@./hack/worker-e2e-image.sh push
 
 runner:
 	for target in py312 py311 py310 py39 py38; do \
@@ -48,11 +102,26 @@ runner:
 		docker push localhost:5001/beta9-runner:micromamba$$version-$(runnerTag); \
 	done
 
+# Local (k3d) and staging (EKS) okteto sessions can run side by side. Okteto
+# stores session state under $OKTETO_FOLDER/<namespace>/<dev>, keyed by name
+# rather than cluster, so both sessions (beta9/beta9-gateway) would otherwise
+# share one okteto.pid and take turns killing each other. Staging gets its own
+# folder, and both pass --context/--namespace explicitly so neither depends on
+# (or clobbers) the global current context.
+LOCAL_OKTETO_CONTEXT ?= k3d-beta9
+LOCAL_OKTETO_NAMESPACE ?= beta9
+STAGE_OKTETO_CONTEXT ?= arn:aws:eks:us-east-1:683656326989:cluster/eks-stage-01
+STAGE_OKTETO_NAMESPACE ?= beta9
+STAGE_OKTETO_FOLDER ?= $(HOME)/.okteto-stage
+OKTETO_LOCAL_FLAGS := --context $(LOCAL_OKTETO_CONTEXT) --namespace $(LOCAL_OKTETO_NAMESPACE)
+OKTETO_STAGE_FLAGS := --context $(STAGE_OKTETO_CONTEXT) --namespace $(STAGE_OKTETO_NAMESPACE)
+OKTETO_STAGE := mkdir -p $(STAGE_OKTETO_FOLDER) && OKTETO_FOLDER=$(STAGE_OKTETO_FOLDER) okteto
+
 start:
 	@if [ -f config.yaml ]; then \
-		cd hack && okteto up --file okteto.yaml --env CONFIG_PATH=/workspace/config.yaml; \
+		cd hack && okteto up $(OKTETO_LOCAL_FLAGS) --file okteto.yaml --env CONFIG_PATH=/workspace/config.yaml; \
 	else \
-		cd hack && okteto up --file okteto.yaml; \
+		cd hack && okteto up $(OKTETO_LOCAL_FLAGS) --file okteto.yaml; \
 	fi
 
 clear-ports:
@@ -60,10 +129,19 @@ clear-ports:
 	@lsof -t -i :1993,1994,8008 | xargs -r sudo kill -9 2>/dev/null || true
 
 stop:
-	cd hack && okteto down --file okteto.yaml
+	cd hack && okteto down $(OKTETO_LOCAL_FLAGS) --file okteto.yaml
+
+# Staging gateway on eks-stage-01 (see hack/okteto.stage.yaml). Forwards to
+# localhost:11993/11994 so it never collides with the local session.
+start-stage:
+	@test -n "$(GATEWAY_TAG)" || { echo "GATEWAY_TAG is required, e.g. GATEWAY_TAG=perf-startup-9b71dbb7 make start-stage"; exit 1; }
+	cd hack && GATEWAY_TAG=$(GATEWAY_TAG) $(OKTETO_STAGE) up $(OKTETO_STAGE_FLAGS) --file okteto.stage.yaml
+
+stop-stage:
+	cd hack && $(OKTETO_STAGE) down $(OKTETO_STAGE_FLAGS) --file okteto.stage.yaml
 
 protocol:
-	uv run ./bin/gen_proto.sh
+	./bin/gen_proto.sh
 
 openapi:
 	@echo "Generating OpenAPI schemas..."
@@ -77,12 +155,15 @@ verify-protocol:
 	./bin/verify_proto.sh
 
 test-pkg:
-	go test -v ./pkg/... -bench=./pkg/..
+	go test -v ./pkg/...
 
-# build-test can be run with "local" to run extra tests when pointing to your local
-# dev setup. It will also exclude custom image tests due to arm64 issues on mac.
+bench-pkg:
+	go test -run '^$$' -bench=. ./pkg/...
+
+# build-test runs CPU-only image build e2e checks. Set MODE=functions or
+# MODE=pods to run a subset; MODE=local is kept as an alias for all.
 build-test:
-	uv run python e2e/build_tests/app.py $(MODE)
+	PYTHONPATH=$(CURDIR)/sdk/src uv run --project sdk python e2e/build_tests/app.py $(MODE)
 
 load-test:
 	cd e2e/load_tests && k6 run --env URL=$(URL) --env TOKEN=$(TOKEN) throughput.js
@@ -107,4 +188,3 @@ sdk-clean:
 
 sdk-publish:
 	make -C sdk publish
-

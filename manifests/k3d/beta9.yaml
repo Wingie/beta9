@@ -10,20 +10,17 @@ metadata:
   namespace: beta9
 rules:
 - apiGroups:
-  - ""
-  - "apps"
-  - "batch"
-  resources:
-  - pods
-  - services
-  - deployments
-  - nodes
-  - persistentvolumeclaims
-  - configmaps
-  - secrets
-  - jobs
-  verbs:
   - '*'
+  resources:
+  - '*'
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -46,8 +43,6 @@ metadata:
   namespace: beta9
 spec:
   replicas: 1
-  strategy:
-    type: Recreate  # Required for hostNetwork - prevents port conflicts during updates
   selector:
     matchLabels:
       app: gateway
@@ -58,33 +53,11 @@ spec:
         prometheus.io/port: "9090"
         app: gateway
     spec:
-      hostNetwork: true  # Allow gateway to access host's Tailscale network
-      dnsPolicy: ClusterFirstWithHostNet  # Use cluster DNS with hostNetwork
-      imagePullSecrets:
-        - name: registry-credentials
-      initContainers:
-      - name: wait-for-deps
-        image: busybox:1.37.0
-        command: ['sh', '-c',
-          'echo "Waiting for dependencies...";
-           until nc -z postgresql 5432; do echo "Waiting for postgresql..."; sleep 2; done;
-           until nc -z redis-master 6379; do echo "Waiting for redis-master..."; sleep 2; done;
-           until nc -z juicefs-redis-master 6379; do echo "Waiting for juicefs-redis..."; sleep 2; done;
-           until nc -z localstack 4566; do echo "Waiting for localstack..."; sleep 2; done;
-           echo "All dependencies ready!"']
       containers:
       - name: gateway
-        image: registry.agentosaurus.com/beta9-gateway:latest
-        imagePullPolicy: IfNotPresent
+        image: registry.localhost:5000/beta9-gateway:latest
         command:
         - /usr/local/bin/gateway
-        env:
-        - name: CONFIG_PATH
-          value: /etc/beta9/config.yaml
-        - name: SENTRY_DSN
-          value: "${SENTRY_DSN}"  # From .env via envsubst
-        - name: SENTRY_ENVIRONMENT
-          value: "${SENTRY_ENVIRONMENT:-development}"
         ports:
         - name: grpc
           containerPort: 1993
@@ -97,15 +70,13 @@ spec:
         volumeMounts:
         - name: images
           mountPath: /images
-        - name: config
-          mountPath: /etc/beta9
         resources:
           requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            cpu: 500m
+            cpu: 1000m
             memory: 1Gi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
         livenessProbe: &probe
           httpGet:
             path: /api/v1/health
@@ -121,9 +92,6 @@ spec:
       - name: images
         persistentVolumeClaim:
           claimName: beta9-images
-      - name: config
-        configMap:
-          name: beta9-config
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -131,7 +99,7 @@ metadata:
   name: proxy
   namespace: beta9
 spec:
-  replicas: 0  # Disabled - no Dockerfile.proxy in this version
+  replicas: 1
   selector:
     matchLabels:
       app: proxy
@@ -142,8 +110,7 @@ spec:
     spec:
       containers:
       - name: proxy
-        image: registry.agentosaurus.com/beta9-proxy:latest
-        imagePullPolicy: IfNotPresent
+        image: registry.localhost:5000/beta9-proxy:latest
         command:
         - /usr/local/bin/proxy
         securityContext:
@@ -194,37 +161,20 @@ spec:
     targetPort: 9090
     protocol: TCP
 ---
-# External NodePort Service so Tailscale peers (SDK, workers, tests) can reach
-# the gateway via the host's stable :31994 (HTTP) / :31993 (gRPC) ports. The
-# internal ClusterIP Service `gateway` above stays for in-cluster traffic.
-# Cubic review finding: the previous manifest referenced 31994/31993 in docs
-# but never materialised a Service, so `ss -tlnp | grep 31994` returned empty
-# on the OCI host.
-apiVersion: v1
-kind: Service
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
 metadata:
-  name: gateway-nodeport
+  name: gateway
   namespace: beta9
-  labels:
-    app: gateway
-    tier: external
 spec:
-  type: NodePort
-  selector:
-    app: gateway
-  ports:
-  - name: http
-    port: 1994
-    targetPort: 1994
-    nodePort: 31994
-    protocol: TCP
-  - name: grpc
-    port: 1993
-    targetPort: 1993
-    nodePort: 31993
-    protocol: TCP
----
-# NOTE: IngressRouteTCP removed - using NodePort instead (no Traefik dependency)
+  entryPoints:
+  - web
+  routes:
+  - match: HostSNI(`*`)
+    kind: Rule
+    services:
+    - name: gateway
+      port: 1993
 ---
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
@@ -235,30 +185,19 @@ spec:
   repo: https://charts.bitnami.com/bitnami
   chart: redis
   createNamespace: false
-  version: 19.6.4
+  version: 18.6.1
   valuesContent: |-
     nameOverride: redis
     fullnameOverride: redis
     architecture: standalone
     auth:
       enabled: false
-    image:
-      registry: registry.agentosaurus.com
-      repository: bitnami/redis
-      tag: "latest"
-      pullPolicy: IfNotPresent
-      pullSecrets:
-        - registry-credentials
     master:
       configuration: |
         activedefrag yes
         notify-keyspace-events AKE
       persistence:
         size: 1Gi
-      resources:
-        requests:
-          cpu: 50m
-          memory: 128Mi
 ---
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
@@ -269,7 +208,7 @@ spec:
   repo: https://charts.bitnami.com/bitnami
   chart: postgresql
   createNamespace: false
-  version: 15.5.38
+  version: 13.2.25
   valuesContent: |-
     nameOverride: postgresql
     fullnameOverride: postgresql
@@ -279,191 +218,12 @@ spec:
           username: root
           password: password
           database: main
-    image:
-      registry: registry.agentosaurus.com
-      repository: bitnami/postgresql
-      tag: "latest"
-      pullPolicy: IfNotPresent
-      pullSecrets:
-        - registry-credentials
     primary:
       extendedConfiguration: |
         max_connections=400
         shared_buffers='400MB'
-      resources:
-        requests:
-          cpu: 50m
-          memory: 128Mi
     volumePermissions:
       enabled: true
-      image:
-        registry: registry.agentosaurus.com
-        repository: bitnami/os-shell
-        tag: "latest"
-        pullSecrets:
-          - registry-credentials
     persistence:
       enabled: true
       size: 1Gi
----
-# JuiceFS Redis - separate Redis for filesystem metadata
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: juicefs-redis
-  namespace: beta9
-spec:
-  repo: https://charts.bitnami.com/bitnami
-  chart: redis
-  createNamespace: false
-  version: 19.6.4
-  valuesContent: |-
-    nameOverride: juicefs-redis
-    fullnameOverride: juicefs-redis
-    architecture: standalone
-    auth:
-      enabled: false
-    image:
-      registry: registry.agentosaurus.com
-      repository: bitnami/redis
-      tag: "latest"
-      pullPolicy: IfNotPresent
-      pullSecrets:
-        - registry-credentials
-    master:
-      persistence:
-        size: 1Gi
-      resources:
-        requests:
-          cpu: 50m
-          memory: 64Mi
----
-# LocalStack - S3-compatible storage for JuiceFS and images
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: localstack
-  namespace: beta9
-spec:
-  repo: https://localstack.github.io/helm-charts
-  chart: localstack
-  createNamespace: false
-  version: 0.6.5
-  valuesContent: |-
-    extraEnvVars:
-    - name: SERVICES
-      value: s3
-    enableStartupScripts: true
-    startupScriptContent: |
-      #!/bin/bash
-      awslocal s3 mb s3://juicefs || true
-      awslocal s3 mb s3://logs || true
-      awslocal s3 mb s3://beta9-images || true
-    persistence:
-      enabled: true
-      storageClass: local-path
-      size: 20Gi
-    resources:
-      requests:
-        cpu: 50m
-        memory: 256Mi
----
-# ConfigMap for Gateway configuration
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: beta9-config
-  namespace: beta9
-data:
-  config.yaml: |
-    database:
-      postgres:
-        host: postgresql
-        port: 5432
-        username: root
-        password: password
-        name: main
-        timezone: UTC
-      redis:
-        mode: single
-        addrs:
-          - redis-master:6379
-        externalPort: 30380  # NodePort exposed via Tailscale for external workers
-    storage:
-      mode: juicefs
-      fsName: beta9-fs
-      fsPath: /data
-      objectPath: /data/objects
-      juicefs:
-        redisURI: redis://juicefs-redis-master:6379/0
-        awsS3Bucket: http://localstack:4566/juicefs
-        awsAccessKey: test
-        awsSecretKey: test
-        blockSize: 4096
-        cacheSize: 0
-        externalRedisPort: 30381  # NodePort exposed via Tailscale for external workers
-        externalS3Port: 31566     # LocalStack NodePort for external workers
-      workspaceStorage:
-        defaultEndpointUrl: http://localstack:4566
-        defaultAccessKey: test
-        defaultSecretKey: test
-    imageService:
-      registries:
-        s3:
-          bucketName: beta9-images
-          endpoint: http://localstack:4566
-          accessKey: test
-          secretKey: test
-      runner:
-        baseImageName: beta9-runner
-        baseImageRegistry: registry.agentosaurus.com  # HTTPS registry accessible from anywhere
-        externalBaseImageRegistry: registry.agentosaurus.com  # Same for external workers
-        tags:
-          python3.8: py38-latest
-          python3.9: py39-latest
-          python3.10: py310-latest
-          python3.11: py311-latest
-          python3.12: py312-latest
-    gateway:
-      host: gateway  # k8s service name for local workers
-      grpc:
-        externalHost: "${TAILSCALE_CONTROLPLANE_IP}"  # Tailscale IP for external workers
-        externalPort: 1993
-        port: 1993
-      http:
-        externalHost: "${TAILSCALE_CONTROLPLANE_IP}"  # Tailscale IP for external workers
-        externalPort: 1994
-        port: 1994
-    tailscale:
-      enabled: true
-      controlUrl: "https://controlplane.tailscale.com"
-      authKey: "${TAILSCALE_AUTHKEY}"  # Set from .env via envsubst
-      hostName: "beta9-gateway"
-      directRedisHost: "${TAILSCALE_CONTROLPLANE_IP}"  # OCI Tailscale IP - bypass tsnet service discovery for external workers
-    # External worker pools for machines connecting via tunnel
-    worker:
-      imageRegistry: "registry.agentosaurus.com"  # HTTPS registry for all workers
-      externalRegistryPort: 30500       # NodePort fallback for HTTP registry (via Tailscale)
-      externalImageRegistry: "registry.agentosaurus.com"  # HTTPS registry for external workers
-      imageName: "beta9-worker"
-      imageTag: "latest"
-      imagePullSecrets:
-        - "registry-credentials"  # k8s secret for registry.agentosaurus.com auth
-      pools:
-        external:
-          mode: external
-          provider: generic
-          poolSizing:
-            defaultWorkerCpu: 4000m
-            defaultWorkerMemory: 8Gi
-            minFreeCpu: 1000m
-            minFreeMemory: 1Gi
-        gpu:
-          mode: external
-          provider: generic
-          gpuType: any
-          poolSizing:
-            defaultWorkerCpu: 8000m
-            defaultWorkerMemory: 16Gi
-            minFreeCpu: 2000m
-            minFreeMemory: 4Gi

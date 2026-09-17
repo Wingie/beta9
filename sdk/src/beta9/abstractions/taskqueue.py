@@ -26,8 +26,10 @@ from ..env import is_local
 from ..schema import Schema
 from ..type import (
     Autoscaler,
+    DurableDisk,
     GpuType,
     GpuTypeAlias,
+    Pool,
     PricingPolicy,
     QueueDepthAutoscaler,
     TaskPolicy,
@@ -144,6 +146,7 @@ class TaskQueue(RunnerAbstraction):
         on_deploy: Optional[AbstractCallableWrapper] = None,
         callback_url: Optional[str] = None,
         volumes: Optional[List[Union[Volume, CloudBucket]]] = None,
+        disks: Optional[List[DurableDisk]] = None,
         secrets: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = {},
         name: Optional[str] = None,
@@ -155,6 +158,8 @@ class TaskQueue(RunnerAbstraction):
         pricing: Optional[PricingPolicy] = None,
         inputs: Optional[Schema] = None,
         outputs: Optional[Schema] = None,
+        pool: Optional[Union[str, Pool]] = None,
+        allow_marketplace: bool = False,
     ) -> None:
         super().__init__(
             cpu=cpu,
@@ -171,6 +176,7 @@ class TaskQueue(RunnerAbstraction):
             on_deploy=on_deploy,
             callback_url=callback_url,
             volumes=volumes,
+            disks=disks,
             secrets=secrets,
             env=env,
             name=name,
@@ -182,6 +188,8 @@ class TaskQueue(RunnerAbstraction):
             pricing=pricing,
             inputs=inputs,
             outputs=outputs,
+            pool=pool,
+            allow_marketplace=allow_marketplace,
         )
         self._taskqueue_stub: Optional[TaskQueueServiceStub] = None
         self.retry_for = retry_for or []

@@ -34,7 +34,7 @@ type Event struct {
 type RunOpts struct {
 	OutputWriter  OutputWriter
 	Started       chan<- int // PID channel
-	DockerEnabled bool       // Enable Docker-in-Docker (gVisor only)
+	DockerEnabled bool       // Enable Docker-in-Docker runtime options
 }
 
 // ExecOpts contains options for executing a command in a container
@@ -61,6 +61,7 @@ type CheckpointOpts struct {
 	AllowOpenTCP bool         // Allow open TCP connections
 	SkipInFlight bool         // Skip in-flight TCP connections
 	LinkRemap    bool         // Enable link remapping
+	FileLocks    bool         // Preserve file locks held by container processes
 	OutputWriter OutputWriter // Writer for checkpoint output
 }
 
@@ -71,7 +72,11 @@ type RestoreOpts struct {
 	BundlePath   string       // Path to container bundle
 	OutputWriter OutputWriter // Writer for restore output
 	Started      chan<- int   // PID channel
-	TCPClose     bool         // Close TCP connections on restore
+	// AllowOpenTCP restores established TCP connections. It is mutually
+	// exclusive with TCPClose and takes precedence if both are true.
+	AllowOpenTCP bool
+	// TCPClose closes TCP connections on restore unless AllowOpenTCP is true.
+	TCPClose bool
 }
 
 // OutputWriter is an interface for writing container output
@@ -124,12 +129,13 @@ type Runtime interface {
 
 // Config contains configuration for creating a runtime
 type Config struct {
-	Type          string // "runc" | "gvisor"
-	RuncPath      string // Path to runc binary (default: "runc")
-	RunscPath     string // Path to runsc binary (default: "runsc")
-	RunscPlatform string // "kvm" | "ptrace" (optional)
-	RunscRoot     string // Root directory for runsc state (default: "/run/gvisor")
-	Debug         bool   // Enable debug mode
+	Type           string // "runc" | "gvisor"
+	RuncPath       string // Path to runc binary (default: "runc")
+	RunscPath      string // Path to runsc binary (default: "runsc")
+	RunscPlatform  string // "kvm" | "systrap" | "ptrace" (optional)
+	RunscRoot      string // Root directory for runsc state (default: "/run/gvisor")
+	RunscExtraArgs []string
+	Debug          bool // Enable debug mode
 }
 
 // New creates a new Runtime based on the provided configuration

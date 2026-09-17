@@ -51,10 +51,10 @@ func (gws GatewayService) ListContainers(ctx context.Context, in *pb.ListContain
 			StubId:       state.StubId,
 			WorkspaceId:  state.WorkspaceId,
 			Status:       string(state.Status),
-			ScheduledAt:  timestamppb.New(time.Unix(state.ScheduledAt, 0)),
-			StartedAt:    timestamppb.New(time.Unix(state.StartedAt, 0)),
-			WorkerId:     containerWorkerMap[state.ContainerId].WorkerId,
-			MachineId:    containerWorkerMap[state.ContainerId].MachineId,
+			ScheduledAt:  containerTimestamp(state.ScheduledAt),
+			StartedAt:    containerTimestamp(state.StartedAt),
+			WorkerId:     firstContainerDetail(state.WorkerId, containerWorkerMap[state.ContainerId].WorkerId),
+			MachineId:    firstContainerDetail(state.MachineId, containerWorkerMap[state.ContainerId].MachineId),
 			DeploymentId: deploymentId,
 		})
 	}
@@ -63,6 +63,22 @@ func (gws GatewayService) ListContainers(ctx context.Context, in *pb.ListContain
 		Ok:         true,
 		Containers: containers,
 	}, nil
+}
+
+func firstContainerDetail(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func containerTimestamp(unixSeconds int64) *timestamppb.Timestamp {
+	if unixSeconds <= 0 {
+		return nil
+	}
+	return timestamppb.New(time.Unix(unixSeconds, 0))
 }
 
 type containerDetails struct {
@@ -114,7 +130,7 @@ func (gws GatewayService) CheckpointContainer(ctx context.Context, in *pb.Checkp
 		}, nil
 	}
 
-	resp, err := client.Checkpoint(ctx, in.ContainerId)
+	resp, err := client.Checkpoint(ctx, in.ContainerId, common.ContainerCheckpointOptions{})
 	if err != nil {
 		return &pb.CheckpointContainerResponse{
 			Ok:       false,
@@ -161,7 +177,7 @@ func (gws *GatewayService) getClient(ctx context.Context, containerId, token str
 		return nil, nil, err
 	}
 
-	conn, err := network.ConnectToHost(ctx, hostname, time.Second*30, gws.tailscale, gws.appConfig.Tailscale)
+	conn, err := network.ConnectToBackend(ctx, hostname, time.Second*30, gws.tailscale, gws.appConfig.Tailscale, gws.containerRepo)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -231,8 +247,12 @@ func (gws *GatewayService) AttachToContainer(stream pb.GatewayService_AttachToCo
 		return stream.Send(containerNotFoundResponse)
 	}
 
+	if !auth.HasInteractivePermission(authInfo) || authInfo.Workspace == nil {
+		return stream.Send(containerNotFoundResponse)
+	}
+
 	container, err := gws.containerRepo.GetContainerState(attachReq.ContainerId)
-	if err != nil {
+	if err != nil || container == nil || container.WorkspaceId != authInfo.Workspace.ExternalId {
 		return stream.Send(containerNotFoundResponse)
 	}
 
@@ -337,11 +357,16 @@ func (gws *GatewayService) AttachToContainer(stream pb.GatewayService_AttachToCo
 
 			switch payload := inMsg.Payload.(type) {
 			case *pb.ContainerStreamMessage_SyncContainerWorkspace:
+				syncRequest := bindSyncRequestToContainer(payload.SyncContainerWorkspace, container.ContainerId)
+				if syncRequest == nil {
+					continue
+				}
+
 				if types.StubType(stub.Type).IsServe() {
 					gws.redisClient.Expire(ctx, common.RedisKeys.SchedulerServeLock(stub.Workspace.Name, stub.ExternalId), serveTimeout)
 				}
 
-				syncQueue <- payload.SyncContainerWorkspace
+				syncQueue <- syncRequest
 			default:
 			}
 		}
@@ -355,4 +380,14 @@ func (gws *GatewayService) AttachToContainer(stream pb.GatewayService_AttachToCo
 		cancel()
 		return err
 	}
+}
+
+func bindSyncRequestToContainer(request *pb.SyncContainerWorkspaceRequest, containerId string) *pb.SyncContainerWorkspaceRequest {
+	if request == nil {
+		return nil
+	}
+
+	boundRequest := *request
+	boundRequest.ContainerId = containerId
+	return &boundRequest
 }

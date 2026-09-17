@@ -45,6 +45,9 @@ type Builder struct {
 	tailscale     *network.Tailscale
 	eventBus      *common.EventBus
 	skopeoClient  common.SkopeoClient
+	rdb           *common.RedisClient
+	// existsOverride replaces the registry lookup in tests.
+	existsOverride func(context.Context, string) (bool, error)
 }
 
 func NewBuilder(config types.AppConfig, registry *registry.ImageRegistry, scheduler *scheduler.Scheduler, tailscale *network.Tailscale, containerRepo repository.ContainerRepository, rdb *common.RedisClient) (*Builder, error) {
@@ -56,6 +59,7 @@ func NewBuilder(config types.AppConfig, registry *registry.ImageRegistry, schedu
 		containerRepo: containerRepo,
 		eventBus:      common.NewEventBus(rdb),
 		skopeoClient:  common.NewSkopeoClient(config),
+		rdb:           rdb,
 	}, nil
 }
 
@@ -90,6 +94,11 @@ func (b *Builder) startBuildContainer(ctx context.Context, build *Build) error {
 		return err
 	}
 
+	if err := b.containerRepo.SetBuildContainerTTL(build.containerID, time.Duration(imageContainerTtlS)*time.Second); err != nil {
+		build.log(true, "Failed to connect to build container.\n")
+		return err
+	}
+
 	if err = b.scheduler.Run(containerRequest); err != nil {
 		build.log(true, err.Error()+"\n")
 		return err
@@ -101,13 +110,9 @@ func (b *Builder) startBuildContainer(ctx context.Context, build *Build) error {
 		return err
 	}
 
-	if err := b.containerRepo.SetBuildContainerTTL(build.containerID, time.Duration(imageContainerTtlS)*time.Second); err != nil {
-		build.log(true, "Failed to connect to build container.\n")
-		return err
-	}
-
 	go b.refreshBuildContainerTTL(ctx, build.containerID)
 
+	build.routeResolver = b.containerRepo
 	return build.connectToHost(hostname, b.tailscale)
 }
 
@@ -203,6 +208,9 @@ func (b *Builder) Build(ctx context.Context, opts *BuildOpts, outputChan chan co
 	if err != nil {
 		return err
 	}
+	if dockerfile, sourceImage, ok := b.reuseBuiltPrefix(ctx, opts); ok {
+		build.dockerfile, build.sourceImage = dockerfile, sourceImage
+	}
 
 	// Send a stop-build event to the worker if the user cancels the build
 	go b.handleBuildCancellation(ctx, build)
@@ -214,7 +222,9 @@ func (b *Builder) Build(ctx context.Context, opts *BuildOpts, outputChan chan co
 		return err
 	}
 
-	go build.streamLogs()
+	if build.containerClient != nil {
+		go build.streamLogs()
+	}
 
 	// Wait for the build container lifecycle to complete
 	err = b.waitForBuildContainer(ctx, build)
@@ -239,6 +249,10 @@ func (b *Builder) Build(ctx context.Context, opts *BuildOpts, outputChan chan co
 		}
 	}
 
+	if isV2 {
+		b.recordBuiltDockerfile(ctx, opts, build.imageID)
+	}
+
 	// Send final completion message with image ID
 	build.setSuccess(true)
 	build.logWithImageAndPythonVersion(true, "Build completed successfully")
@@ -256,18 +270,55 @@ func (b *Builder) hasWorkToDo(opts *BuildOpts) bool {
 		(opts.PythonVersion != "" && !opts.IgnorePython)
 }
 
-// renderEnvVarsAndSecrets adds ENV directives and ARG directives to a Dockerfile
-func renderEnvVarsAndSecrets(sb *strings.Builder, opts *BuildOpts) {
-	// Add environment variables
-	if len(opts.EnvVars) > 0 {
-		for _, envVar := range opts.EnvVars {
-			if envVar != "" {
-				sb.WriteString("ENV ")
-				sb.WriteString(envVar)
-				sb.WriteString("\n")
-			}
+// dockerfileVarRef matches a $NAME or ${NAME...} reference inside an ENV value,
+// capturing the backslashes before it: an odd run escapes the dollar sign, and
+// the Dockerfile then carries it literally rather than as a reference.
+var dockerfileVarRef = regexp.MustCompile(`(\\*)\$\{?([A-Za-z_][A-Za-z0-9_]*)`)
+
+// referencesAny reports whether value substitutes any of the given variables.
+func referencesAny(value string, names map[string]bool) bool {
+	for _, ref := range dockerfileVarRef.FindAllStringSubmatch(value, -1) {
+		if len(ref[1])%2 == 0 && names[ref[2]] {
+			return true
 		}
 	}
+	return false
+}
+
+// renderEnvVarsAndSecrets adds ENV directives and ARG directives to a Dockerfile
+func renderEnvVarsAndSecrets(sb *strings.Builder, opts *BuildOpts) {
+	// Variables share one ENV instruction where they can: each instruction is
+	// a layer commit, and a commit snapshots the rootfs whatever the step
+	// changed. Substitution within an instruction only sees the environment
+	// before it, so a value that references a variable set earlier in the
+	// same instruction would resolve to the old value; such a variable starts
+	// a new instruction instead.
+	var batch []string
+	defined := map[string]bool{}
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		sb.WriteString("ENV ")
+		sb.WriteString(strings.Join(batch, " "))
+		sb.WriteString("\n")
+		batch = nil
+		clear(defined)
+	}
+	for _, envVar := range opts.EnvVars {
+		if envVar == "" {
+			continue
+		}
+		if name, value, ok := strings.Cut(envVar, "="); ok && name != "" {
+			if referencesAny(value, defined) {
+				flush()
+			}
+			defined[name] = true
+			envVar = name + "=" + quoteDockerfileValue(value)
+		}
+		batch = append(batch, envVar)
+	}
+	flush()
 
 	// Add build secrets as ARG directives
 	// Secrets are mounted at build time using buildah --build-arg flag
@@ -283,6 +334,31 @@ func renderEnvVarsAndSecrets(sb *strings.Builder, opts *BuildOpts) {
 			}
 		}
 	}
+}
+
+// quoteDockerfileValue makes a value safe to sit among others on one ENV line:
+// bare values end at whitespace, so anything containing it or a quote is
+// double-quoted. Values are Dockerfile syntax, as they always were when each
+// had its own ENV line: $VAR expands and \$ is a literal dollar sign, inside
+// quotes as much as outside. Backslashes are therefore kept as written, and
+// only an unescaped double quote needs escaping.
+func quoteDockerfileValue(value string) string {
+	if !strings.ContainsAny(value, " \t\"'") {
+		return value
+	}
+	var quoted strings.Builder
+	quoted.WriteByte('"')
+	escaped := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '"' && !escaped {
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteByte(ch)
+		escaped = ch == '\\' && !escaped
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
 }
 
 // appendToDockerfile appends additional build steps to a custom Dockerfile
@@ -471,8 +547,13 @@ func (b *Builder) refreshBuildContainerTTL(ctx context.Context, containerId stri
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := b.containerRepo.SetBuildContainerTTL(containerId, time.Duration(imageContainerTtlS)*time.Second); err != nil {
-				log.Error().Str("container_id", containerId).Err(err).Msg("failed to set build container ttl")
+			refreshed, err := b.containerRepo.RefreshBuildContainerTTL(containerId, time.Duration(imageContainerTtlS)*time.Second)
+			if err != nil {
+				log.Error().Str("container_id", containerId).Err(err).Msg("failed to refresh build container ttl")
+				continue
+			}
+			if !refreshed {
+				return
 			}
 		}
 	}
@@ -528,14 +609,24 @@ func ExtractImageNameAndTag(imageRef string) (BaseImage, error) {
 }
 
 func (b *Builder) stopBuild(containerId string) error {
-	_, err := b.eventBus.Send(&common.Event{
-		Type:          common.StopBuildEventType(containerId),
-		Args:          map[string]any{"container_id": containerId},
-		LockAndDelete: false,
-	})
-	if err != nil {
-		log.Error().Err(err).Msg("failed to send stop build event")
-		return err
+	events := []struct {
+		eventType common.EventType
+		errorMsg  string
+	}{
+		{eventType: common.EventTypeStopBuild, errorMsg: "failed to send stop build event"},
+		{eventType: common.StopBuildEventType(containerId), errorMsg: "failed to send legacy stop build event"},
+	}
+
+	for _, event := range events {
+		_, err := b.eventBus.Send(&common.Event{
+			Type:          event.eventType,
+			Args:          map[string]any{"container_id": containerId},
+			LockAndDelete: false,
+		})
+		if err != nil {
+			log.Error().Err(err).Msg(event.errorMsg)
+			return err
+		}
 	}
 
 	log.Info().Str("container_id", containerId).Msg("sent stop build event")
@@ -552,7 +643,14 @@ func (b *Builder) handleBuildCancellation(ctx context.Context, build *Build) {
 		log.Error().Str("container_id", build.containerID).Err(err).Msg("failed to stop build")
 	}
 
-	err = b.containerRepo.UpdateContainerStatus(build.containerID, types.ContainerStatusStopping, time.Now().Unix())
+	if build.containerClient == nil {
+		if err := b.containerRepo.DeleteContainerState(build.containerID); err != nil {
+			log.Error().Str("container_id", build.containerID).Err(err).Msg("failed to delete pending build container state")
+		}
+		return
+	}
+
+	err = b.containerRepo.UpdateContainerStatus(build.containerID, types.ContainerStatusStopping, types.ContainerStateTtlSWhileStopping)
 	if err != nil {
 		log.Error().Str("container_id", build.containerID).Err(err).Msg("failed to update container status")
 	}

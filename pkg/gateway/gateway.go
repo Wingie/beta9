@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/labstack/echo-contrib/pprof"
@@ -25,6 +28,7 @@ import (
 	_shell "github.com/beam-cloud/beta9/pkg/abstractions/shell"
 	"github.com/beam-cloud/beta9/pkg/clients"
 
+	disk "github.com/beam-cloud/beta9/pkg/abstractions/disk"
 	"github.com/beam-cloud/beta9/pkg/abstractions/function"
 	"github.com/beam-cloud/beta9/pkg/abstractions/image"
 	dmap "github.com/beam-cloud/beta9/pkg/abstractions/map"
@@ -38,7 +42,9 @@ import (
 	"github.com/beam-cloud/beta9/pkg/common"
 	gatewaymiddleware "github.com/beam-cloud/beta9/pkg/gateway/middleware"
 	gatewayservices "github.com/beam-cloud/beta9/pkg/gateway/services"
+	computesvc "github.com/beam-cloud/beta9/pkg/gateway/services/compute"
 	repositoryservices "github.com/beam-cloud/beta9/pkg/gateway/services/repository"
+	thundersvc "github.com/beam-cloud/beta9/pkg/gateway/services/thunder"
 	"github.com/beam-cloud/beta9/pkg/network"
 	"github.com/beam-cloud/beta9/pkg/repository"
 	usage "github.com/beam-cloud/beta9/pkg/repository/usage"
@@ -52,6 +58,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -60,12 +67,15 @@ type Gateway struct {
 	Config               types.AppConfig
 	httpServer           *http.Server
 	grpcServer           *grpc.Server
+	healthServer         *health.Server
 	RedisClient          *common.RedisClient
 	TaskDispatcher       *task.Dispatcher
 	TaskRepo             repository.TaskRepository
 	WorkspaceRepo        repository.WorkspaceRepository
 	ContainerRepo        repository.ContainerRepository
 	BackendRepo          repository.BackendRepository
+	ComputeRepo          repository.ComputeRepository
+	ComputeService       *computesvc.Service
 	ProviderRepo         repository.ProviderRepository
 	WorkerPoolRepo       repository.WorkerPoolRepository
 	EventRepo            repository.EventRepository
@@ -77,10 +87,20 @@ type Gateway struct {
 	Scheduler            *scheduler.Scheduler
 	ctx                  context.Context
 	cancelFunc           context.CancelFunc
+	drainCtx             context.Context
+	drainCancelFunc      context.CancelFunc
 	baseRouteGroup       *echo.Group
 	rootRouteGroup       *echo.Group
-	InferenceRegistry    *ModelRegistry
+	draining             atomic.Bool
 }
+
+const (
+	gatewayDrainPropagationDelay = 10 * time.Second
+	gatewayGRPCShutdownMaxWait   = 5 * time.Second
+	gatewayTailscaleStartTimeout = 30 * time.Second
+	gatewayLivenessService       = "liveness"
+	gatewayReadinessService      = "readiness"
+)
 
 func NewGateway() (*Gateway, error) {
 	configManager, err := common.NewConfigManager[types.AppConfig]()
@@ -99,7 +119,7 @@ func NewGateway() (*Gateway, error) {
 		return nil, err
 	}
 
-	eventRepo := repository.NewTCPEventClientRepo(config.Monitoring.FluentBit.Events)
+	eventRepo := repository.NewEventClientRepo(config)
 
 	storage, err := storage.NewStorage(config.Storage, nil)
 	if err != nil {
@@ -107,11 +127,14 @@ func NewGateway() (*Gateway, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	drainCtx, drainCancel := context.WithCancel(context.Background())
 	gateway := &Gateway{
-		RedisClient: redisClient,
-		ctx:         ctx,
-		cancelFunc:  cancel,
-		Storage:     storage,
+		RedisClient:     redisClient,
+		ctx:             ctx,
+		cancelFunc:      cancel,
+		drainCtx:        drainCtx,
+		drainCancelFunc: drainCancel,
+		Storage:         storage,
 	}
 
 	backendRepo, err := repository.NewBackendPostgresRepository(config.Database.Postgres, eventRepo)
@@ -119,30 +142,16 @@ func NewGateway() (*Gateway, error) {
 		return nil, err
 	}
 
-	if release, err := gateway.initLock("postgres"); err == nil {
-		defer release()
-		if err = backendRepo.Migrate(); err != nil {
-			return nil, err
-		}
+	if err := gateway.migratePostgres(backendRepo); err != nil {
+		return nil, err
 	}
 
 	tailscaleRepo := repository.NewTailscaleRedisRepository(redisClient, config)
-	tailscale := network.GetOrCreateTailscale(network.TailscaleConfig{
-		ControlURL: config.Tailscale.ControlURL,
-		AuthKey:    config.Tailscale.AuthKey,
-		Hostname:   config.Tailscale.HostName,
-		Debug:      config.Tailscale.Debug,
-		Ephemeral:  true,
-	}, tailscaleRepo)
-
-	// Start the Tailscale connection if configured
-	if config.Tailscale.Enabled && config.Tailscale.AuthKey != "" {
-		if err := tailscale.Start(ctx); err != nil {
-			log.Warn().Err(err).Msg("failed to start tailscale, external worker features may not work")
-		}
-	}
+	tailscale := network.GetOrCreateTailscale(gatewayTailscaleConfig(config), tailscaleRepo)
 
 	workspaceRepo := repository.NewWorkspaceRedisRepository(redisClient)
+	computeRepo := repository.NewComputeRedisRepository(redisClient)
+	managedPoolRepo := repository.NewManagedPoolRedisRepository(redisClient)
 
 	scheduler, err := scheduler.NewScheduler(ctx, config, redisClient, usageMetricsRepo, backendRepo, workspaceRepo, tailscale)
 	if err != nil {
@@ -172,6 +181,7 @@ func NewGateway() (*Gateway, error) {
 	gateway.ProviderRepo = providerRepo
 	gateway.WorkerPoolRepo = workerPoolRepo
 	gateway.BackendRepo = backendRepo
+	gateway.ComputeRepo = computeRepo
 	gateway.Tailscale = tailscale
 	gateway.TaskDispatcher = taskDispatcher
 	gateway.UsageMetricsRepo = usageMetricsRepo
@@ -179,22 +189,39 @@ func NewGateway() (*Gateway, error) {
 	gateway.workerRepo = workerRepo
 	gateway.DefaultStorageClient = storageClient
 
+	keyEventManager := common.NewKeyEventManager(redisClient)
+	gateway.ComputeService = computesvc.New(computesvc.Options{
+		Config:           config,
+		BackendRepo:      backendRepo,
+		ContainerRepo:    containerRepo,
+		Scheduler:        scheduler,
+		EventRepo:        eventRepo,
+		WorkerRepo:       workerRepo,
+		WorkerPoolRepo:   workerPoolRepo,
+		UsageMetricsRepo: usageMetricsRepo,
+		ComputeRepo:      computeRepo,
+		ManagedPoolRepo:  managedPoolRepo,
+		KeyEventManager:  keyEventManager,
+		RedisClient:      redisClient,
+		Tailscale:        tailscale,
+	})
+	gateway.ComputeService.Start(ctx)
+
 	return gateway, nil
 }
 
-func (g *Gateway) initLock(name string) (func(), error) {
-	lockKey := fmt.Sprintf("gateway:init:%v:lock", name)
+type postgresMigrator interface {
+	MigrateContext(context.Context) error
+}
+
+func (g *Gateway) migratePostgres(backendRepo postgresMigrator) error {
+	const lockTTL = 30 * time.Second
 	lock := common.NewRedisLock(g.RedisClient)
-
-	if err := lock.Acquire(g.ctx, lockKey, common.RedisLockOptions{TtlS: 10, Retries: 1}); err != nil {
-		return nil, err
-	}
-
-	return func() {
-		if err := lock.Release(lockKey); err != nil {
-			log.Error().Str("lock_key", lockKey).Err(err).Msg("failed to release init lock")
-		}
-	}, nil
+	return lock.WithLease(g.ctx, "gateway:init:postgres:lock", common.RedisLockOptions{
+		TtlS:          int(lockTTL.Seconds()),
+		Retries:       480,
+		RetryInterval: 500 * time.Millisecond,
+	}, backendRepo.MigrateContext)
 }
 
 func (g *Gateway) initHttp() error {
@@ -222,8 +249,12 @@ func (g *Gateway) initHttp() error {
 		AllowHeaders: g.Config.GatewayService.HTTP.CORS.AllowedHeaders,
 		AllowMethods: g.Config.GatewayService.HTTP.CORS.AllowedMethods,
 	}))
+	// Subdomain middleware can dispatch requests directly, so drain handling must run first.
+	e.Use(g.drainMiddleware)
 	e.Use(gatewaymiddleware.Subdomain(g.Config.GatewayService.HTTP.GetExternalURL(), g.BackendRepo, g.RedisClient))
 	e.Use(middleware.Recover())
+	e.GET("/install/agent", agentInstallScriptHandler())
+	e.GET("/install/agent/:os/:arch", agentBinaryHandler())
 
 	// Accept both HTTP/2 and HTTP/1
 	g.httpServer = &http.Server{
@@ -235,27 +266,20 @@ func (g *Gateway) initHttp() error {
 	g.baseRouteGroup = e.Group(apiv1.HttpServerBaseRoute)
 	g.rootRouteGroup = e.Group(apiv1.HttpServerRootRoute)
 
-	// Register inference routes
-	inferenceGroup := g.baseRouteGroup.Group("/inference", authMiddleware)
-	if g.InferenceRegistry == nil {
-		g.InferenceRegistry = NewModelRegistry()
-	}
-	inferenceService := NewInferenceService(g.ctx, g.InferenceRegistry)
-	inferenceService.RegisterRoutes(inferenceGroup)
-
-	apiv1.NewHealthGroup(g.baseRouteGroup.Group("/health"), g.RedisClient, g.BackendRepo)
-	apiv1.NewMachineGroup(g.baseRouteGroup.Group("/machine", authMiddleware), g.ProviderRepo, g.Tailscale, g.Config, g.workerRepo, g.InferenceRegistry)
+	apiv1.NewHealthGroup(g.baseRouteGroup.Group("/health"), g.RedisClient, g.BackendRepo, g.isReady)
+	apiv1.NewMachineGroup(g.baseRouteGroup.Group("/machine", authMiddleware), g.ProviderRepo, g.Tailscale, g.Config, g.workerRepo)
 	apiv1.NewWorkspaceGroup(g.baseRouteGroup.Group("/workspace", authMiddleware), g.BackendRepo, g.WorkspaceRepo, g.DefaultStorageClient, g.Config)
 	apiv1.NewTokenGroup(g.baseRouteGroup.Group("/token", authMiddleware), g.BackendRepo, g.WorkspaceRepo, g.Config)
-	apiv1.NewTaskGroup(g.baseRouteGroup.Group("/task", authMiddleware), g.RedisClient, g.TaskRepo, g.ContainerRepo, g.BackendRepo, g.TaskDispatcher, g.Scheduler, g.Config)
+	apiv1.NewTaskGroup(g.baseRouteGroup.Group("/task", authMiddleware), g.RedisClient, g.TaskRepo, g.ContainerRepo, g.EventRepo, g.BackendRepo, g.TaskDispatcher, g.Scheduler, g.Config)
+	apiv1.NewEventGroup(g.baseRouteGroup.Group("/events", authMiddleware), g.BackendRepo, g.ContainerRepo, g.EventRepo)
+	apiv1.NewLogGroup(g.baseRouteGroup.Group("/logs", authMiddleware), g.BackendRepo, g.ContainerRepo, repository.NewComputeRedisRepository(g.RedisClient), g.EventRepo)
+	apiv1.NewMetricsGroup(g.baseRouteGroup.Group("/metrics", authMiddleware), g.BackendRepo, g.EventRepo)
 	apiv1.NewContainerGroup(g.baseRouteGroup.Group("/container", authMiddleware), g.BackendRepo, g.ContainerRepo, *g.Scheduler, g.Config)
-	apiv1.NewStubGroup(g.baseRouteGroup.Group("/stub", authMiddleware), g.BackendRepo, g.EventRepo, g.Config)
+	apiv1.NewStubGroup(g.baseRouteGroup.Group("/stub", authMiddleware), g.BackendRepo, g.ContainerRepo, g.EventRepo, g.RedisClient, g.Config)
 	apiv1.NewConcurrencyLimitGroup(g.baseRouteGroup.Group("/concurrency-limit", authMiddleware), g.BackendRepo, g.WorkspaceRepo)
 	apiv1.NewDeploymentGroup(g.baseRouteGroup.Group("/deployment", authMiddleware), g.BackendRepo, g.ContainerRepo, *g.Scheduler, g.RedisClient, g.Config)
 	apiv1.NewAppGroup(g.baseRouteGroup.Group("/app", authMiddleware), g.BackendRepo, g.Config, g.ContainerRepo, *g.Scheduler, g.RedisClient)
-
-	// Start registry cleanup
-	StartRegistryCleanup(g.ctx, g.InferenceRegistry)
+	apiv1.NewPoolGroup(g.baseRouteGroup.Group("/pools", authMiddleware), g.ComputeService)
 
 	return nil
 }
@@ -268,6 +292,20 @@ func (g *Gateway) initGrpc() error {
 		grpc.StreamInterceptor(authInterceptor.Stream()),
 		grpc.MaxRecvMsgSize(g.Config.GatewayService.GRPC.MaxRecvMsgSize * 1024 * 1024),
 		grpc.MaxSendMsgSize(g.Config.GatewayService.GRPC.MaxSendMsgSize * 1024 * 1024),
+		// Permit client keepalive pings (including without active streams) so
+		// long-lived clients like workers can detect a connection broken by a
+		// gateway rollout. MinTime must be <= the client's keepalive Time to
+		// avoid sending "too_many_pings" GOAWAYs.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		// Server-side keepalive so the gateway also detects and reaps dead client
+		// connections rather than holding them open.
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    20 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
 	}
 
 	g.grpcServer = grpc.NewServer(
@@ -283,7 +321,7 @@ func (g *Gateway) initGrpcProxy(grpcAddr string) error {
 	g.httpServer.RegisterOnShutdown(func() {
 		cancel()
 	})
-	mux := runtime.NewServeMux()
+	mux := runtime.NewServeMux(runtime.WithOutgoingHeaderMatcher(gatewayOutgoingHeaderMatcher))
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	if err := pb.RegisterPodServiceHandlerFromEndpoint(ctx, mux, grpcAddr, opts); err != nil {
 		return err
@@ -292,6 +330,9 @@ func (g *Gateway) initGrpcProxy(grpcAddr string) error {
 		return err
 	}
 	if err := pb.RegisterVolumeServiceHandlerFromEndpoint(ctx, mux, grpcAddr, opts); err != nil {
+		return err
+	}
+	if err := pb.RegisterDiskServiceHandlerFromEndpoint(ctx, mux, grpcAddr, opts); err != nil {
 		return err
 	}
 	if err := pb.RegisterGatewayServiceHandlerFromEndpoint(ctx, mux, grpcAddr, opts); err != nil {
@@ -305,9 +346,22 @@ func (g *Gateway) initGrpcProxy(grpcAddr string) error {
 	return nil
 }
 
+func gatewayOutgoingHeaderMatcher(key string) (string, bool) {
+	switch strings.ToLower(key) {
+	case "cache-control":
+		return "Cache-Control", true
+	case "pragma":
+		return "Pragma", true
+	case "content-disposition":
+		return "Content-Disposition", true
+	default:
+		return runtime.DefaultHeaderMatcher(key)
+	}
+}
+
 // Register repository services
 func (g *Gateway) registerRepositoryServices() error {
-	wr := repositoryservices.NewWorkerRepositoryService(g.ctx, g.workerRepo)
+	wr := repositoryservices.NewWorkerRepositoryService(g.ctx, g.workerRepo, g.ContainerRepo, g.BackendRepo, g.ComputeRepo, g.EventRepo, g.RedisClient, g.Config, g.Config.Cache.Coordinator.Token)
 	pb.RegisterWorkerRepositoryServiceServer(g.grpcServer, wr)
 
 	cr := repositoryservices.NewContainerRepositoryService(g.ctx, g.ContainerRepo)
@@ -338,6 +392,18 @@ func (g *Gateway) registerServices() error {
 		return err
 	}
 	pb.RegisterSimpleQueueServiceServer(g.grpcServer, rq)
+
+	// Register Thunder service
+	ts, err := thundersvc.NewService(thundersvc.ServiceOpts{
+		RedisClient:         g.RedisClient,
+		ContainerRepo:       g.ContainerRepo,
+		WorkerRepo:          g.workerRepo,
+		AgentStateValidator: g.ComputeService,
+	})
+	if err != nil {
+		return err
+	}
+	pb.RegisterThunderServiceServer(g.grpcServer, ts)
 
 	// Register image service
 	is, err := image.NewContainerImageService(g.ctx, image.ImageServiceOpts{
@@ -414,25 +480,37 @@ func (g *Gateway) registerServices() error {
 	pb.RegisterEndpointServiceServer(g.grpcServer, ws)
 
 	// Register volume service
-	vs, err := volume.NewGlobalVolumeService(g.Config.FileService, g.BackendRepo, g.WorkspaceRepo, g.RedisClient, g.rootRouteGroup)
+	vs, err := volume.NewGlobalVolumeService(g.Config.FileService, g.Config.Storage.WorkspaceStorage, g.BackendRepo, g.WorkspaceRepo, g.RedisClient, g.rootRouteGroup)
 	if err != nil {
 		return err
 	}
 	pb.RegisterVolumeServiceServer(g.grpcServer, vs)
 
+	// Register disk service
+	ds, err := disk.NewGlobalDiskService(g.BackendRepo, g.WorkspaceRepo, g.baseRouteGroup)
+	if err != nil {
+		return err
+	}
+	pb.RegisterDiskServiceServer(g.grpcServer, ds)
+
 	// Register pod service
 	ps, err := pod.NewPodService(
 		g.ctx,
 		pod.PodServiceOpts{
-			Config:        g.Config,
-			BackendRepo:   g.BackendRepo,
-			ContainerRepo: g.ContainerRepo,
-			Tailscale:     g.Tailscale,
-			Scheduler:     g.Scheduler,
-			RedisClient:   g.RedisClient,
-			EventRepo:     g.EventRepo,
-			RouteGroup:    g.rootRouteGroup,
-			WorkspaceRepo: g.WorkspaceRepo,
+			Config:         g.Config,
+			BackendRepo:    g.BackendRepo,
+			ContainerRepo:  g.ContainerRepo,
+			ComputeRepo:    g.ComputeRepo,
+			Tailscale:      g.Tailscale,
+			Scheduler:      g.Scheduler,
+			RedisClient:    g.RedisClient,
+			EventRepo:      g.EventRepo,
+			RouteGroup:     g.rootRouteGroup,
+			WorkspaceRepo:  g.WorkspaceRepo,
+			WorkerRepo:     g.workerRepo,
+			WorkerPoolRepo: g.WorkerPoolRepo,
+			TaskDispatcher: g.TaskDispatcher,
+			DrainContext:   g.drainCtx,
 		},
 	)
 	if err != nil {
@@ -480,15 +558,18 @@ func (g *Gateway) registerServices() error {
 
 	// Register shell service
 	ss, err := _shell.NewSSHShellService(g.ctx, _shell.ShellServiceOpts{
-		Config:        g.Config,
-		RedisClient:   g.RedisClient,
-		Scheduler:     g.Scheduler,
-		BackendRepo:   g.BackendRepo,
-		WorkspaceRepo: g.WorkspaceRepo,
-		ContainerRepo: g.ContainerRepo,
-		Tailscale:     g.Tailscale,
-		EventRepo:     g.EventRepo,
-		RouteGroup:    g.rootRouteGroup,
+		Config:         g.Config,
+		RedisClient:    g.RedisClient,
+		Scheduler:      g.Scheduler,
+		BackendRepo:    g.BackendRepo,
+		ComputeRepo:    g.ComputeRepo,
+		WorkspaceRepo:  g.WorkspaceRepo,
+		ContainerRepo:  g.ContainerRepo,
+		WorkerRepo:     g.workerRepo,
+		WorkerPoolRepo: g.WorkerPoolRepo,
+		Tailscale:      g.Tailscale,
+		EventRepo:      g.EventRepo,
+		RouteGroup:     g.rootRouteGroup,
 	})
 	if err != nil {
 		return err
@@ -508,6 +589,7 @@ func (g *Gateway) registerServices() error {
 		Ctx:              g.ctx,
 		Config:           g.Config,
 		BackendRepo:      g.BackendRepo,
+		WorkspaceRepo:    g.WorkspaceRepo,
 		ContainerRepo:    g.ContainerRepo,
 		ProviderRepo:     g.ProviderRepo,
 		Scheduler:        g.Scheduler,
@@ -516,6 +598,9 @@ func (g *Gateway) registerServices() error {
 		EventRepo:        g.EventRepo,
 		WorkerRepo:       g.workerRepo,
 		WorkerPoolRepo:   g.WorkerPoolRepo,
+		ComputeRepo:      g.ComputeRepo,
+		ComputeService:   g.ComputeService,
+		ThunderService:   ts,
 		UsageMetricsRepo: g.UsageMetricsRepo,
 		Tailscale:        g.Tailscale,
 	})
@@ -524,14 +609,7 @@ func (g *Gateway) registerServices() error {
 	}
 	pb.RegisterGatewayServiceServer(g.grpcServer, gws)
 
-	// Register health service
-	hs := health.NewServer()
-	hs.Resume()
-	go func() {
-		<-g.ctx.Done()
-		hs.Shutdown()
-	}()
-	healthpb.RegisterHealthServer(g.grpcServer, hs)
+	g.registerHealthService()
 
 	return nil
 }
@@ -539,6 +617,17 @@ func (g *Gateway) registerServices() error {
 // Gateway entry point
 func (g *Gateway) Start() error {
 	var err error
+	if g.Config.Tailscale.Enabled {
+		ctx, cancel := context.WithTimeout(g.ctx, gatewayTailscaleStartTimeout)
+		err := g.Tailscale.Start(ctx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("failed to connect gateway to tailnet: %w", err)
+		}
+		// Agent routes are warmed with an end-to-end dial when they become ready.
+		// Do not enumerate and ping every tailnet peer here: that makes gateway
+		// startup and periodic keepalives scale with the entire tailnet.
+	}
 
 	if g.Config.Monitoring.Telemetry.Enabled {
 		_, err = common.SetupTelemetry(g.ctx, types.DefaultGatewayServiceName, g.Config)
@@ -577,7 +666,7 @@ func (g *Gateway) Start() error {
 			log.Fatal().Err(err).Msg("failed to listen")
 		}
 
-		if err := g.grpcServer.Serve(lis); err != nil {
+		if err := g.grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
 			log.Fatal().Err(err).Msg("failed to start grpc server")
 		}
 	}()
@@ -598,17 +687,92 @@ func (g *Gateway) Start() error {
 
 	terminationSignal := make(chan os.Signal, 1)
 	signal.Notify(terminationSignal, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(terminationSignal)
 	<-terminationSignal
 	log.Info().Msg("termination signal received. shutting down...")
+	g.startDraining()
+	waitForDrainPropagation(g.ctx)
 	g.shutdown()
 
 	return nil
 }
 
+func (g *Gateway) isReady() bool {
+	return !g.draining.Load()
+}
+
+func (g *Gateway) registerHealthService() {
+	hs := g.newHealthServer()
+	healthpb.RegisterHealthServer(g.grpcServer, hs)
+}
+
+func (g *Gateway) newHealthServer() *health.Server {
+	hs := health.NewServer()
+	hs.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	hs.SetServingStatus(gatewayLivenessService, healthpb.HealthCheckResponse_SERVING)
+	hs.SetServingStatus(gatewayReadinessService, healthpb.HealthCheckResponse_SERVING)
+	g.healthServer = hs
+
+	if g.ctx != nil {
+		go func() {
+			<-g.ctx.Done()
+			hs.Shutdown()
+		}()
+	}
+	return hs
+}
+
+func (g *Gateway) drainMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		c.Response().Before(func() {
+			if g.draining.Load() {
+				c.Response().Header().Set(echo.HeaderConnection, "close")
+			}
+		})
+		return next(c)
+	}
+}
+
+func (g *Gateway) startDraining() {
+	if !g.draining.CompareAndSwap(false, true) {
+		return
+	}
+
+	if g.httpServer != nil {
+		g.httpServer.SetKeepAlivesEnabled(false)
+	}
+	if g.healthServer != nil {
+		g.healthServer.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+		g.healthServer.SetServingStatus(gatewayReadinessService, healthpb.HealthCheckResponse_NOT_SERVING)
+	}
+	if g.drainCancelFunc != nil {
+		g.drainCancelFunc()
+	}
+	log.Info().Msg("gateway entering drain mode")
+}
+
+func waitForDrainPropagation(ctx context.Context) {
+	timer := time.NewTimer(gatewayDrainPropagationDelay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+}
+
+func grpcGracefulStopTimeout(shutdownTimeout time.Duration) time.Duration {
+	if shutdownTimeout <= 0 || shutdownTimeout > gatewayGRPCShutdownMaxWait {
+		return gatewayGRPCShutdownMaxWait
+	}
+	return shutdownTimeout
+}
+
 // Shutdown gracefully shuts down the gateway.
 // This function is blocking and will only return when the gateway has been shut down.
 func (g *Gateway) shutdown() {
-	ctx, cancel := context.WithTimeout(context.Background(), g.Config.GatewayService.ShutdownTimeout)
+	timeout := g.Config.GatewayService.ShutdownTimeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	eg, ctx := errgroup.WithContext(ctx)
@@ -624,18 +788,24 @@ func (g *Gateway) shutdown() {
 			close(done)
 		}()
 
+		timer := time.NewTimer(grpcGracefulStopTimeout(timeout))
+		defer timer.Stop()
+
 		select {
+		case <-timer.C:
+			g.grpcServer.Stop()
+			return nil
 		case <-ctx.Done():
 			g.grpcServer.Stop()
-			return ctx.Err()
+			return nil
 		case <-done:
 			return nil
 		}
 	})
 
-	g.cancelFunc()
-
 	if err := eg.Wait(); err != nil {
-		log.Fatal().Err(err).Msg("failed to shutdown gateway")
+		log.Warn().Err(err).Msg("gateway shutdown completed with errors")
 	}
+
+	g.cancelFunc()
 }

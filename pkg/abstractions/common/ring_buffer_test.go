@@ -138,3 +138,53 @@ func TestRingBuffer_PriorityPushOnFullBuffer(t *testing.T) {
 	}
 
 }
+
+func TestRingBuffer_OverwriteStats(t *testing.T) {
+	rb := NewRingBuffer[int](2)
+
+	if rb.Capacity() != 2 {
+		t.Errorf("expected capacity 2, got %d", rb.Capacity())
+	}
+
+	if overwritten := rb.Push(1, false); overwritten {
+		t.Errorf("expected first push not to overwrite")
+	}
+	if overwritten := rb.Push(2, false); overwritten {
+		t.Errorf("expected second push not to overwrite")
+	}
+	if overwritten := rb.Push(3, false); !overwritten {
+		t.Errorf("expected full buffer push to overwrite")
+	}
+
+	if rb.Overwrites() != 1 {
+		t.Errorf("expected 1 overwrite, got %d", rb.Overwrites())
+	}
+
+	if overwritten := rb.Push(0, true); !overwritten {
+		t.Errorf("expected full priority push to overwrite")
+	}
+	if rb.Overwrites() != 2 {
+		t.Errorf("expected 2 overwrites, got %d", rb.Overwrites())
+	}
+}
+
+func TestRingBuffer_PushWithOverwriteReturnsDisplacedItem(t *testing.T) {
+	rb := NewRingBuffer[int](2)
+
+	if displaced, overwritten := rb.PushWithOverwrite(1, false); overwritten || displaced != 0 {
+		t.Fatalf("first push displaced=%d overwritten=%v, want zero value and false", displaced, overwritten)
+	}
+	if displaced, overwritten := rb.PushWithOverwrite(2, false); overwritten || displaced != 0 {
+		t.Fatalf("second push displaced=%d overwritten=%v, want zero value and false", displaced, overwritten)
+	}
+
+	displaced, overwritten := rb.PushWithOverwrite(3, false)
+	if !overwritten || displaced != 1 {
+		t.Fatalf("normal overwrite displaced=%d overwritten=%v, want 1 and true", displaced, overwritten)
+	}
+
+	displaced, overwritten = rb.PushWithOverwrite(0, true)
+	if !overwritten || displaced != 2 {
+		t.Fatalf("priority overwrite displaced=%d overwritten=%v, want 2 and true", displaced, overwritten)
+	}
+}

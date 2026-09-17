@@ -35,10 +35,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/uv.lock') }}
 
       - name: Install dependencies
-        run: |
-          uv sync
-          uv pip install ruff pytest pytest-cov
-        if: steps.cached-dependencies.outputs.cache-hit != 'true'
+        run: uv sync --locked --group dev
 
       - name: Code formatting
         run: uv run ruff format .
@@ -52,7 +49,6 @@ jobs:
         run: make tests
 
   lint_and_test_go_pkg:
-    needs: lint_and_test_python_sdk
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -60,7 +56,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v3
         with:
-          go-version: "1.21"
+          go-version: "1.25.0"
 
       - name: Cache Go modules
         uses: actions/cache@v3
@@ -75,7 +71,6 @@ jobs:
           make test-pkg
   
   verify_protobufs:
-    needs: lint_and_test_go_pkg
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -83,7 +78,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v3
         with:
-          go-version: "1.21"
+          go-version: "1.25.0"
       
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
@@ -100,10 +95,13 @@ jobs:
         run: |
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.31.0
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
+          go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@v2.27.1
+          go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@v2.27.1
+          go install github.com/beam-cloud/go2proto@091f2e319b32a829052fdc8f02bbb6561c4f0504
         
       - name: Install Python GRPC Package
         run: |
-          python3 -m pip install -U "betterproto-beta9[compiler]" betterproto-beta9 grpcio
+          python3 -m pip install -U "betterproto-beta9[compiler]==2.0.1" "grpcio==1.69.0" "black==24.8.0" "isort==5.13.2"
           sudo apt update
           sudo apt install protobuf-compiler -y
       

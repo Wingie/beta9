@@ -1,296 +1,139 @@
-# Beta9 - Distributed GPU Compute Platform
+<div align="center">
+<p align="center">
+<img alt="Logo" src="static/beam-logo-white.png#gh-dark-mode-only" width="30%">
+<img alt="Logo" src="static/beam-logo-dark.png#gh-light-mode-only" width="30%">
+</p>
 
-**A fork of [beam-cloud/beta9](https://github.com/beam-cloud/beta9) for [Agentosaurus](https://agentosaurus.com)**
+## Run AI Workloads at Scale
 
-Enable external worker support with a new Go-based agent and unified inference routing, so you can run hybrid GPU workloads over SSH/Tailscale with clear docs and a multi-arch CI build pipeline.
+<p align="center">
+  </a>
+    <a href="https://colab.research.google.com/drive/1jSDyYY7FY3Y3jJlCzkmHlH8vTyF-TEmB?usp=sharing">
+    <img alt="Colab" src="https://colab.research.google.com/assets/colab-badge.svg">
+  </a>
+  <a href="https://github.com/beam-cloud/beta9/stargazers">
+    <img alt="⭐ Star the Repo" src="https://img.shields.io/github/stars/beam-cloud/beta9">
+  </a>
+  <a href="https://docs.beam.cloud">
+    <img alt="Documentation" src="https://img.shields.io/badge/docs-quickstart-purple">
+  </a>
+  <a href="https://join.slack.com/t/beam-cloud/shared_invite/zt-39hbkt8ty-CTVv4NsgLoYArjWaVkwcFw">
+    <img alt="Join Slack" src="https://img.shields.io/badge/Beam-Join%20Slack-orange?logo=slack">
+  </a>
+    <a href="https://twitter.com/beam_cloud">
+    <img alt="Twitter" src="https://img.shields.io/twitter/follow/beam_cloud.svg?style=social&logo=twitter">
+  </a>
+    <a href="https://github.com/beam-cloud/beta9?tab=AGPL-3.0-1-ov-file">
+    <img alt="AGPL" src="https://img.shields.io/badge/License-AGPL-green">
+  </a>
+</p>
 
-## Project Status
+</div>
 
-**Work in Progress** - This fork is under active development as the compute infrastructure layer for Agentosaurus, a platform focused on democratizing GPU access for climate research and AI workloads within the European Union.
+**[Beam](https://beam.cloud?utm_source=github_readme)** is a fast, open-source runtime for serverless AI workloads. It gives you a Pythonic interface to deploy and scale AI applications with zero infrastructure overhead.
 
-## Vision
+![Watch the demo](static/readme.gif)
 
-Build a distributed GPU compute platform that:
+## ✨ Features
 
-- **Brings Your Own GPU**: Connect any machine (cloud VMs, workstations, Mac Studios) to a unified compute pool
-- **Supports Heterogeneous Hardware**: NVIDIA CUDA, Apple MPS, AMD ROCm (planned), Intel Arc (planned)
-- **Enables Serverless by Default**: Scale to zero, pay only for compute time used
-- **Maintains EU Data Sovereignty**: All data and compute remains within European infrastructure
-- **Prioritizes Carbon Efficiency**: Verified renewable energy usage with transparent carbon reporting
+- **Fast Cold Starts**: Launch containers in under a second using a custom container runtime, scheduler, and embedded caching
+- **Parallelization and Concurrency**: Fan out workloads to 100s of containers
+- **First-Class Developer Experience**: Hot-reloading, webhooks, and scheduled jobs
+- **Scale-to-Zero**: Workloads are serverless by default
+- **Volume Storage**: Mount distributed storage volumes
+- **GPU Support**: Run on our cloud (4090s, H100s, and more) or bring your own GPUs
 
-## Architecture
+## 📦 Installation
 
-```
-                          TAILSCALE MESH VPN
-            (Encrypted overlay network - 100.x.x.x addressing)
-    ┌─────────────────────────────────────────────────────────────┐
-    │                                                             │
-    ▼                           ▼                           ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   GATEWAY       │     │   WORKER 1      │     │   WORKER 2      │
-│   (OCI Cloud)   │     │   (Mac MPS)     │     │   (NVIDIA GPU)  │
-│                 │     │                 │     │                 │
-│  ┌───────────┐  │     │  ┌───────────┐  │     │  ┌───────────┐  │
-│  │ Gateway   │◄─┼─────┼──│ b9agent   │  │     │  │ b9agent   │  │
-│  │ :1993/94  │  │     │  │ :9999     │  │     │  │ :9999     │  │
-│  └───────────┘  │     │  └─────┬─────┘  │     │  └─────┬─────┘  │
-│        │        │     │        │        │     │        │        │
-│        ▼        │     │        ▼        │     │        ▼        │
-│  ┌───────────┐  │     │  ┌───────────┐  │     │  ┌───────────┐  │
-│  │ k3s API   │◄─┼─────┼──│ Ollama    │  │     │  │ vLLM      │  │
-│  │ Scheduler │  │     │  │ :11434    │  │     │  │ :8000     │  │
-│  └───────────┘  │     │  └───────────┘  │     │  └───────────┘  │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-     Control Plane           MPS Inference         CUDA Inference
-```
-
-### New Features in this Fork
-
-- **New Go-based Agent (`b9agent`)**: Includes TUI, persistent config, control API (start/stop/pull models), keepalive, and job monitoring.
-- **Unified Inference Routing**: Gateway inference router, model registry, and OpenAI-compatible endpoints; enabled Tailscale and hostNetwork for external connectivity.
-- **External Worker API**: Expanded machine API with register/keepalive and TTL-based lifecycle; added detailed API/docs for external workers and self-hosting.
-- **Python SDK**: Added `beta9.inference` module (chat/generate/embed) and test scripts.
-- **Flexible Configuration**: External worker config supports direct Redis host, external image registries/ports, CoreDNS override, and Podman-friendly k3d settings.
-- **Multi-Arch CI**: New GitHub Action to build/push multi-arch images to `registry.agentosaurus.com` with improved sequencing and reliability.
-
-### Migration Guide for Existing Users
-
-1.  **Registry Credentials**: Create `registry-credentials` secret and set `ExternalImageRegistry` / runner registry in config.
-2.  **Networking**: Configure `TAILSCALE_AUTHKEY` or direct `REDIS_HOST`; expose NodePorts for Redis/S3/Registry; deploy Gateway with `hostNetwork: true`.
-3.  **Agent Setup**: Initialize and run `b9agent`, then set up SSH tunnel (forward 1994; reverse 6443 if needed).
-4.  **K8s Config**: Apply CoreDNS and metrics-server manifests; update k3d config for Podman compatibility.
-
-### TUI Dashboard
-
-Real-time terminal interface showing:
-
-```
-╔══ Beta9 Agent: 1c1b50c8 ═══════════════════════════════════════════════╗
-║ Status: READY │ Gateway: http://100.72.101.23:1994 │ Pool: external    ║
-║ CPU: 28.1% │ Memory: 78.1% │ GPUs: 0 │ Last Heartbeat: 25s ago         ║
-╠════════════════════════════════════════════════════════════════════════╣
-║ WORKER PODS                                                            ║
-╟────────────────────────────────────────────────────────────────────────╢
-║ No jobs yet                                                            ║
-╠════════════════════════════════════════════════════════════════════════╣
-║ INFERENCE                                                              ║
-╟────────────────────────────────────────────────────────────────────────╢
-║ Status: running │ Endpoint: 100.100.74.117:11434                       ║
-║ Models: gemma3:1b                                                      ║
-╠════════════════════════════════════════════════════════════════════════╣
-║ LOGS                                                                   ║
-╟────────────────────────────────────────────────────────────────────────╢
-║ 10:15:23 Control API listening on :9999                                ║
-║ 10:15:24 Inference: starting Ollama...                                 ║
-║ 10:15:26 Inference: ready on :11434                                    ║
-╚════════════════════════════════════════════════════════════════════════╝
-Press Ctrl+C to quit
+```shell
+pip install beam-client
 ```
 
-## Quick Start
+## ⚡️ Quickstart
 
-### Prerequisites
+1. Create an account [here](https://beam.cloud?utm_source=github_readme)
+2. Follow our [Getting Started Guide](https://platform.beam.cloud/onboarding?utm_source=github_readme)
 
-- Go 1.21+ (for building the agent)
-- Tailscale account and network
-- Ollama (for Mac inference)
+## Creating a sandbox
 
-### 1. Build the Agent
-
-```bash
-cd backend/beta9
-go build ./cmd/b9agent/...
-```
-
-### 2. Initialize Configuration
-
-```bash
-./b9agent init \
-  --gateway <GATEWAY_TAILSCALE_IP>:1994 \
-  --token <MACHINE_TOKEN> \
-  --pool external
-```
-
-### 3. Start the Agent
-
-```bash
-./b9agent
-```
-
-### 4. Test Inference (from remote machine)
-
-```bash
-# Test inference pipeline
-TEST_MODEL=llama3.2 ./backend/remote_servers/scripts/dgpu/test_inference.sh
-```
-
-## Configuration
-
-Agent configuration is stored in `~/.b9agent/config.yaml`:
-
-```yaml
-gateway:
-  host: "100.72.101.23"
-  port: 1994
-machine:
-  id: "1c1b50c8"
-  token: "<machine-token>"
-  hostname: "100.100.74.117"
-pool: "external"
-k3s:
-  token: "<k3s-bearer-token>"
-```
-
-## Python SDK
-
-The inference module provides a lightweight client for inference endpoints:
+Spin up isolated containers to run LLM-generated code:
 
 ```python
-from beta9 import inference
+from beam import Image, Sandbox
 
-# Configure endpoint
-inference.configure(host="100.100.74.117", port=11434)
 
-# Chat completion
-result = inference.chat(
-    model="llama3.2",
-    messages=[{"role": "user", "content": "Hello!"}]
+sandbox = Sandbox(image=Image()).create()
+response = sandbox.process.run_code("print('I am running remotely')")
+
+print(response.result)
+```
+
+## Deploy a serverless inference endpoint
+
+Create an autoscaling endpoint for your custom model:
+
+```python
+from beam import Image, endpoint
+from beam import QueueDepthAutoscaler
+
+@endpoint(
+    image=Image(python_version="python3.11"),
+    gpu="A10G",
+    cpu=2,
+    memory="16Gi",
+    autoscaler=QueueDepthAutoscaler(max_containers=5, tasks_per_container=30)
 )
-print(result.content)
+def handler():
+    return {"label": "cat", "confidence": 0.97}
+```
 
-# Text generation
-result = inference.generate(
-    model="llama3.2",
-    prompt="Once upon a time"
+## Run background tasks
+
+Schedule resilient background tasks (or replace your Celery queue) by adding a simple decorator:
+
+```python
+from beam import Image, TaskPolicy, schema, task_queue
+
+
+class Input(schema.Schema):
+    image_url = schema.String()
+
+
+@task_queue(
+    name="image-processor",
+    image=Image(python_version="python3.11"),
+    cpu=1,
+    memory=1024,
+    inputs=Input,
+    task_policy=TaskPolicy(max_retries=3),
 )
+def my_background_task(input: Input, *, context):
+    image_url = input.image_url
+    print(f"Processing image: {image_url}")
+    return {"image_url": image_url}
 
-# Embeddings
-embedding = inference.embed(
-    model="nomic-embed-text",
-    input="Hello world"
-)
 
-# List models
-models = inference.list_models()
+if __name__ == "__main__":
+    # Invoke a background task from your app (without deploying it)
+    my_background_task.put(image_url="https://example.com/image.jpg")
+
+    # You can also deploy this behind a versioned endpoint with:
+    # beam deploy app.py:my_background_task --name image-processor
 ```
 
-## Testing
+> ## Self-Hosting vs Cloud
+>
+> Beta9 is the open-source engine powering [Beam](https://beam.cloud), our fully-managed cloud platform. You can self-host Beta9 for free or choose managed cloud hosting through Beam.
 
-Run the inference test suite:
+## 👋 Contributing
 
-```bash
-# Default model (llama3.2)
-./backend/remote_servers/scripts/dgpu/test_inference.sh
+We welcome contributions big or small. These are the most helpful things for us:
 
-# Custom model
-TEST_MODEL=gemma3:1b ./backend/remote_servers/scripts/dgpu/test_inference.sh
+- Submit a [feature request](https://github.com/beam-cloud/beta9/issues/new?assignees=&labels=&projects=&template=feature-request.md&title=) or [bug report](https://github.com/beam-cloud/beta9/issues/new?assignees=&labels=&projects=&template=bug-report.md&title=)
+- Open a PR with a new feature or improvement
 
-# Custom host
-BETA9_INFERENCE_HOST=100.100.74.117 ./backend/remote_servers/scripts/dgpu/test_inference.sh
-```
+## ❤️ Thanks to Our Contributors
 
-Test output:
-
-```
-[0/6] Sending start-inference command to agent... ✓
-[1/6] Testing health endpoint...                  ✓
-[2/6] Checking model availability...              ✓
-[3/6] Testing chat via curl...                    ✓
-[4/6] Testing Python SDK...                       ✓
-[5/6] Testing latency (3 requests)...             ✓
-[6/6] Stopping inference server...                ✓
-```
-
-## Roadmap
-
-### Phase 1: Foundation (Current)
-
-- [x] External worker registration and keepalive
-- [x] Apple Silicon (MPS) inference via Ollama
-- [x] Control API for inference lifecycle
-- [x] TUI dashboard with inference status and logs
-- [x] Python SDK for inference
-
-### Phase 2: Multi-Backend Inference
-
-- [ ] vLLM integration for NVIDIA GPUs
-- [ ] SGLang integration for structured outputs
-- [ ] Model routing based on hardware capabilities
-- [ ] Automatic model format conversion (GGUF/Safetensors)
-
-### Phase 3: Production Hardening
-
-- [ ] Prometheus metrics export
-- [ ] Carbon footprint tracking
-- [ ] Rate limiting and quotas
-- [ ] Multi-tenant isolation
-
-### Phase 4: Enterprise Features
-
-- [ ] EU AI Act compliance reporting
-- [ ] Model provenance tracking
-- [ ] Audit logging
-- [ ] SSO integration
-
-## Project Structure
-
-```
-beta9/
-├── cmd/
-│   └── b9agent/           # Go agent binary
-│       └── main.go
-├── pkg/
-│   └── agent/
-│       ├── agent.go       # Agent lifecycle management
-│       ├── control.go     # HTTP control API
-│       ├── inference.go   # OllamaManager and inference types
-│       ├── state.go       # Agent state for TUI
-│       └── tui.go         # Terminal UI rendering
-├── sdk/
-│   └── src/
-│       └── beta9/
-│           └── inference.py  # Python inference SDK
-└── docs/
-    └── external-workers/     # External worker documentation
-```
-
-## Related Projects
-
-- **[Agentosaurus](https://agentosaurus.com)** - Organization discovery platform and parent project
-- **[FlowState](https://github.com/Wingie/flowstate-agents)** - AI presentation system using this compute layer
-- **[beam-cloud/beta9](https://github.com/beam-cloud/beta9)** - Upstream project
-
-## License
-
-This fork maintains the same AGPL-3.0 license as the upstream beta9 project.
-
-## Contributing
-
-Contributions are welcome. Please open an issue to discuss proposed changes before submitting a pull request.
-
-## Acknowledgments
-
-- [Beam Cloud](https://beam.cloud) for the original beta9 project
-- [Ollama](https://ollama.ai) for the inference server
-- [Tailscale](https://tailscale.com) for the mesh VPN infrastructure
-
-## Security & Networking
-
-Beta9 uses **Tailscale** for secure mesh networking between components.
-
-- **Network Isolation:** All traffic between Gateway, Workers, and Clients travels over an encrypted WireGuard mesh.
-- **Endpoint Security:** 
-  - Internal management endpoints (inference control, keepalives) are bound to `0.0.0.0` but are effectively protected because the nodes are only reachable via the private Tailscale network.
-  - The Gateway uses `hostNetwork: true` to expose these services directly to the mesh.
-  - **Note:** Do not expose the Gateway's ports (1993, 1994) to the public internet. Access should only be possible via the Tailscale mesh or a secure ingress.
-
-## Known Limitations & Roadmap
-
-The following security enhancements are planned for the upcoming **Security Epic** but are currently mitigated by the network architecture:
-
-1.  **Inference Endpoint Auth (`beta9-b1j`)**: Direct inference endpoints (port 11434/8000) currently do not require per-request authentication.
-    - *Mitigation*: These ports are only accessible within the encrypted Tailscale mesh. Workers are isolated from the public internet.
-2.  **RBAC Scoping (`beta9-7aw`)**: The k3d manifest uses broad ClusterRole permissions for simplicity during beta.
-    - *Mitigation*: The cluster is intended for single-tenant use. Scoped RBAC profiles will be introduced in Phase 3.
-3.  **Token Binding (`beta9-bx0`)**: Keepalive tokens are not strictly bound to machine IDs in the current implementation.
-    - *Mitigation*: Tokens are secret and transmitted over encrypted channels. Token binding will be enforced in the next auth refactor.
+<a href="https://github.com/beam-cloud/beta9/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=beam-cloud/beta9" />
+</a>

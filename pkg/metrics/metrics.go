@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ const (
 	metricRequestRetries            = "scheduler_request_retries"
 	metricRequestScheduleFailure    = "scheduler_request_schedule_failure"
 	metricImagePullTime             = "worker_image_pull_time_seconds"
+	metricImageVerifyPhase          = "image_verify_phase_duration_ms"
 	metricImageBuildSpeed           = "worker_image_build_speed_mbps"
 	metricImageUnpackSpeed          = "worker_image_unpack_speed_mbps"
 	metricImageCopySpeed            = "worker_image_copy_speed_mbps"
@@ -38,7 +40,98 @@ const (
 	metricS3GetSpeed                = "s3_get_speed_mbps"
 	metricDialTime                  = "dial_time_ms"
 	metricContainerStartLatency     = "container_start_latency_ms"
+	metricWorkerStartupLatency      = "worker_startup_latency_ms"
+	metricWorkerStartupPhase        = "worker_startup_phase_duration_ms"
+	metricSchedulerBacklogDepth     = "scheduler_backlog_depth"
+	metricSchedulerWorkerWait       = "scheduler_worker_wait_duration_ms"
+	metricWorkerQueueDepth          = "worker_queue_depth"
+	metricWorkerQueueReceiveLatency = "worker_queue_receive_latency_ms"
+	metricWorkerQueueEmptyPolls     = "worker_queue_empty_polls"
+	metricConcurrencyLimitThrottles = "concurrency_limit_throttles"
+	metricRingBufferOccupancy       = "ring_buffer_occupancy"
+	metricRingBufferOverwrites      = "ring_buffer_overwrites"
+	metricProxyTokenDenials         = "proxy_token_denials"
+	metricProxyQueuedRequestWait    = "proxy_queued_request_wait_ms"
+	metricProxyBackendDialLatency   = "proxy_backend_dial_latency_ms"
+	metricPodLLMRequestDuration     = "pod_llm_request_duration_ms"
+	metricPodLLMTimeToFirst         = "pod_llm_time_to_first_ms"
+	metricPodLLMEstimatedTokens     = "pod_llm_estimated_tokens"
+	metricSandboxConnectPhase       = "sandbox_connect_phase_duration_ms"
+	metricFunctionTaskPhase         = "function_task_phase_duration_ms"
 )
+
+func escapeLabelValue(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, "\n", `\n`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	return value
+}
+
+func metricWithLabels(metric string, labels map[string]string) string {
+	if len(labels) == 0 {
+		return metric
+	}
+
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	labelParts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		labelParts = append(labelParts, fmt.Sprintf(`%s="%s"`, key, escapeLabelValue(labels[key])))
+	}
+
+	return fmt.Sprintf("%s{%s}", metric, strings.Join(labelParts, ","))
+}
+
+func requestMetricLabels(request *types.ContainerRequest) map[string]string {
+	labels := map[string]string{
+		"stub_type": "unknown",
+		"gpu":       "none",
+		"gpu_count": "0",
+		"cpu":       "0",
+		"memory":    "0",
+	}
+
+	if request == nil {
+		return labels
+	}
+
+	labels["gpu_count"] = fmt.Sprintf("%d", request.GpuCount)
+	labels["cpu"] = fmt.Sprintf("%d", request.Cpu)
+	labels["memory"] = fmt.Sprintf("%d", request.Memory)
+	if request.Gpu != "" {
+		labels["gpu"] = request.Gpu
+	}
+	if request.Stub.Type != "" {
+		labels["stub_type"] = string(request.Stub.Type.Kind())
+	}
+	if request.Checkpoint != nil {
+		labels["checkpoint"] = "true"
+	} else {
+		labels["checkpoint"] = "false"
+	}
+	if request.DockerEnabled {
+		labels["docker_enabled"] = "true"
+	} else {
+		labels["docker_enabled"] = "false"
+	}
+
+	return labels
+}
+
+func mergeLabels(base map[string]string, extra map[string]string) map[string]string {
+	labels := make(map[string]string, len(base)+len(extra))
+	for key, value := range base {
+		labels[key] = value
+	}
+	for key, value := range extra {
+		labels[key] = value
+	}
+	return labels
+}
 
 func InitializeMetricsRepository(config types.VictoriaMetricsConfig) {
 	workerPoolName := os.Getenv("WORKER_POOL_NAME")
@@ -197,5 +290,253 @@ func RecordContainerStartLatency(container *types.ContainerState, duration time.
 		container.Cpu,
 		container.Memory,
 	)
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+func RecordWorkerStartupLatency(duration time.Duration, request *types.ContainerRequest) {
+	metricName := metricWithLabels(metricWorkerStartupLatency, requestMetricLabels(request))
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+func RecordWorkerStartupPhase(phase string, duration time.Duration, request *types.ContainerRequest, extraLabels map[string]string) {
+	labels := requestMetricLabels(request)
+	labels["phase"] = phase
+	labels = mergeLabels(labels, extraLabels)
+
+	metricName := metricWithLabels(metricWorkerStartupPhase, labels)
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+func RecordImageVerifyPhase(phase string, duration time.Duration, labels map[string]string) {
+	metricLabels := map[string]string{
+		"phase":                  phase,
+		"registry_store":         "unknown",
+		"clip_version":           "0",
+		"explicit_image_id":      "false",
+		"success":                "true",
+		"python_version":         "unknown",
+		"custom_base_image":      "false",
+		"dockerfile":             "false",
+		"exists":                 "unknown",
+		"valid":                  "unknown",
+		"metadata_authoritative": "unknown",
+	}
+	for key, value := range labels {
+		if value != "" {
+			metricLabels[key] = value
+		}
+	}
+
+	metricName := metricWithLabels(metricImageVerifyPhase, metricLabels)
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+func RecordSchedulerBacklogDepth(depth int64) {
+	metricName := metricWithLabels(metricSchedulerBacklogDepth, nil)
+	vmetrics.GetDefaultSet().GetOrCreateGauge(metricName, nil).Set(float64(depth))
+}
+
+func RecordSchedulerWorkerWait(duration time.Duration, request *types.ContainerRequest, outcome string) {
+	labels := requestMetricLabels(request)
+	labels["outcome"] = outcome
+
+	metricName := metricWithLabels(metricSchedulerWorkerWait, labels)
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+func RecordWorkerQueueDepth(workerId string, depth int64) {
+	metricName := metricWithLabels(metricWorkerQueueDepth, map[string]string{"worker_id": workerId})
+	vmetrics.GetDefaultSet().GetOrCreateGauge(metricName, nil).Set(float64(depth))
+}
+
+func RecordWorkerQueueReceiveLatency(workerId string, duration time.Duration, request *types.ContainerRequest) {
+	labels := requestMetricLabels(request)
+	labels["worker_id"] = workerId
+
+	metricName := metricWithLabels(metricWorkerQueueReceiveLatency, labels)
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+func RecordWorkerQueueEmptyPoll(workerId string) {
+	metricName := metricWithLabels(metricWorkerQueueEmptyPolls, map[string]string{"worker_id": workerId})
+	vmetrics.GetDefaultSet().GetOrCreateCounter(metricName).Inc()
+}
+
+func RecordConcurrencyLimitThrottle(resource string, request *types.ContainerRequest) {
+	labels := requestMetricLabels(request)
+	labels["resource"] = resource
+
+	metricName := metricWithLabels(metricConcurrencyLimitThrottles, labels)
+	vmetrics.GetDefaultSet().GetOrCreateCounter(metricName).Inc()
+}
+
+func RecordRingBufferOccupancy(bufferName, workspaceName, stubId string, length, capacity int) {
+	labels := map[string]string{
+		"buffer":    bufferName,
+		"workspace": workspaceName,
+		"stub_id":   stubId,
+	}
+	metricName := metricWithLabels(metricRingBufferOccupancy, mergeLabels(labels, map[string]string{"stat": "length"}))
+	vmetrics.GetDefaultSet().GetOrCreateGauge(metricName, nil).Set(float64(length))
+
+	capacityMetricName := metricWithLabels(metricRingBufferOccupancy, mergeLabels(labels, map[string]string{"stat": "capacity"}))
+	vmetrics.GetDefaultSet().GetOrCreateGauge(capacityMetricName, nil).Set(float64(capacity))
+}
+
+func RecordRingBufferOverwrite(bufferName, workspaceName, stubId string) {
+	metricName := metricWithLabels(metricRingBufferOverwrites, map[string]string{
+		"buffer":    bufferName,
+		"workspace": workspaceName,
+		"stub_id":   stubId,
+	})
+	vmetrics.GetDefaultSet().GetOrCreateCounter(metricName).Inc()
+}
+
+func RecordProxyTokenDenial(proxyName, workspaceName, stubId string) {
+	metricName := metricWithLabels(metricProxyTokenDenials, map[string]string{
+		"proxy":     proxyName,
+		"workspace": workspaceName,
+		"stub_id":   stubId,
+	})
+	vmetrics.GetDefaultSet().GetOrCreateCounter(metricName).Inc()
+}
+
+func RecordProxyQueuedRequestWait(proxyName, workspaceName, stubId, protocol string, duration time.Duration) {
+	metricName := metricWithLabels(metricProxyQueuedRequestWait, map[string]string{
+		"proxy":     proxyName,
+		"workspace": workspaceName,
+		"stub_id":   stubId,
+		"protocol":  protocol,
+	})
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+func RecordProxyBackendDialLatency(proxyName, workspaceName, stubId, protocol string, success bool, duration time.Duration) {
+	successLabel := "false"
+	if success {
+		successLabel = "true"
+	}
+
+	metricName := metricWithLabels(metricProxyBackendDialLatency, map[string]string{
+		"proxy":     proxyName,
+		"workspace": workspaceName,
+		"stub_id":   stubId,
+		"protocol":  protocol,
+		"success":   successLabel,
+	})
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+type PodLLMRequestSample struct {
+	WorkspaceName  string
+	StubID         string
+	Model          string
+	Engine         string
+	RouteReason    string
+	Stream         bool
+	StatusCode     int
+	BackendError   bool
+	PromptTokens   int64
+	OutputTokens   int64
+	TokenPressure  int64
+	Duration       time.Duration
+	TimeToFirst    time.Duration
+	ContainerIDSet bool
+}
+
+func RecordPodLLMRequest(sample PodLLMRequestSample) {
+	stream := "false"
+	if sample.Stream {
+		stream = "true"
+	}
+	backendError := "false"
+	if sample.BackendError {
+		backendError = "true"
+	}
+	containerIDSet := "false"
+	if sample.ContainerIDSet {
+		containerIDSet = "true"
+	}
+	labels := map[string]string{
+		"workspace":        sample.WorkspaceName,
+		"stub_id":          sample.StubID,
+		"engine":           firstNonEmpty(sample.Engine, "unknown"),
+		"route_reason":     firstNonEmpty(sample.RouteReason, "unknown"),
+		"stream":           stream,
+		"status_code":      fmt.Sprintf("%d", sample.StatusCode),
+		"backend_error":    backendError,
+		"container_routed": containerIDSet,
+	}
+
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricWithLabels(metricPodLLMRequestDuration, labels)).Update(float64(sample.Duration.Milliseconds()))
+	if sample.TimeToFirst > 0 {
+		vmetrics.GetDefaultSet().GetOrCreateHistogram(metricWithLabels(metricPodLLMTimeToFirst, labels)).Update(float64(sample.TimeToFirst.Milliseconds()))
+	}
+
+	tokenLabels := mergeLabels(labels, map[string]string{"kind": "prompt"})
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricWithLabels(metricPodLLMEstimatedTokens, tokenLabels)).Update(float64(sample.PromptTokens))
+	tokenLabels = mergeLabels(labels, map[string]string{"kind": "output"})
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricWithLabels(metricPodLLMEstimatedTokens, tokenLabels)).Update(float64(sample.OutputTokens))
+	tokenLabels = mergeLabels(labels, map[string]string{"kind": "pressure"})
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricWithLabels(metricPodLLMEstimatedTokens, tokenLabels)).Update(float64(sample.TokenPressure))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func RecordSandboxConnectPhase(phase, workspaceId, stubId, containerStatus, errorCode string, success bool, duration time.Duration) {
+	successLabel := "false"
+	if success {
+		successLabel = "true"
+	}
+
+	if stubId == "" {
+		stubId = "unknown"
+	}
+	if containerStatus == "" {
+		containerStatus = "unknown"
+	}
+	if errorCode == "" {
+		errorCode = "none"
+	}
+
+	metricName := metricWithLabels(metricSandboxConnectPhase, map[string]string{
+		"phase":            phase,
+		"workspace_id":     workspaceId,
+		"stub_id":          stubId,
+		"container_status": containerStatus,
+		"error":            errorCode,
+		"success":          successLabel,
+	})
+	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
+}
+
+func RecordFunctionTaskPhase(phase string, duration time.Duration, labels map[string]string) {
+	metricLabels := map[string]string{
+		"phase":        phase,
+		"workspace_id": "unknown",
+		"stub_id":      "unknown",
+		"stub_type":    "function",
+		"cpu":          "0",
+		"memory":       "0",
+		"gpu":          "none",
+		"gpu_count":    "0",
+		"status":       "unknown",
+		"success":      "true",
+	}
+
+	for key, value := range labels {
+		if value != "" {
+			metricLabels[key] = value
+		}
+	}
+
+	metricName := metricWithLabels(metricFunctionTaskPhase, metricLabels)
 	vmetrics.GetDefaultSet().GetOrCreateHistogram(metricName).Update(float64(duration.Milliseconds()))
 }

@@ -81,10 +81,7 @@ func NewHTTPEndpointService(
 	ctx context.Context,
 	opts EndpointServiceOpts,
 ) (EndpointService, error) {
-	keyEventManager, err := common.NewKeyEventManager(opts.RedisClient)
-	if err != nil {
-		return nil, err
-	}
+	keyEventManager := common.NewKeyEventManager(opts.RedisClient)
 
 	es := &HttpEndpointService{
 		ctx:               ctx,
@@ -112,7 +109,15 @@ func NewHTTPEndpointService(
 	}
 	eventManager.Listen()
 
-	es.controller = abstractions.NewInstanceController(ctx, es.InstanceFactory, []string{types.StubTypeEndpointDeployment, types.StubTypeASGIDeployment}, es.backendRepo, es.rdb)
+	es.controller = abstractions.NewInstanceController(
+		ctx,
+		es.InstanceFactory,
+		es.GetInstance,
+		[]string{types.StubTypeEndpointDeployment, types.StubTypeASGIDeployment},
+		es.backendRepo,
+		es.containerRepo,
+		es.rdb,
+	)
 	err = es.controller.Init()
 	if err != nil {
 		return nil, err
@@ -160,6 +165,14 @@ func (es *HttpEndpointService) forwardRequest(
 		return err
 	}
 
+	// Fail fast instead of queueing until timeout when the stub's GPU has no
+	// supporting pool; requests start succeeding as soon as capacity joins.
+	if reason := instance.UnschedulableReason(); reason != "" {
+		return ctx.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"error": reason,
+		})
+	}
+
 	tasksInFlight, err := es.taskRepo.TasksInFlight(ctx.Request().Context(), instance.Workspace.Name, stubId)
 	if err != nil {
 		return ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
@@ -197,13 +210,34 @@ func (es *HttpEndpointService) forwardRequest(
 	return task.Execute(ctx.Request().Context(), ctx, authInfo)
 }
 
+func (es *HttpEndpointService) forwardASGIHealthRequest(ctx echo.Context, stubId string) error {
+	instance, err := es.getOrCreateEndpointInstance(ctx.Request().Context(), stubId)
+	if err != nil {
+		return err
+	}
+
+	if err := instance.ensureReadyForTasklessRequest(); err != nil {
+		return err
+	}
+
+	return instance.buffer.ForwardRequest(ctx, nil)
+}
+
 func (es *HttpEndpointService) InstanceFactory(ctx context.Context, stubId string, options ...func(abstractions.IAutoscaledInstance)) (abstractions.IAutoscaledInstance, error) {
 	return es.getOrCreateEndpointInstance(ctx, stubId)
 }
 
+func (es *HttpEndpointService) GetInstance(stubId string) (abstractions.IAutoscaledInstance, bool) {
+	instance, exists := es.endpointInstances.Get(stubId)
+	if !exists {
+		return nil, false
+	}
+	return instance, true
+}
+
 func (es *HttpEndpointService) getOrCreateEndpointInstance(ctx context.Context, stubId string, options ...func(*endpointInstance)) (*endpointInstance, error) {
 	instance, exists := es.endpointInstances.Get(stubId)
-	if exists {
+	if exists && instance.Ctx.Err() == nil {
 		return instance, nil
 	}
 
@@ -216,8 +250,11 @@ func (es *HttpEndpointService) getOrCreateEndpointInstance(ctx context.Context, 
 	defer es.mu.Unlock()
 
 	instance, exists = es.endpointInstances.Get(stubId)
-	if exists {
+	if exists && instance.Ctx.Err() == nil {
 		return instance, nil
+	}
+	if exists {
+		es.endpointInstances.Delete(stubId)
 	}
 
 	stub, err := es.backendRepo.GetStubByExternalId(es.ctx, stubId)
@@ -272,8 +309,6 @@ func (es *HttpEndpointService) getOrCreateEndpointInstance(ctx context.Context, 
 		instance.isASGI = true
 	}
 
-	instance.buffer = NewRequestBuffer(autoscaledInstance.Ctx, es.rdb, &stub.Workspace, stubId, requestBufferSize, es.containerRepo, es.keyEventManager, stubConfig, es.tailscale, es.config.Tailscale, instance.isASGI)
-
 	// Embed autoscaled instance struct
 	instance.AutoscaledInstance = autoscaledInstance
 
@@ -290,6 +325,11 @@ func (es *HttpEndpointService) getOrCreateEndpointInstance(ctx context.Context, 
 		}
 	}
 
+	instance.buffer = NewRequestBuffer(autoscaledInstance.Ctx, es.rdb, &stub.Workspace, stubId, requestBufferSize, es.containerRepo, es.keyEventManager, stubConfig, es.tailscale, es.config.Tailscale, instance.isASGI)
+	if instance.Autoscaler != nil {
+		instance.buffer.onTaskQueued = instance.Autoscaler.Trigger
+	}
+
 	if len(instance.EntryPoint) == 0 {
 		instance.EntryPoint = []string{instance.StubConfig.PythonVersion, "-m", "beta9.runner.endpoint"}
 	}
@@ -300,35 +340,41 @@ func (es *HttpEndpointService) getOrCreateEndpointInstance(ctx context.Context, 
 	go instance.Monitor()
 	go func(i *endpointInstance) {
 		<-i.Ctx.Done()
-		es.endpointInstances.Delete(stubId)
+		es.deleteEndpointInstance(stubId, i)
 	}(instance)
 
 	return instance, nil
+}
+
+func (es *HttpEndpointService) deleteEndpointInstance(stubId string, instance *endpointInstance) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+
+	if current, exists := es.endpointInstances.Get(stubId); exists && current == instance {
+		es.endpointInstances.Delete(stubId)
+	}
 }
 
 var Keys = &keys{}
 
 type keys struct{}
 
-var (
-	endpointKeepWarmLock     string = "endpoint:%s:%s:keep_warm_lock:%s"
-	endpointInstanceLock     string = "endpoint:%s:%s:instance_lock"
-	endpointRequestTokens    string = "endpoint:%s:%s:request_tokens:%s"
-	endpointRequestHeartbeat string = "endpoint:%s:%s:request_heartbeat:%s:%s"
-)
-
 func (k *keys) endpointKeepWarmLock(workspaceName, stubId, containerId string) string {
-	return fmt.Sprintf(endpointKeepWarmLock, workspaceName, stubId, containerId)
+	return common.RedisKeys.EndpointKeepWarmLock(workspaceName, stubId, containerId)
 }
 
 func (k *keys) endpointInstanceLock(workspaceName, stubId string) string {
-	return fmt.Sprintf(endpointInstanceLock, workspaceName, stubId)
+	return common.RedisKeys.EndpointInstanceLock(workspaceName, stubId)
 }
 
 func (k *keys) endpointRequestTokens(workspaceName, stubId, containerId string) string {
-	return fmt.Sprintf(endpointRequestTokens, workspaceName, stubId, containerId)
+	return common.RedisKeys.EndpointRequestTokens(workspaceName, stubId, containerId)
 }
 
 func (k *keys) endpointRequestHeartbeat(workspaceName, stubId, taskId, containerId string) string {
-	return fmt.Sprintf(endpointRequestHeartbeat, workspaceName, stubId, taskId, containerId)
+	return common.RedisKeys.EndpointRequestHeartbeat(workspaceName, stubId, taskId, containerId)
+}
+
+func (k *keys) endpointRequestRelease(workspaceName, stubId, taskId, containerId string) string {
+	return common.RedisKeys.EndpointRequestRelease(workspaceName, stubId, taskId, containerId)
 }

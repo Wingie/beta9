@@ -7,7 +7,6 @@ import (
 	"github.com/beam-cloud/beta9/pkg/repository"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/beam-cloud/redislock"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -21,6 +20,7 @@ type WorkerPoolSizer struct {
 }
 
 func NewWorkerPoolSizer(controller WorkerPoolController,
+	config types.AppConfig,
 	workerPoolConfig *types.WorkerPoolConfig,
 	workerRepo repository.WorkerRepository,
 	workerPoolRepo repository.WorkerPoolRepository,
@@ -29,6 +29,7 @@ func NewWorkerPoolSizer(controller WorkerPoolController,
 	if err != nil {
 		return nil, err
 	}
+	applyBuildPoolSizingMinimums(controller.Name(), config, poolSizingConfig)
 
 	return &WorkerPoolSizer{
 		controller:             controller,
@@ -45,15 +46,6 @@ func (s *WorkerPoolSizer) Start() {
 	ticker := time.NewTicker(poolMonitoringInterval)
 	defer ticker.Stop()
 
-	sampledLogger := log.Sample(zerolog.LevelSampler{
-		WarnSampler: &zerolog.BurstSampler{
-			Burst:       1,
-			Period:      10 * time.Second,
-			NextSampler: nil,
-		},
-	})
-
-	previousState := &types.WorkerPoolState{}
 	for range ticker.C {
 		select {
 		case <-ctx.Done():
@@ -62,23 +54,13 @@ func (s *WorkerPoolSizer) Start() {
 		}
 
 		func() {
-			nextState, err := s.controller.State() // Get the current state of the pool
-			if err != nil {
+			if err := s.workerPoolRepo.SetWorkerPoolSizerLock(s.controller.Name()); err != nil {
+				if !errors.Is(err, redislock.ErrNotObtained) {
+					log.Error().Str("pool_name", s.controller.Name()).Err(err).Msg("failed to acquire worker pool sizing lock")
+				}
 				return
 			}
-
-			if previousState.Status != nextState.Status && nextState.Status == types.WorkerPoolStatusDegraded {
-				sampledLogger.Warn().Str("pool_name", s.controller.Name()).Msg("pool is degraded, skipping pool sizing")
-			} else if previousState.Status != nextState.Status && nextState.Status == types.WorkerPoolStatusHealthy {
-				sampledLogger.Info().Str("pool_name", s.controller.Name()).Msg("pool is healthy, resuming pool sizing")
-			}
-
-			previousState = nextState
-
-			// If the pool is degraded, we don't want to keep adding more workers
-			if nextState.Status == types.WorkerPoolStatusDegraded {
-				return
-			}
+			defer s.workerPoolRepo.RemoveWorkerPoolSizerLock(s.controller.Name())
 
 			// Get the current free capacity of the pool
 			freeCapacity, err := s.controller.FreeCapacity()
@@ -92,13 +74,13 @@ func (s *WorkerPoolSizer) Start() {
 			if err != nil {
 				log.Error().Str("pool_name", s.controller.Name()).Err(err).Msg("failed to add worker")
 			} else if newWorker != nil {
-				log.Info().Str("pool_name", s.controller.Name()).Interface("worker", newWorker).Msg("added new worker to maintain pool size")
+				workerLog(log.Info(), newWorker).Msg("added new worker to maintain pool size")
 			}
 
 			// Handle case where we want to make sure all available manually provisioned nodes have available workers
 			if s.workerPoolConfig.Mode == types.PoolModeExternal {
-				err := s.occupyAvailableMachines()
-				if err != nil && !errors.Is(err, redislock.ErrNotObtained) {
+				err := s.occupyAvailableMachinesLocked()
+				if err != nil {
 					log.Error().Str("pool_name", s.controller.Name()).Err(err).Msg("failed to list machines in external pool")
 				}
 			}
@@ -115,6 +97,10 @@ func (s *WorkerPoolSizer) occupyAvailableMachines() error {
 	}
 	defer s.workerPoolRepo.RemoveWorkerPoolSizerLock(s.controller.Name())
 
+	return s.occupyAvailableMachinesLocked()
+}
+
+func (s *WorkerPoolSizer) occupyAvailableMachinesLocked() error {
 	machines, err := s.providerRepo.ListAllMachines(string(*s.workerPoolConfig.Provider), s.controller.Name(), true)
 	if err != nil {
 		return err
@@ -132,7 +118,7 @@ func (s *WorkerPoolSizer) occupyAvailableMachines() error {
 
 		worker, err := s.controller.AddWorkerToMachine(cpu, memory, gpuType, gpuCount, m.State.MachineId)
 		if err != nil {
-			log.Error().Str("pool_name", s.controller.Name()).Err(err).Msg("failed to add worker to machine")
+			log.Error().Str("pool_name", s.controller.Name()).Str("machine_id", m.State.MachineId).Err(err).Msg("failed to add worker to machine")
 			continue
 		}
 		// When there is no capacity of the machine is not ready the worker will be nil with no error
@@ -140,7 +126,7 @@ func (s *WorkerPoolSizer) occupyAvailableMachines() error {
 			continue
 		}
 
-		log.Info().Str("pool_name", s.controller.Name()).Interface("worker", worker).Msg("added new worker to occupy existing machine")
+		workerLog(log.Info(), worker).Msg("added new worker to occupy existing machine")
 	}
 
 	return nil
@@ -151,12 +137,31 @@ func (s *WorkerPoolSizer) addWorkerIfNeeded(freeCapacity *WorkerPoolCapacity) (*
 	if !shouldAddWorker(freeCapacity, s.workerPoolSizingConfig) {
 		return nil, nil
 	}
+	if !s.poolSupportsProvisioning() {
+		return nil, nil
+	}
 
 	return s.controller.AddWorker(
 		s.workerPoolSizingConfig.DefaultWorkerCpu,
 		s.workerPoolSizingConfig.DefaultWorkerMemory,
 		s.workerPoolSizingConfig.DefaultWorkerGpuCount,
 	)
+}
+
+func (s *WorkerPoolSizer) poolSupportsProvisioning() bool {
+	if s == nil || s.workerPoolConfig == nil {
+		return true
+	}
+	return workerPoolSupportsProvisioning(*s.workerPoolConfig)
+}
+
+func workerPoolSupportsProvisioning(config types.WorkerPoolConfig) bool {
+	if config.Mode == types.PoolModeExternal &&
+		config.Provider != nil &&
+		*config.Provider == types.ProviderGeneric {
+		return false
+	}
+	return true
 }
 
 // shouldAddWorker checks if the conditions are met for a new worker to be added
@@ -210,4 +215,19 @@ func parsePoolSizingConfig(config types.WorkerPoolJobSpecPoolSizingConfig) (*typ
 	}
 
 	return c, nil
+}
+
+func applyBuildPoolSizingMinimums(poolName string, config types.AppConfig, sizing *types.WorkerPoolSizingConfig) {
+	if sizing == nil || poolName == "" || poolName != config.ImageService.BuildContainerPoolSelector {
+		return
+	}
+
+	if config.ImageService.BuildContainerCpu > sizing.DefaultWorkerCpu {
+		sizing.DefaultWorkerCpu = config.ImageService.BuildContainerCpu
+	}
+
+	buildMemory := capacityMemoryForScheduling(&types.ContainerRequest{Memory: config.ImageService.BuildContainerMemory})
+	if buildMemory > sizing.DefaultWorkerMemory {
+		sizing.DefaultWorkerMemory = buildMemory
+	}
 }

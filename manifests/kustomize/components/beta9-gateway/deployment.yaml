@@ -9,12 +9,15 @@ metadata:
 spec:
   replicas: 1
   revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
   selector:
     matchLabels:
       app.kubernetes.io/component: gateway
       app.kubernetes.io/name: beta9
-  strategy:
-    type: Recreate
   template:
     metadata:
       labels:
@@ -22,9 +25,8 @@ spec:
         app.kubernetes.io/name: beta9
     spec:
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: 185
-      imagePullSecrets:
-        - name: registry-credentials
+      # 180s gateway shutdownTimeout + 10s readiness propagation + 5s buffer.
+      terminationGracePeriodSeconds: 195
       initContainers:
       - name: wait-on-backends
         image: busybox:1.37.0
@@ -42,8 +44,7 @@ spec:
         env:
         - name: CONFIG_PATH
           value: /etc/beta9/.config.yaml
-        image: registry.agentosaurus.com/beta9-gateway:v0.1.0
-        imagePullPolicy: IfNotPresent
+        image: registry.localhost:5000/beta9-gateway:latest
         name: main
         readinessProbe:
           initialDelaySeconds: 5
@@ -53,6 +54,7 @@ spec:
           timeoutSeconds: 1
           grpc:
             port: 1993
+            service: readiness
         livenessProbe:
           initialDelaySeconds: 10
           successThreshold: 1
@@ -61,6 +63,14 @@ spec:
           timeoutSeconds: 1
           grpc:
             port: 1993
+            service: liveness
+        startupProbe:
+          periodSeconds: 3
+          timeoutSeconds: 1
+          failureThreshold: 100
+          grpc:
+            port: 1993
+            service: liveness
         resources:
           limits:
             cpu: 4000m

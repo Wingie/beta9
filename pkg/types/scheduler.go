@@ -13,6 +13,7 @@ import (
 const (
 	DefaultServeContainerTimeout = time.Minute * 10
 	DefaultCPUWorkerPoolName     = "default"
+	ContainerRuntimeTokenEnv     = "BETA9_TOKEN"
 )
 
 type WorkerStatus string
@@ -25,16 +26,32 @@ const (
 )
 
 const (
+	DefaultRuncStartConcurrency   int   = 32
+	DefaultGvisorStartConcurrency int   = 32
+	RuncStartConcurrencyPerCPU    int64 = 2
+	GvisorStartConcurrencyPerCPU  int64 = 4
+)
+
+const (
 	StubStateDegraded = "degraded"
 	StubStateWarning  = "warning"
 	StubStateHealthy  = "healthy"
 )
 
 type ContainerRequestStatus string
+type ContainerSchedulingFailureReason string
 
 const (
 	ContainerRequestStatusFailed ContainerRequestStatus = "failed"
 	ContainerRequestStatusTTL                           = 10 * time.Minute
+
+	ContainerSchedulingFailureBacklogPushFailed               ContainerSchedulingFailureReason = "backlog_push_failed"
+	ContainerSchedulingFailureNoController                    ContainerSchedulingFailureReason = "no_controller"
+	ContainerSchedulingFailureWorkerCapacityTimeout           ContainerSchedulingFailureReason = "worker_capacity_timeout"
+	ContainerSchedulingFailureProvisioningLimit               ContainerSchedulingFailureReason = "worker_provisioning_limit"
+	ContainerSchedulingFailureRetryLimit                      ContainerSchedulingFailureReason = "retry_limit"
+	ContainerSchedulingFailureManagedFallbackConcurrencyLimit ContainerSchedulingFailureReason = "managed_fallback_concurrency_limit"
+	ContainerSchedulingFailureManagedFallbackNoCapacity       ContainerSchedulingFailureReason = "managed_fallback_no_capacity"
 )
 
 // @go2proto
@@ -57,6 +74,27 @@ type Worker struct {
 	BuildVersion         string       `json:"build_version" redis:"build_version"`
 	ActiveContainers     []Container  `json:"active_containers" redis:"active_containers"`
 	Runtime              string       `json:"runtime" redis:"runtime"`
+	PoolSelector         string       `json:"pool_selector" redis:"pool_selector"`
+	// CordonRequested records explicit operator intent. Disabled workers without
+	// this flag may be recovered automatically after a transient failure.
+	CordonRequested bool `json:"cordon_requested" redis:"cordon_requested"`
+	// RolloutGeneration gates readiness while an agent worker is being replaced.
+	RolloutGeneration   string `json:"rollout_generation" redis:"rollout_generation"`
+	RolloutBuildVersion string `json:"rollout_build_version" redis:"-"`
+	WorkerImageOverride string `json:"worker_image_override" redis:"worker_image_override"`
+	WorkspaceId         string `json:"-" redis:"workspace_id" go2proto:"ignore"`
+	ControlPlaneManaged bool   `json:"-" redis:"control_plane_managed" go2proto:"ignore"`
+}
+
+type WorkerKeepAlive struct {
+	MachineId string `json:"machine_id"`
+}
+
+func StableStorageNodeID(machineID, workerID string) string {
+	if machineID = strings.TrimSpace(machineID); machineID != "" {
+		return machineID
+	}
+	return strings.TrimSpace(workerID)
 }
 
 func (w *Worker) ToProto() *pb.Worker {
@@ -83,6 +121,12 @@ func (w *Worker) ToProto() *pb.Worker {
 		Preemptable:          w.Preemptable,
 		BuildVersion:         w.BuildVersion,
 		ActiveContainers:     containers,
+		Runtime:              w.Runtime,
+		PoolSelector:         w.PoolSelector,
+		CordonRequested:      w.CordonRequested,
+		RolloutGeneration:    w.RolloutGeneration,
+		RolloutBuildVersion:  w.RolloutBuildVersion,
+		WorkerImageOverride:  w.WorkerImageOverride,
 	}
 }
 
@@ -110,6 +154,12 @@ func NewWorkerFromProto(in *pb.Worker) *Worker {
 		Preemptable:          in.Preemptable,
 		BuildVersion:         in.BuildVersion,
 		ActiveContainers:     containers,
+		Runtime:              in.Runtime,
+		PoolSelector:         in.PoolSelector,
+		CordonRequested:      in.CordonRequested,
+		RolloutGeneration:    in.RolloutGeneration,
+		RolloutBuildVersion:  in.RolloutBuildVersion,
+		WorkerImageOverride:  in.WorkerImageOverride,
 	}
 }
 
@@ -148,6 +198,8 @@ type ContainerState struct {
 	Cpu         int64           `redis:"cpu" json:"cpu"`
 	Memory      int64           `redis:"memory" json:"memory"`
 	StartedAt   int64           `redis:"started_at" json:"started_at"`
+	WorkerId    string          `redis:"worker_id" json:"worker_id"`
+	MachineId   string          `redis:"machine_id" json:"machine_id"`
 }
 
 // @go2proto
@@ -230,11 +282,115 @@ type ContainerRequest struct {
 	BuildRegistryCredentials string          `json:"build_registry_credentials"`
 	BlockNetwork             bool            `json:"block_network"`
 	AllowList                []string        `json:"allow_list"`
-	DockerEnabled            bool            `json:"docker_enabled"` // Enable Docker-in-Docker (gVisor only)
+	DockerEnabled            bool            `json:"docker_enabled"` // Enable Docker-in-Docker
+	RuntimeSecretNames       []string        `json:"runtime_secret_names,omitempty"`
+	RuntimeTokenRequired     bool            `json:"runtime_token_required,omitempty"`
+	AllowMarketplace         bool            `json:"allow_marketplace"`
+	// MachineId pins scheduling to a single agent machine (e.g. a marketplace
+	// rental); empty means any machine.
+	MachineId         string             `json:"machine_id,omitempty"`
+	CheckpointTrigger *CheckpointTrigger `json:"checkpoint_trigger,omitempty"`
+	TaskId            string             `json:"task_id,omitempty"`
+	DeliveryToken     string             `json:"-" go2proto:"ignore"`
+	// Hostname preserved across checkpoint and restore.
+	Hostname             string `json:"hostname,omitempty"`
+	ProvisioningAttempts int    `json:"provisioning_attempts,omitempty" go2proto:"ignore"`
 }
 
+// @go2proto
+type CheckpointTrigger struct {
+	Type            string `json:"type,omitempty"`
+	HttpPath        string `json:"http_path,omitempty"`
+	HttpPort        uint32 `json:"http_port,omitempty"`
+	TimeoutSeconds  uint32 `json:"timeout_seconds,omitempty"`
+	IntervalSeconds uint32 `json:"interval_seconds,omitempty"`
+}
+
+func (t *CheckpointTrigger) ToProto() *pb.CheckpointTrigger {
+	if t == nil {
+		return nil
+	}
+	return &pb.CheckpointTrigger{
+		Type:            t.Type,
+		HttpPath:        t.HttpPath,
+		HttpPort:        t.HttpPort,
+		TimeoutSeconds:  t.TimeoutSeconds,
+		IntervalSeconds: t.IntervalSeconds,
+	}
+}
+
+func NewCheckpointTriggerFromProto(in *pb.CheckpointTrigger) *CheckpointTrigger {
+	if in == nil {
+		return nil
+	}
+	return &CheckpointTrigger{
+		Type:            in.Type,
+		HttpPath:        in.HttpPath,
+		HttpPort:        in.HttpPort,
+		TimeoutSeconds:  in.TimeoutSeconds,
+		IntervalSeconds: in.IntervalSeconds,
+	}
+}
+
+type ContainerNetworkPolicy string
+
+const (
+	ContainerNetworkPolicyOpen      ContainerNetworkPolicy = "open"
+	ContainerNetworkPolicyBlock     ContainerNetworkPolicy = "block"
+	ContainerNetworkPolicyAllowList ContainerNetworkPolicy = "allowlist"
+)
+
 func (c *ContainerRequest) RequiresGPU() bool {
-	return len(c.GpuRequest) > 0 || c.Gpu != ""
+	for _, gpu := range c.GpuRequest {
+		if gpu != "" && gpu != string(NO_GPU) {
+			return true
+		}
+	}
+	return c.Gpu != "" && c.Gpu != string(NO_GPU)
+}
+
+func WorkerStartConcurrencyForPool(poolConfig WorkerPoolConfig, globalRuntime, runtimeType string, workerCPU int64) int {
+	if runtimeType == "" {
+		runtimeType = poolConfig.ContainerRuntime
+	}
+	if runtimeType == "" {
+		runtimeType = globalRuntime
+	}
+	if runtimeType == "" {
+		runtimeType = ContainerRuntimeRunc.String()
+	}
+
+	limit := DefaultRuncStartConcurrency
+	perCPU := RuncStartConcurrencyPerCPU
+	if runtimeType == ContainerRuntimeGvisor.String() {
+		limit = DefaultGvisorStartConcurrency
+		perCPU = GvisorStartConcurrencyPerCPU
+	}
+	if poolConfig.ContainerStartConcurrency > 0 {
+		limit = poolConfig.ContainerStartConcurrency
+	}
+
+	if workerCPU <= 0 {
+		return limit
+	}
+
+	maxStarts := int((workerCPU*perCPU + 999) / 1000)
+	if maxStarts < 1 {
+		maxStarts = 1
+	}
+	if limit > maxStarts {
+		return maxStarts
+	}
+	return limit
+}
+
+func WorkerStartConcurrency(workerConfig WorkerConfig, worker *Worker) int {
+	if worker == nil {
+		return DefaultRuncStartConcurrency
+	}
+
+	poolConfig := workerConfig.Pools[worker.PoolName]
+	return WorkerStartConcurrencyForPool(poolConfig, workerConfig.ContainerRuntime, worker.Runtime, worker.TotalCpu)
 }
 
 // IsBuildRequest checks if the sourceImage or Dockerfile field is not-nil, which means the container request is for a build container
@@ -251,6 +407,166 @@ func (c *ContainerRequest) VolumeCacheCompatible() bool {
 
 func (c *ContainerRequest) StorageAvailable() bool {
 	return c.Workspace.StorageAvailable()
+}
+
+func (c *ContainerRequest) NetworkPolicy() ContainerNetworkPolicy {
+	if c == nil {
+		return ContainerNetworkPolicyOpen
+	}
+	if len(c.AllowList) > 0 {
+		return ContainerNetworkPolicyAllowList
+	}
+	if c.BlockNetwork {
+		return ContainerNetworkPolicyBlock
+	}
+	return ContainerNetworkPolicyOpen
+}
+
+func (c *ContainerRequest) NetworkRestricted() bool {
+	return c.NetworkPolicy() != ContainerNetworkPolicyOpen
+}
+
+func (c *ContainerRequest) HasDurableDiskMount() bool {
+	if c == nil {
+		return false
+	}
+	for _, mount := range c.Mounts {
+		if mount.MountType == StorageModeDurableDisk || mount.DurableDisk != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ContainerRequest) Clone() *ContainerRequest {
+	if c == nil {
+		return nil
+	}
+
+	cloned := *c
+	cloned.EntryPoint = append([]string(nil), c.EntryPoint...)
+	cloned.Env = append([]string(nil), c.Env...)
+	cloned.GpuRequest = append([]string(nil), c.GpuRequest...)
+	cloned.Mounts = cloneMounts(c.Mounts)
+	cloned.Ports = append([]uint32(nil), c.Ports...)
+	cloned.AllowList = append([]string(nil), c.AllowList...)
+	cloned.BuildOptions.BuildSecrets = append([]string(nil), c.BuildOptions.BuildSecrets...)
+	cloned.RuntimeSecretNames = append([]string(nil), c.RuntimeSecretNames...)
+	return &cloned
+}
+
+func (c *ContainerRequest) PrivateWorkerRequest() *ContainerRequest {
+	request := c.Clone()
+	if request == nil {
+		return nil
+	}
+
+	secretNames := c.runtimeSecretNames()
+	tokenRequired := c.runtimeTokenRequired()
+
+	request.RuntimeSecretNames = secretNames
+	request.RuntimeTokenRequired = tokenRequired
+	request.Workspace = request.Workspace.WithoutPrivateCredentials()
+	request.Env = c.privateWorkerEnv(secretNames, tokenRequired)
+	request.Mounts = request.privateWorkerMounts()
+	request.ImageCredentials = ""
+	request.BuildRegistryCredentials = ""
+	request.BuildOptions.SourceImageCreds = ""
+	request.BuildOptions.BuildSecrets = nil
+	return request
+}
+
+func (c *ContainerRequest) privateWorkerEnv(secretNames []string, tokenRequired bool) []string {
+	if c == nil {
+		return nil
+	}
+
+	secretNameSet := stringSet(secretNames)
+	env := make([]string, 0, len(c.Env))
+	for _, item := range c.Env {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok {
+			env = append(env, item)
+			continue
+		}
+		if tokenRequired && key == ContainerRuntimeTokenEnv {
+			continue
+		}
+		if _, ok := secretNameSet[key]; ok {
+			continue
+		}
+		env = append(env, item)
+	}
+	return env
+}
+
+func (c *ContainerRequest) runtimeSecretNames() []string {
+	if len(c.RuntimeSecretNames) > 0 {
+		return uniqueStrings(c.RuntimeSecretNames)
+	}
+
+	names := make([]string, 0)
+	if c.Stub.Config != "" {
+		if stubConfig, err := c.Stub.UnmarshalConfig(); err == nil && stubConfig != nil {
+			for _, secret := range stubConfig.Secrets {
+				if secret.Name != "" {
+					names = append(names, secret.Name)
+				}
+			}
+		}
+	}
+	return uniqueStrings(names)
+}
+
+func (c *ContainerRequest) runtimeTokenRequired() bool {
+	if c.RuntimeTokenRequired {
+		return true
+	}
+	for _, item := range c.Env {
+		key, _, ok := strings.Cut(item, "=")
+		if ok && key == ContainerRuntimeTokenEnv {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSet(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value != "" {
+			set[value] = struct{}{}
+		}
+	}
+	return set
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func (c *ContainerRequest) privateWorkerMounts() []Mount {
+	mounts := cloneMounts(c.Mounts)
+	for i := range mounts {
+		if mounts[i].MountPointConfig == nil {
+			continue
+		}
+		config := mounts[i].MountPointConfig.WithoutCredentials()
+		mounts[i].MountPointConfig = &config
+	}
+	return mounts
 }
 
 func (c *ContainerRequest) ToProto() *pb.ContainerRequest {
@@ -291,6 +607,7 @@ func (c *ContainerRequest) ToProto() *pb.ContainerRequest {
 		ImageId:                  c.ImageId,
 		Mounts:                   mounts,
 		StubId:                   c.StubId,
+		TaskId:                   c.TaskId,
 		AppId:                    c.AppId,
 		WorkspaceId:              c.WorkspaceId,
 		Workspace:                c.Workspace.ToProto(),
@@ -308,6 +625,12 @@ func (c *ContainerRequest) ToProto() *pb.ContainerRequest {
 		BlockNetwork:             c.BlockNetwork,
 		AllowList:                c.AllowList,
 		DockerEnabled:            c.DockerEnabled,
+		AllowMarketplace:         c.AllowMarketplace,
+		MachineId:                c.MachineId,
+		RuntimeSecretNames:       c.RuntimeSecretNames,
+		RuntimeTokenRequired:     c.RuntimeTokenRequired,
+		CheckpointTrigger:        c.CheckpointTrigger.ToProto(),
+		Hostname:                 c.Hostname,
 	}
 }
 
@@ -349,7 +672,9 @@ func NewContainerRequestFromProto(in *pb.ContainerRequest) *ContainerRequest {
 		Workspace:                *NewWorkspaceFromProto(in.Workspace),
 		Stub:                     *NewStubWithRelatedFromProto(in.Stub),
 		StubId:                   in.StubId,
+		TaskId:                   in.TaskId,
 		Timestamp:                in.GetTimestamp().AsTime(),
+		RetryCount:               int(in.RetryCount),
 		CheckpointEnabled:        in.CheckpointEnabled,
 		Preemptable:              in.Preemptable,
 		PoolSelector:             in.PoolSelector,
@@ -361,6 +686,12 @@ func NewContainerRequestFromProto(in *pb.ContainerRequest) *ContainerRequest {
 		BlockNetwork:             in.BlockNetwork,
 		AllowList:                in.AllowList,
 		DockerEnabled:            in.DockerEnabled,
+		AllowMarketplace:         in.AllowMarketplace,
+		MachineId:                in.MachineId,
+		RuntimeSecretNames:       in.RuntimeSecretNames,
+		RuntimeTokenRequired:     in.RuntimeTokenRequired,
+		CheckpointTrigger:        NewCheckpointTriggerFromProto(in.CheckpointTrigger),
+		Hostname:                 in.Hostname,
 	}
 }
 
@@ -378,13 +709,30 @@ func getStringOrDefault(s *string) string {
 	return ""
 }
 
-const ContainerExitCodeTtlS int = 300
+func cloneMounts(mounts []Mount) []Mount {
+	out := append([]Mount(nil), mounts...)
+	for i := range out {
+		if out[i].MountPointConfig == nil {
+			continue
+		}
+		config := *out[i].MountPointConfig
+		out[i].MountPointConfig = &config
+	}
+	return out
+}
+
+const (
+	ContainerExitCodeTTL       = 5 * time.Minute
+	ContainerFailureHistoryTTL = time.Hour
+	ContainerFailureCooldown   = time.Minute
+)
 
 const (
 	ContainerDurationEmissionInterval      time.Duration = 5 * time.Second
 	ContainerResourceUsageEmissionInterval time.Duration = 3 * time.Second
 )
-const ContainerStateTtlSWhilePending int64 = 600
+const ContainerStateTtlSWhilePending int64 = 1800
+const ContainerStateTtlSWhileStopping int64 = 300
 const ContainerStateTtlS int64 = 120
 const WorkspaceQuotaTtlS int64 = 600
 
@@ -540,6 +888,25 @@ func (e *ThrottledByConcurrencyLimitError) Error() string {
 	return "concurrency_limit_reached: " + e.Reason
 }
 
+// InsufficientCreditsError is returned when a workspace has no prepaid credit
+// (or has been blocked by billing) and so may not run serverless workloads.
+type InsufficientCreditsError struct {
+	WorkspaceId string
+	Code        string
+	Reason      string
+}
+
+func (e *InsufficientCreditsError) Error() string {
+	code := e.Code
+	if code == "" {
+		code = "insufficient_credits"
+	}
+	if e.Reason == "" {
+		return code
+	}
+	return code + ": " + e.Reason
+}
+
 type QuotaDoesNotExistError struct{}
 
 func (e *QuotaDoesNotExistError) Error() string {
@@ -574,6 +941,9 @@ const (
 	StopContainerReasonScheduler StopContainerReason = "SCHEDULER"
 	// StopContainerReasonAdmin is used when a container is stopped by an admin request (i.e. draining a worker)
 	StopContainerReasonAdmin StopContainerReason = "ADMIN"
+	// StopContainerReasonInsufficientCredits is used when the scheduler stops a
+	// container because its workspace has run out of prepaid credit
+	StopContainerReasonInsufficientCredits StopContainerReason = "INSUFFICIENT_CREDITS"
 
 	StopContainerReasonUnknown StopContainerReason = "UNKNOWN"
 )

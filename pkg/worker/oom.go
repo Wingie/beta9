@@ -2,8 +2,12 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	runtime "github.com/beam-cloud/beta9/pkg/runtime"
 	types "github.com/beam-cloud/beta9/pkg/types"
@@ -11,8 +15,12 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// setupOOMWatcher configures and starts the appropriate OOM watcher for the container
-// Returns true if OOM is detected (via the atomic bool)
+const (
+	gvisorOOMKillTimeout   = 5 * time.Second
+	gvisorOOMDeleteTimeout = 5 * time.Second
+)
+
+// setupOOMWatcher starts OOM monitoring for the container.
 func (s *Worker) setupOOMWatcher(
 	ctx context.Context,
 	containerId string,
@@ -22,49 +30,56 @@ func (s *Worker) setupOOMWatcher(
 	outputLogger *slog.Logger,
 	isOOMKilled *atomic.Bool,
 ) {
-	var oomWatcher runtime.OOMWatcher
+	var newOOMWatcher func() runtime.OOMWatcher
+	containerInstance, exists := s.containerInstances.Get(containerId)
+	if !exists {
+		return
+	}
+	containerRuntime := containerInstance.Runtime
+	if containerRuntime == nil {
+		containerRuntime = s.runtime
+	}
+	if containerRuntime == nil {
+		return
+	}
 
-	// Select appropriate OOM watcher based on runtime
-	if s.runtime.Name() == types.ContainerRuntimeGvisor.String() {
-		// For gVisor: monitor memory usage directly since cgroup files aren't accessible
-		memoryLimit := s.getMemoryLimit(spec, request)
-		oomWatcher = runtime.NewGvisorOOMWatcher(ctx, pid, memoryLimit)
+	if containerRuntime.Name() == types.ContainerRuntimeGvisor.String() {
+		if !s.memoryLimitsEnforced(request) {
+			return
+		}
+		// runsc places the sandbox and gofer in a cgroup named after the
+		// container. memory.events accounts shared mappings once and only
+		// reports an OOM after the kernel actually enforces the hard limit.
+		cgroupPath := containerId
+		if spec != nil && spec.Linux != nil && spec.Linux.CgroupsPath != "" {
+			cgroupPath = strings.TrimPrefix(spec.Linux.CgroupsPath, "/")
+		}
+		newOOMWatcher = func() runtime.OOMWatcher {
+			return runtime.NewCgroupOOMWatcher(ctx, cgroupPath)
+		}
 	} else {
-		// For runc: use cgroup-based OOM detection
 		cgroupPath, err := runtime.GetCgroupPathFromPID(pid)
 		if err != nil {
 			log.Warn().Str("container_id", containerId).Err(err).Msg("failed to get cgroup path, OOM detection disabled")
 			return
 		}
-		oomWatcher = runtime.NewCgroupOOMWatcher(ctx, cgroupPath)
+		newOOMWatcher = func() runtime.OOMWatcher {
+			return runtime.NewCgroupOOMWatcher(ctx, cgroupPath)
+		}
 	}
 
-	// Store watcher and start monitoring
-	containerInstance, exists := s.containerInstances.Get(containerId)
-	if !exists {
-		return
-	}
-
-	containerInstance.OOMWatcher = oomWatcher
-	s.containerInstances.Set(containerId, containerInstance)
-
-	// Start watching with callback
-	err := oomWatcher.Watch(func() {
-		s.handleOOMKill(ctx, containerId, request, outputLogger, isOOMKilled)
+	containerInstance.installOOMWatcher(func(onOOM func()) runtime.OOMWatcher {
+		oomWatcher := newOOMWatcher()
+		err := oomWatcher.Watch(onOOM)
+		if err != nil {
+			oomWatcher.Stop()
+			log.Warn().Str("container_id", containerId).Err(err).Msg("OOM watcher failed to start")
+			return nil
+		}
+		return oomWatcher
+	}, func() error {
+		return s.handleOOMKill(ctx, containerId, request, outputLogger, isOOMKilled)
 	})
-
-	if err != nil {
-		log.Warn().Str("container_id", containerId).Err(err).Msg("OOM watcher failed to start")
-	}
-}
-
-// getMemoryLimit extracts memory limit from spec or request
-func (s *Worker) getMemoryLimit(spec *specs.Spec, request *types.ContainerRequest) uint64 {
-	if spec.Linux.Resources != nil && spec.Linux.Resources.Memory != nil && spec.Linux.Resources.Memory.Limit != nil {
-		return uint64(*spec.Linux.Resources.Memory.Limit)
-	}
-	// Fallback to request memory (convert MB to bytes)
-	return uint64(request.Memory * 1024 * 1024)
 }
 
 // handleOOMKill handles the OOM kill event
@@ -74,21 +89,77 @@ func (s *Worker) handleOOMKill(
 	request *types.ContainerRequest,
 	outputLogger *slog.Logger,
 	isOOMKilled *atomic.Bool,
-) {
+) error {
 	log.Warn().Str("container_id", containerId).Msg("OOM kill detected")
 	isOOMKilled.Store(true)
 	outputLogger.Info(types.WorkerContainerExitCodeOomKillMessage)
 
-	// Push OOM event for monitoring/notifications
-	go s.eventRepo.PushContainerOOMEvent(containerId, s.workerId, request)
+	go s.recordContainerEvent(ctx, request, types.EventContainerEventSchema{
+		ID:        types.ContainerEventRuntimeOOMKilled,
+		Domain:    types.EventDomainRuntime,
+		Timestamp: time.Now().UTC(),
+		Reason:    "OOM",
+		Source:    types.EventSourceWorkerRuntime.String(),
+		Message:   types.EventMessageRuntimeOOMKilled.String(),
+		Attrs: map[string]string{
+			types.EventAttrOOMKilled: "true",
+		},
+	})
 
-	// For gVisor, manually stop the container (kernel won't do it automatically)
-	if s.runtime.Name() == types.ContainerRuntimeGvisor.String() {
-		log.Info().Str("container_id", containerId).Msg("stopping container due to OOM (gVisor)")
-		go func() {
-			if err := s.stopContainer(containerId, true); err != nil {
-				log.Error().Str("container_id", containerId).Err(err).Msg("failed to stop OOM container")
-			}
-		}()
+	// For gVisor, manually stop the container (kernel won't do it automatically).
+	// A restored container may use a different runtime than the worker default.
+	containerRuntime := s.runtime
+	if instance, exists := s.containerInstances.Get(containerId); exists {
+		if _, stopReason := instance.lifecycleState(); stopReason == "" {
+			instance.setStopReason(types.StopContainerReasonUnknown)
+			s.containerInstances.Set(containerId, instance)
+		}
+		if instance.Runtime != nil {
+			containerRuntime = instance.Runtime
+		}
 	}
+	if containerRuntime != nil && containerRuntime.Name() == types.ContainerRuntimeGvisor.String() {
+		log.Info().Str("container_id", containerId).Msg("stopping container due to OOM (gVisor)")
+		// Fence local lifecycle work immediately. The bounded runtime commands stay
+		// synchronous with watcher arbitration, so no kill escapes into CRIU.
+		s.cancelContainer(containerId)
+		if err := s.terminateGvisorAfterOOM(ctx, containerId, containerRuntime); err != nil {
+			log.Error().Str("container_id", containerId).Err(err).Msg("failed to stop OOM container")
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Worker) terminateGvisorAfterOOM(ctx context.Context, containerId string, containerRuntime runtime.Runtime) error {
+	killCtx, cancelKill := oomOperationContext(ctx, gvisorOOMKillTimeout)
+	// OOM termination is not an automatic scheduler/TTL stop. It must not be
+	// deferred behind an in-flight checkpoint because the runtime is already in
+	// an unsafe terminal condition.
+	killErr := s.stopContainerWithoutCheckpointDeferral(killCtx, containerId, true)
+	cancelKill()
+	if killErr == nil || runtimeContainerNotFound(killErr) {
+		return nil
+	}
+
+	deleteCtx, cancelDelete := context.WithTimeout(context.Background(), gvisorOOMDeleteTimeout)
+	deleteErr := containerRuntime.Delete(deleteCtx, containerId, &runtime.DeleteOpts{Force: true})
+	cancelDelete()
+	if deleteErr == nil || runtimeContainerNotFound(deleteErr) {
+		return nil
+	}
+
+	return fmt.Errorf("gVisor OOM termination failed: %w", errors.Join(
+		fmt.Errorf("kill: %w", killErr),
+		fmt.Errorf("force delete: %w", deleteErr),
+	))
+}
+
+func oomOperationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(timeout)
+	if parentDeadline, ok := parent.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	return context.WithDeadline(context.WithoutCancel(parent), deadline)
 }

@@ -2,16 +2,22 @@ package worker
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/beam-cloud/beta9/pkg/types"
 )
 
 type GPUInfoClient interface {
 	AvailableGPUDevices() ([]int, error)
+	DeviceUUIDs() (map[int]string, error)
 	GetGPUMemoryUsage(deviceIndex int) (GPUMemoryUsageStats, error)
 }
 
@@ -20,21 +26,102 @@ type GPUMemoryUsageStats struct {
 	TotalCapacity int64
 }
 
-type NvidiaInfoClient struct{}
+type NvidiaInfoClient struct {
+	visibleDevices string
+	devicesMu      sync.Mutex
+	devicesLoaded  bool
+	devices        []nvidiaSMIDevice
+}
 
-func (c *NvidiaInfoClient) hexToPaddedString(hexStr string) (string, error) {
-	// Remove the "0x" prefix if it exists
+const defaultDeviceCheckpointPath = types.HostKubeletDeviceCheckpointPath
+
+var (
+	nvidiaProcGPUInfoRoot = "/proc/driver/nvidia/gpus"
+)
+
+type kubeletCheckpoint struct {
+	Data struct {
+		PodDeviceEntries []podDeviceEntry `json:"PodDeviceEntries"`
+	} `json:"Data"`
+}
+
+type podDeviceEntry struct {
+	PodUID       string              `json:"PodUID"`
+	ResourceName string              `json:"ResourceName"`
+	DeviceIDs    map[string][]string `json:"DeviceIDs"`
+}
+
+type nvidiaSMIDevice struct {
+	Index       int
+	UUID        string
+	SystemBusID string
+}
+
+// resolveVisibleDevices returns this worker's GPU assignment: "all" or a
+// comma-separated list of UUIDs/indices. NVIDIA_VISIBLE_DEVICES is a request
+// mechanism, not introspection (base images and the container toolkit both
+// rewrite it to "void"), so the orchestrator's allocation record wins.
+var resolveVisibleDevices = func() string {
+	// k8s/k3s: the device-plugin checkpoint, keyed by pod UID.
+	if devices := kubeletAssignedDevices(); devices != "" {
+		return devices
+	}
+	// docker: the assignment passed explicitly by the agent.
+	if devices := strings.TrimSpace(os.Getenv(types.WorkerGPUDevicesEnv)); devices != "" {
+		return devices
+	}
+
+	devices := os.Getenv(types.NvidiaVisibleDevicesEnv)
+	if devices == "void" && agentManagedWorker() {
+		// Older agents only set NVIDIA_VISIBLE_DEVICES; the machine is
+		// dedicated, so every device injected into the container is ours.
+		return "all"
+	}
+	return devices
+}
+
+func kubeletAssignedDevices() string {
+	podUID := os.Getenv(types.WorkerPodUIDEnv)
+	if podUID == "" {
+		return ""
+	}
+
+	data, err := os.ReadFile(defaultDeviceCheckpointPath)
+	if err != nil {
+		return ""
+	}
+
+	var checkpoint kubeletCheckpoint
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return ""
+	}
+
+	var allUUIDs []string
+	for _, entry := range checkpoint.Data.PodDeviceEntries {
+		if entry.PodUID != podUID || entry.ResourceName != "nvidia.com/gpu" {
+			continue
+		}
+		for _, uuids := range entry.DeviceIDs {
+			allUUIDs = append(allUUIDs, uuids...)
+		}
+	}
+	return strings.Join(allUUIDs, ",")
+}
+
+// agentManagedWorker reports whether a private-pool agent started this worker
+// on a machine dedicated to it.
+func agentManagedWorker() bool {
+	persistent, _ := strconv.ParseBool(os.Getenv(types.WorkerPersistentEnv))
+	return persistent && os.Getenv(types.WorkerMachineEnv) != ""
+}
+
+func hexToPaddedString(hexStr string) (string, error) {
 	hexStr = strings.TrimPrefix(hexStr, "0x")
-
-	// Parse the hexadecimal string to an integer
 	value, err := strconv.ParseUint(hexStr, 16, 16)
 	if err != nil {
 		return "", err
 	}
-
-	// Format the integer as a zero-padded string with 4 digits
-	paddedStr := fmt.Sprintf("%04x", value)
-	return paddedStr, nil
+	return fmt.Sprintf("%04x", value), nil
 }
 
 var queryDevices = func() ([]byte, error) {
@@ -43,9 +130,17 @@ var queryDevices = func() ([]byte, error) {
 }
 
 var checkGPUExists = func(busId string) (bool, error) {
-	_, err := os.Stat(fmt.Sprintf("/proc/driver/nvidia/gpus/%s", busId))
+	path := filepath.Join(nvidiaProcGPUInfoRoot, busId)
+	_, err := os.Stat(path)
 	if err == nil {
-		return true, nil
+		data, err := os.ReadFile(filepath.Join(path, "information"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return true, nil
+			}
+			return false, err
+		}
+		return !nvidiaProcInfoLooksFailed(string(data)), nil
 	}
 
 	if os.IsNotExist(err) {
@@ -55,15 +150,103 @@ var checkGPUExists = func(busId string) (bool, error) {
 	return false, err
 }
 
+// deviceVisible reports whether a GPU matches the assignment spec: "all", or a
+// comma-separated list of UUIDs and/or indices.
+func deviceVisible(visibleDevices, uuid, index string) bool {
+	if visibleDevices == "all" {
+		return true
+	}
+	for _, token := range strings.Split(visibleDevices, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if token == uuid || token == index {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *NvidiaInfoClient) AvailableGPUDevices() ([]int, error) {
-	visibleDevices := os.Getenv("NVIDIA_VISIBLE_DEVICES") // Find available GPU BUS IDs
-	devices, err := queryDevices()
+	visibleDevices := c.visibleDevices
+	devices, err := c.deviceInventory()
 	if err != nil {
 		return nil, err
 	}
 
-	// Parse the output
 	result := []int{}
+	for _, device := range devices {
+		if !deviceVisible(visibleDevices, device.UUID, strconv.Itoa(device.Index)) {
+			continue
+		}
+
+		if exists, err := checkGPUExists(device.SystemBusID); err == nil && exists {
+			result = append(result, device.Index)
+		}
+	}
+
+	return result, nil
+}
+
+// DeviceUUIDs returns the index-to-UUID mapping for all devices from a single
+// nvidia-smi query, so callers can resolve many devices without re-querying.
+func (c *NvidiaInfoClient) DeviceUUIDs() (map[int]string, error) {
+	devices, err := c.deviceInventory()
+	if err != nil {
+		return nil, err
+	}
+
+	uuids := make(map[int]string, len(devices))
+	for _, device := range devices {
+		uuids[device.Index] = device.UUID
+	}
+	return uuids, nil
+}
+
+func (c *NvidiaInfoClient) deviceInventory() ([]nvidiaSMIDevice, error) {
+	c.devicesMu.Lock()
+	defer c.devicesMu.Unlock()
+	if c.devicesLoaded {
+		return c.devices, nil
+	}
+
+	devices, err := nvidiaSMIDevices()
+	if err != nil {
+		return nil, err
+	}
+	c.devices = devices
+	c.devicesLoaded = true
+	return c.devices, nil
+}
+
+func nvidiaSMIDevices() ([]nvidiaSMIDevice, error) {
+	devices, err := queryDevices()
+	if err != nil {
+		return nil, err
+	}
+	return parseNvidiaSMIDevices(devices)
+}
+
+func nvidiaProcInfoLooksFailed(info string) bool {
+	for _, line := range strings.Split(info, "\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		switch strings.TrimSpace(name) {
+		case "GPU Excluded":
+			if strings.EqualFold(value, "yes") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func parseNvidiaSMIDevices(devices []byte) ([]nvidiaSMIDevice, error) {
+	result := []nvidiaSMIDevice{}
 	for _, line := range strings.Split(string(devices), "\n") {
 		if len(line) == 0 {
 			continue
@@ -74,35 +257,30 @@ func (c *NvidiaInfoClient) AvailableGPUDevices() ([]int, error) {
 			return nil, fmt.Errorf("unexpected output from nvidia-smi: %s", line)
 		}
 
-		domain, err := c.hexToPaddedString(strings.TrimSpace(parts[0]))
+		domain, err := hexToPaddedString(strings.TrimSpace(parts[0]))
 		if err != nil {
 			return nil, err
 		}
 
-		uuid := strings.TrimSpace(parts[3])
-		if !strings.Contains(visibleDevices, uuid) && visibleDevices != "all" {
-			continue
-		}
-
-		smiBusIdParts := strings.Split(parts[1], ":")
-		if len(smiBusIdParts) != 3 {
+		smiBusIDParts := strings.Split(parts[1], ":")
+		if len(smiBusIDParts) != 3 {
 			return nil, fmt.Errorf("unexpected bus id format from nvidia-smi: %s", line)
 		}
 
-		// The bus id from nvidia-smi comes as xxxxxxxx:xx:xx.x so convert it to the format xxxx:xx:xx.x
-		systemBusId := strings.ToLower(strings.Join([]string{domain, smiBusIdParts[1], smiBusIdParts[2]}, ":"))
-		gpuIndex := strings.TrimSpace(parts[2])
-
-		if exists, err := checkGPUExists(systemBusId); err == nil && exists {
-			index, err := strconv.Atoi(strings.TrimSpace(gpuIndex))
-			if err != nil {
-				return nil, err
-			}
-
-			result = append(result, index)
+		gpuIndex, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+		if err != nil {
+			return nil, err
 		}
-	}
 
+		// The bus id from nvidia-smi comes as xxxxxxxx:xx:xx.x; procfs uses
+		// xxxx:xx:xx.x.
+		systemBusID := strings.ToLower(strings.Join([]string{domain, smiBusIDParts[1], smiBusIDParts[2]}, ":"))
+		result = append(result, nvidiaSMIDevice{
+			Index:       gpuIndex,
+			UUID:        strings.TrimSpace(parts[3]),
+			SystemBusID: systemBusID,
+		})
+	}
 	return result, nil
 }
 

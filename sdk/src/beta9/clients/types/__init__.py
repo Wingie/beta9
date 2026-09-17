@@ -44,6 +44,21 @@ class Checkpoint(betterproto.Message):
     created_at: datetime = betterproto.message_field(13)
     last_restored_at: datetime = betterproto.message_field(14)
     deleted_at: "NullTime" = betterproto.message_field(15)
+    cache_hash: str = betterproto.string_field(16)
+    cache_size_bytes: int = betterproto.int64_field(17)
+    origin_key: str = betterproto.string_field(18)
+    locality: str = betterproto.string_field(19)
+    accelerator: str = betterproto.string_field(20)
+    runtime: str = betterproto.string_field(21)
+
+
+@dataclass(eq=False, repr=False)
+class CheckpointTrigger(betterproto.Message):
+    type: str = betterproto.string_field(1)
+    http_path: str = betterproto.string_field(2)
+    http_port: int = betterproto.uint32_field(3)
+    timeout_seconds: int = betterproto.uint32_field(4)
+    interval_seconds: int = betterproto.uint32_field(5)
 
 
 @dataclass(eq=False, repr=False)
@@ -102,6 +117,13 @@ class ContainerRequest(betterproto.Message):
     block_network: bool = betterproto.bool_field(28)
     allow_list: List[str] = betterproto.string_field(29)
     docker_enabled: bool = betterproto.bool_field(30)
+    runtime_secret_names: List[str] = betterproto.string_field(31)
+    runtime_token_required: bool = betterproto.bool_field(32)
+    allow_marketplace: bool = betterproto.bool_field(33)
+    machine_id: str = betterproto.string_field(34)
+    checkpoint_trigger: "CheckpointTrigger" = betterproto.message_field(35)
+    task_id: str = betterproto.string_field(36)
+    hostname: str = betterproto.string_field(38)
 
 
 @dataclass(eq=False, repr=False)
@@ -116,6 +138,17 @@ class ContainerState(betterproto.Message):
     cpu: int = betterproto.int64_field(8)
     memory: int = betterproto.int64_field(9)
     started_at: int = betterproto.int64_field(10)
+    worker_id: str = betterproto.string_field(11)
+    machine_id: str = betterproto.string_field(12)
+
+
+@dataclass(eq=False, repr=False)
+class DurableDiskMountConfig(betterproto.Message):
+    name: str = betterproto.string_field(1)
+    size: str = betterproto.string_field(2)
+    filesystem: str = betterproto.string_field(3)
+    driver: str = betterproto.string_field(4)
+    source_snapshot_id: str = betterproto.string_field(5)
 
 
 @dataclass(eq=False, repr=False)
@@ -163,6 +196,7 @@ class Mount(betterproto.Message):
     read_only: bool = betterproto.bool_field(4)
     mount_type: str = betterproto.string_field(5)
     mount_point_config: "MountPointConfig" = betterproto.message_field(6)
+    durable_disk: "DurableDiskMountConfig" = betterproto.message_field(7)
 
 
 @dataclass(eq=False, repr=False)
@@ -254,6 +288,11 @@ class Worker(betterproto.Message):
     build_version: str = betterproto.string_field(16)
     active_containers: List["Container"] = betterproto.message_field(17)
     runtime: str = betterproto.string_field(18)
+    pool_selector: str = betterproto.string_field(19)
+    cordon_requested: bool = betterproto.bool_field(20)
+    rollout_generation: str = betterproto.string_field(21)
+    rollout_build_version: str = betterproto.string_field(22)
+    worker_image_override: str = betterproto.string_field(23)
 
 
 @dataclass(eq=False, repr=False)

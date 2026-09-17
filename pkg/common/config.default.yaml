@@ -18,6 +18,12 @@ database:
     enableTLS: false
     insecureSkipVerify: false
     dialTimeout: 3s
+  s2:
+    apiKey: ""
+    basin: beta9-events
+    streamPrefix: events
+events:
+  callbacks: []
 storage:
   mode: juicefs
   fsName: beta9-fs
@@ -39,6 +45,7 @@ storage:
     defaultAccessKey: test
     defaultSecretKey: test
     defaultEndpointUrl: http://localstack:4566
+    defaultPresignedEndpointUrl: http://127.0.0.1:4566
     defaultRegion: us-east-1
     alluxio:
       debug: false
@@ -46,8 +53,9 @@ storage:
       debug: false
       fsyncOnClose: true
       memoryLimit: 2048
-      maxFlushers: 64
-      maxParallelParts: 64
+      maxFlushers: 16
+      maxParallelParts: 8
+      httpTimeout: 60s
       dirMode: 0777
       fileMode: 0666
       listType: 1
@@ -60,6 +68,7 @@ storage:
       stagedWritePath: /tmp/geesefs-staged-write
       stagedWriteDebounce: 30s
       cacheStreamingEnabled: false
+      cacheDirectIO: false
       cacheThroughEnabled: true
 gateway:
   host: beta9-gateway
@@ -87,6 +96,25 @@ gateway:
     memory: 32768
     maxReplicas: 10
     maxGpuCount: 2
+  # Per-workspace cap on concurrently reserved capacity, applied only to
+  # workspaces without an explicit concurrency limit row. Disabled when
+  # either value is 0.
+  defaultConcurrencyLimit:
+    cpuMillicores: 0
+    gpuCount: 0
+  # Prepaid credit gate. In "http" mode the scheduler asks the billing
+  # service (POST {workspace_id} to endpoint) before running a container and
+  # periodically stops containers of workspaces that have run out of credit.
+  # "noop" allows everything (self-hosted default).
+  creditGate:
+    mode: noop
+    endpoint: ""
+    authToken: ""
+    timeout: 10s
+    cacheTTL: 30s
+    staleTTL: 10m
+    failOpen: true
+    enforceInterval: 1m
 fileService:
   enabled: true
   endpointUrl: http://juicefs-s3-gateway.beta9.svc.cluster.local:9900
@@ -100,8 +128,23 @@ imageService:
   # In the worst case, we have seen 10gb images take 20 minutes. That is 1e+10 bytes taking 1200 seconds.
   # That gives 1200 / 1e+10 = 120 ns per byte.
   archiveNanosecondsPerByte: 120
-  # Default to clip v2 (index-only OCI archives). Set to 1 to force legacy.
-  clipVersion: 1
+  # Default to clip v2. Set to 1 to force legacy image format. NOTE: This only applies to new images.
+  clipVersion: 2
+  # Publish a build's delta as layers packed from the working container (no
+  # buildah commit/push/re-index). Unsupported Dockerfiles fall back to bud.
+  layeredBuilds: true
+  # apt settings for RUN steps of a build (bind-mounted, not baked into the
+  # image). Set mirror to a nearby Ubuntu mirror, e.g.
+  # http://mirrors.edge.kernel.org/ubuntu, when archive.ubuntu.com is slow.
+  buildApt:
+    mirror: ""
+    proxy: ""
+    timeoutS: 20
+    retries: 3
+  # The buildah layer store under the build cache keeps every layer a build on
+  # the node produced. Cap it at this fraction of its filesystem; after each
+  # build the oldest images go until it fits. 0 disables the cap.
+  buildLayerCacheMaxPct: 0.20
   registryStore: local
   registryCredentialProvider: docker
   buildRegistry: registry.localhost:5000
@@ -161,18 +204,33 @@ worker:
       priority: 1
       # runtime: ""  # Optional: Kubernetes RuntimeClass for the pod (e.g., "nvidia")
       containerRuntime: gvisor  # Pool-specific container runtime: "runc" or "gvisor"
+      containerStartConcurrency: 32
       containerRuntimeConfig:
         gvisorPlatform: systrap
         gvisorRoot: /run/gvisor
+        # CLIP image roots are immutable, so gVisor can safely cache their
+        # path metadata. Non-root mounts retain gVisor's shared default.
+        gvisorExtraArgs:
+          - --overlay2=none
+          - --file-access=exclusive
+      # Optional per-pool durable disk and cache overrides for nodes with different storage layouts.
+      # Defaults to <storagePath>/durable-disks when storagePath is set, otherwise /var/lib/beta9/durable-disks.
+      # durableDisksPath: /mnt/nvme/beta9/durable-disks
+      # cache:
+      #   disk:
+      #     hostPath: /mnt/nvme/beta9/cache
+      #     mountPath: /var/lib/beta9/cache
+      #     maxUsagePct: 0.95
+      networkPreallocation: true
+      networkSlotPoolSize: 32
       jobSpec:
         nodeSelector: {}
       criuEnabled: true
-      checkpointPath: /data/checkpoints
       poolSizing:
-        defaultWorkerCpu: 1000m
+        defaultWorkerCpu: 2000m
         defaultWorkerGpuType: ""
         defaultWorkerMemory: 1Gi
-        minFreeCpu: 1000m
+        minFreeCpu: 2000m
         minFreeGpu: 0
         minFreeMemory: 1Gi
     build:
@@ -183,6 +241,18 @@ worker:
       containerRuntimeConfig:
         gvisorPlatform: systrap
         gvisorRoot: /run/gvisor
+        gvisorExtraArgs:
+          - --overlay2=none
+          - --file-access=exclusive
+      # Optional per-pool durable disk and cache overrides.
+      # Defaults to <storagePath>/durable-disks when storagePath is set, otherwise /var/lib/beta9/durable-disks.
+      # durableDisksPath: /mnt/build-cache/beta9/durable-disks
+      # cache:
+      #   disk:
+      #     hostPath: /mnt/build-cache/beta9/cache
+      #     mountPath: /var/lib/beta9/cache
+      networkPreallocation: true
+      networkSlotPoolSize: 32
       tmpSizeLimit: 50Gi
       jobSpec:
         nodeSelector: {}
@@ -213,6 +283,30 @@ worker:
     #     minFreeGpu:
     #     minFreeMemory:
     #     sharedMemoryLimitPct: 100%
+    # Agent-backed public/serverless pool. Omitting provider is intentional:
+    # external + provider uses the provider-backed remote Kubernetes controller;
+    # external without provider uses the agent controller and `machine create`.
+    # public-cpu:
+    #   mode: external
+    #   containerRuntime: runc
+    #   requiresPoolSelector: false
+    #   priority: 100
+    #   preemptable: false
+    #   containerStartConcurrency: 4
+    #   networkSlotPoolSize: 32
+    #   tmpSizeLimit: 50Gi
+    #   # On agent-backed pools these are host paths on each joined machine.
+    #   # Empty values fall back to the agent installer's state/cache dirs.
+    #   storagePath: /var/lib/beta9/storage
+    #   imagesPath: /var/lib/beta9/images
+    #   durableDisksPath: /var/lib/beta9/durable-disks
+    #   cache:
+    #     enabled: true
+    #     disk:
+    #       enabled: true
+    #       hostPath: /var/lib/beta9/cache
+    #       mountPath: /var/lib/beta9/cache
+    #       maxUsagePct: 0.95
   # global pool attributes
   useHostResolvConf: true
   hostNetwork: false
@@ -227,72 +321,94 @@ worker:
   # non-standard k8s job spec
   imagePVCName: beta9-images
   jobResourcesEnforced: false
+  # Extra CPU/memory for the worker process itself (FUSE image/volume servers,
+  # runtime, log shipping), added to the pod on top of the container capacity
+  # the scheduler hands out. Only applies when jobResourcesEnforced is true.
+  jobResourceOverhead:
+    cpu: ''
+    memory: ''
   containerResourceLimits:
     cpuEnforced: true
+    cpuAffinityEnforced: false
     memoryEnforced: false
   defaultWorkerCPURequest: 2000
   defaultWorkerMemoryRequest: 1024
   terminationGracePeriod: 30
   cleanupWorkerInterval: 1m
   cleanupPendingWorkerAgeLimit: 10m
-  blobCacheEnabled: true
+  # An idle worker holding a pool's minimum free capacity (poolSizing.minFree*)
+  # stays up; past this age it exits anyway and the sizer replaces it.
+  headroomWorkerMaxAge: 6h
+  # Lifetime bound for any non-persistent worker, busy or idle: past it the
+  # worker stops accepting containers, lets running ones finish and exits, so
+  # steady traffic cannot keep a worker on an old image forever.
+  # Both ages get up to 1/8 worker-id jitter so workers do not leave together;
+  # 0 disables either bound.
+  maxAge: 24h
+  cacheEnabled: true
   containerLogLinesPerHour: 6000
-  failover:
-    enabled: true
-    maxPendingWorkers: 10
-    maxSchedulingLatencyMs: 300000 # 5 minutes
-    minMachinesAvailable: 1 # minMachinesAvailable only applies to external pools
   criu:
     mode: nvidia
-    storage:
-      mode: local
-      mountPath: /data/checkpoints
-    cedana:
-      # Can be unix, tcp, vsock
-      protocol: unix
-      address: /run/cedana.sock
-      log_level: debug
-      # Connection details to your cedana endpoint
-      connection:
-        url: ""
-        auth_token: ""
-      checkpoint:
-        # Default dir to write/stream checkpoints to
-        dir: /data/checkpoints
-        # Can be one of: none, tar, lz4, gzip, zlib
-        compression: lz4
-        # Number of parallel streams for streaming checkpoints (0 = off)
-        # TODO: usable only in next release
-        # stream: 4
-      db:
-        # Use remote DB on the cedana endpoint
-        remote: true
-      profiling:
-        # Receive profiling info in the gRPC trailer
-        enabled: false
-        precision: auto
-      criu:
-        # Keep the job running after checkpoint
-        leave_running: true
 
-blobcache:
+cache:
+  enabled: true
+  disk:
+    enabled: true
+    hostPath: /var/lib/beta9/cache
+    mountPath: /var/lib/beta9/cache
+    maxUsagePct: 0.95
+  memory:
+    enabled: false
+    maxCachePct: 0
+  coordinator:
+    token:
+    registrationTTLSeconds: 30
+    heartbeatIntervalSeconds: 10
+    hostWatchIntervalSeconds: 5
   global:
-    coordinatorHost: blobcache.beta9.svc.cluster.local:2049
     defaultLocality: default
-    serverPort: 2049
+    serverPort: 2050
     discoveryIntervalS: 5
+    discoveryJitterS: 3
+    maxDiscoveryConcurrency: 8
+    hostMonitorIntervalS: 30
     rttThresholdMilliseconds: 1000
     hostStorageCapacityThresholdPct: 0.95
     grpcDialTimeoutS: 1
     grpcMessageSizeBytes: 1073741824 # 1GB
+    grpcInitialWindowSize: 4194304
+    grpcInitialConnWindowSize: 33554432
+    grpcWriteBufferSize: 262144
+    grpcReadBufferSize: 262144
+    grpcMaxConcurrentStreams: 1024
     debugMode: false
     prettyLogs: true
+  server:
+    pageSizeBytes: 4194304
+    smallRangeCopyThresholdBytes: 131072
+    objectTtlS: 0
+    s3DownloadConcurrency: 16
+    s3DownloadChunkSize: 64000000
+    readTransport:
+      enabled: true
+      sendfile: true
+      maxRequestSizeBytes: 67108864 # 64MiB; independent of the gRPC message limit.
+      maxInflightBytes: 1073741824 # Sixteen maximum-sized raw reads server-wide (not RAM with sendfile).
+      maxConcurrentRequests: 256 # One packed 16-CPU worker can have this many read-ahead windows in flight.
+    metadata:
+      mode: default
+      redisInsecureSkipVerify: false
   client:
     nTopHosts: 3
-    minRetryLengthBytes: 10000000 # 10MB
+    minRetryLengthBytes: 0 # 0 means retry all cache reads; increase to retry only larger reads.
     maxGetContentAttempts: 3
-    token:
-    blobfs:
+    readTransport:
+      enabled: true
+      maxActiveConnsPerHost: 64
+      maxIdleConnsPerHost: 16
+      requestSizeBytes: 67108864 # 64MiB; one request per GeeseFS cache-through window.
+      maxPartsPerRead: 8 # Only applies when a logical read is larger than requestSizeBytes.
+    cachefs:
       maxBackgroundTasks: 256
       maxReadAheadKB: 1024
       maxWriteKB: 1024
@@ -302,19 +418,51 @@ blobcache:
       directMount: false
       options:
       - max_read=1048576
+  reconciliation:
+    enabled: true
+    intervalSeconds: 15
+    recentStubTTLSeconds: 604800 # keep required content warm for 7 days after a stub's last container
+    lockTTLSeconds: 300
+    maxItemsPerCycle: 256 # re-prioritization batch size; exhausted cycles re-kick immediately
+    maxBytesPerCycle: 2147483648 # 2GiB between disk-usage gate rechecks
+    maxConcurrentFetches: 16
+    volumeMinBytes: 134217728 # 128MiB; only large geesefs volume objects are reconciled
+    originFallbackEnabled: false
 
 providers:
   ec2:
-    accessKey:
-    secretkey:
-    region: us-east-1
+    awsAccessKey:
+    awsSecretKey:
+    awsRegion: us-east-1
     # If you want workers nodes to land in your default vpc, you can omit subnetId
     subnetId:
     ami: ami-052c704a7f82c38b1
+  hetzner:
+    apiToken:
+    baseURL: https://api.hetzner.cloud/v1
+    image: ubuntu-24.04
+    imageByRegion: {}
+    sshKeys: []
+    sshKeysByRegion: {}
+    privateNetwork:
+      id: 0
+      name:
+      regionIds: {}
+      regionNames: {}
+      requireSubnet: true
+    serverTypePrices: {}
+    serverTypeCategories: {}
+    regionMetadata: {}
+    defaultRegions:
+    - ash
+    - hil
 tailscale:
   controlUrl:
   user: beta9
+  # Gateway tsnet auth key. Use an environment-scoped gateway tag, for example tag:beam-staging-gateway.
   authKey:
+  # Private pool agent tsnet auth key. Use a separate environment-scoped agent tag, for example tag:beam-staging-agent.
+  agentAuthKey:
   enabled: false
   debug: false
   hostName: headscale.internal
@@ -330,20 +478,27 @@ monitoring:
     meterInterval: 3s
     traceInterval: 3s
     traceSampleRatio: 1.0
-  fluentbit:
-    events:
-      endpoint: http://fluent-bit.monitoring:9880
-      maxConns: 0
-      maxIdleConns: 30
-      idleConnTimeout: 10s
-      dialTimeout: 2s
-      keepAlive: 30s
-      # mapping:
-      # - name: container.lifecycle
-      #   tag: internal_api
   openmeter:
     serverUrl: ""
     apiKey: ""
+managedCompute:
+  billableMarginPct: 0.10
+  byoc:
+    pricing:
+      memoryHourlyMicrosPerGB: 4500
+      cpuHourlyMicrosPerVCPU: 9500
+    aws:
+      templateUrl: ""
+      controlRolePrincipalArn: ""
+  billing:
+    mode: noop
+    endpoint: ""
+    authToken: ""
+    required: false
+    timeout: 5s
+    reconcileInterval: 1m
+    minimumCreditCents: 2500
+    failureGracePeriod: 10m
 abstractions:
   bot:
     systemPrompt: ""
@@ -351,7 +506,7 @@ abstractions:
     sessionInactivityTimeoutS: 10
   pod:
     tcp:
-      enabled: false
+      enabled: true
       externalHost: localhost
       externalPort: 1995
       port: 1995

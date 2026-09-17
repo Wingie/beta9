@@ -37,7 +37,27 @@ func (t Time) Value() (driver.Value, error) {
 
 // @go2proto
 type NullTime struct {
-	sql.NullTime
+	Time  time.Time
+	Valid bool
+}
+
+func (t *NullTime) Scan(value interface{}) error {
+	var nullTime sql.NullTime
+	if err := nullTime.Scan(value); err != nil {
+		return err
+	}
+
+	t.Time = nullTime.Time
+	t.Valid = nullTime.Valid
+	return nil
+}
+
+func (t NullTime) Value() (driver.Value, error) {
+	if !t.Valid {
+		return nil, nil
+	}
+
+	return t.Time, nil
 }
 
 func (t NullTime) Serialize() interface{} {
@@ -45,15 +65,13 @@ func (t NullTime) Serialize() interface{} {
 		return nil
 	}
 
-	return time.Time(t.Time).Format(time.RFC3339Nano)
+	return t.Time.Format(time.RFC3339Nano)
 }
 
 func (t NullTime) Now() NullTime {
 	return NullTime{
-		NullTime: sql.NullTime{
-			Time:  time.Now(),
-			Valid: true,
-		},
+		Time:  time.Now(),
+		Valid: true,
 	}
 }
 
@@ -75,6 +93,22 @@ type Workspace struct {
 
 func (w *Workspace) StorageAvailable() bool {
 	return w.Storage != nil && w.Storage.Id != nil && *w.Storage.Id > 0
+}
+
+func (w Workspace) WithoutSigningKey() Workspace {
+	w.SigningKey = nil
+	return w
+}
+
+func (w Workspace) WithoutPrivateCredentials() Workspace {
+	w.SigningKey = nil
+	if w.Storage != nil {
+		storage := *w.Storage
+		storage.AccessKey = nil
+		storage.SecretKey = nil
+		w.Storage = &storage
+	}
+	return w
 }
 
 func (w *Workspace) ToProto() *pb.Workspace {
@@ -155,27 +189,56 @@ func NewWorkspaceStorageFromProto(in *pb.WorkspaceStorage) *WorkspaceStorage {
 }
 
 func (w *WorkspaceStorage) ToProto() *pb.WorkspaceStorage {
+	createdAt := timestamppb.New(time.Time{})
+	if w.CreatedAt != nil {
+		createdAt = timestamppb.New(*w.CreatedAt)
+	}
+
+	updatedAt := timestamppb.New(time.Time{})
+	if w.UpdatedAt != nil {
+		updatedAt = timestamppb.New(*w.UpdatedAt)
+	}
+
 	return &pb.WorkspaceStorage{
-		Id:          uint32(*w.Id),
-		ExternalId:  *w.ExternalId,
-		BucketName:  *w.BucketName,
-		AccessKey:   *w.AccessKey,
-		SecretKey:   *w.SecretKey,
-		Region:      *w.Region,
-		EndpointUrl: *w.EndpointUrl,
-		CreatedAt:   timestamppb.New(*w.CreatedAt),
-		UpdatedAt:   timestamppb.New(*w.UpdatedAt),
+		Id:          uint32(getUintOrDefault(w.Id)),
+		ExternalId:  getStringOrDefault(w.ExternalId),
+		BucketName:  getStringOrDefault(w.BucketName),
+		AccessKey:   getStringOrDefault(w.AccessKey),
+		SecretKey:   getStringOrDefault(w.SecretKey),
+		Region:      getStringOrDefault(w.Region),
+		EndpointUrl: getStringOrDefault(w.EndpointUrl),
+		CreatedAt:   createdAt,
+		UpdatedAt:   updatedAt,
 	}
 }
 
+func getUintOrDefault(value *uint) uint {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
 const (
-	TokenTypeClusterAdmin        string = "admin"
-	TokenTypeWorkspacePrimary    string = "workspace_primary"
-	TokenTypeWorkspace           string = "workspace"
-	TokenTypeWorker              string = "worker"
+	TokenTypeClusterAdmin     string = "admin"
+	TokenTypeWorkspacePrimary string = "workspace_primary"
+	TokenTypeWorkspace        string = "workspace"
+	TokenTypeWorker           string = "worker"
+	// TokenTypeWorkerPrivate is a worker token minted for private-pool (agent)
+	// compute running on customer machines. It carries the pool owner's
+	// workspace and marks the worker as untrusted customer compute, so the
+	// gateway scopes its cache namespace and credential access by workspace.
+	TokenTypeWorkerPrivate       string = "worker_private"
 	TokenTypeMachine             string = "machine"
 	TokenTypeWorkspaceRestricted string = "workspace_restricted"
 )
+
+// IsWorkerTokenType reports whether the token type belongs to a worker
+// process: cluster workers (in-cluster and external pools) or private-pool
+// agent workers.
+func IsWorkerTokenType(tokenType string) bool {
+	return tokenType == TokenTypeWorker || tokenType == TokenTypeWorkerPrivate
+}
 
 type Token struct {
 	Id                     uint       `db:"id" json:"id" serializer:"id,source:external_id"`
@@ -230,6 +293,8 @@ type DeploymentWithRelated struct {
 	StubId      string    `serializer:"stub_id,source:stub.id"`
 	AppId       string    `serializer:"app_id,source:app.id"`
 	WorkspaceId string    `serializer:"workspace_id,source:workspace.id"`
+	URL         string    `db:"-" json:"url,omitempty" serializer:"url,omitempty"`
+	InvokeURL   string    `db:"-" json:"invoke_url,omitempty" serializer:"invoke_url,omitempty"`
 }
 
 // @go2proto
@@ -305,6 +370,7 @@ type Task struct {
 	Id                  uint       `db:"id" json:"id,omitempty" serializer:"id,source:external_id"`
 	ExternalId          string     `db:"external_id" json:"external_id,omitempty" serializer:"external_id"`
 	Status              TaskStatus `db:"status" json:"status,omitempty" serializer:"status"`
+	FailureReason       string     `db:"failure_reason" json:"failure_reason,omitempty" serializer:"failure_reason"`
 	ContainerId         string     `db:"container_id" json:"container_id,omitempty" serializer:"container_id"`
 	StartedAt           NullTime   `db:"started_at" json:"started_at,omitempty" serializer:"started_at"`
 	EndedAt             NullTime   `db:"ended_at" json:"ended_at,omitempty" serializer:"ended_at"`
@@ -339,6 +405,22 @@ type TaskWithRelated struct {
 type TaskCountPerDeployment struct {
 	DeploymentName string `db:"deployment_name" json:"deployment_name"`
 	TaskCount      uint   `db:"task_count" json:"task_count"`
+}
+
+// AppActivityBucket is one hour of an app's 24h activity strip: tasks created
+// (task-based stubs) plus sandboxes created (sandbox stubs), and how many of
+// those tasks ended in error.
+type AppActivityBucket struct {
+	Time   time.Time `json:"time"`
+	Total  int       `json:"total"`
+	Failed int       `json:"failed"`
+}
+
+type AppStateCounts struct {
+	All     int `json:"all" serializer:"all"`
+	Running int `json:"running" serializer:"running"`
+	Idle    int `json:"idle" serializer:"idle"`
+	Stopped int `json:"stopped" serializer:"stopped"`
 }
 
 type TaskCountByTime struct {
@@ -391,6 +473,18 @@ type Checkpoint struct {
 	CreatedAt         Time     `db:"created_at" json:"created_at" serializer:"created_at"`
 	LastRestoredAt    Time     `db:"last_restored_at" json:"last_restored_at" serializer:"last_restored_at"`
 	DeletedAt         NullTime `db:"deleted_at" json:"deleted_at" serializer:"deleted_at"`
+	CacheHash         string   `db:"cache_hash" json:"cache_hash" serializer:"cache_hash"`
+	CacheSizeBytes    int64    `db:"cache_size_bytes" json:"cache_size_bytes" serializer:"cache_size_bytes"`
+	OriginKey         string   `db:"origin_key" json:"origin_key" serializer:"origin_key"`
+	Locality          string   `db:"locality" json:"locality" serializer:"locality"`
+	Accelerator       string   `db:"accelerator" json:"accelerator" serializer:"accelerator"`
+	Runtime           string   `db:"runtime" json:"runtime" serializer:"runtime"`
+}
+
+const CheckpointRuntimeFilesystem = "filesystem"
+
+func (c *Checkpoint) IsFilesystemOnly() bool {
+	return c != nil && strings.EqualFold(strings.TrimSpace(c.Runtime), CheckpointRuntimeFilesystem)
 }
 
 func (c *Checkpoint) ToProto() *pb.Checkpoint {
@@ -410,6 +504,12 @@ func (c *Checkpoint) ToProto() *pb.Checkpoint {
 		ExposedPorts:      exposedPorts,
 		CreatedAt:         timestamppb.New(c.CreatedAt.Time),
 		LastRestoredAt:    timestamppb.New(c.LastRestoredAt.Time),
+		CacheHash:         c.CacheHash,
+		CacheSizeBytes:    c.CacheSizeBytes,
+		OriginKey:         c.OriginKey,
+		Locality:          c.Locality,
+		Accelerator:       c.Accelerator,
+		Runtime:           c.Runtime,
 	}
 }
 
@@ -430,39 +530,245 @@ func NewCheckpointFromProto(in *pb.Checkpoint) *Checkpoint {
 		ExposedPorts:      exposedPorts,
 		CreatedAt:         Time{Time: in.CreatedAt.AsTime()},
 		LastRestoredAt:    Time{Time: in.LastRestoredAt.AsTime()},
+		CacheHash:         in.CacheHash,
+		CacheSizeBytes:    in.CacheSizeBytes,
+		OriginKey:         in.OriginKey,
+		Locality:          in.Locality,
+		Accelerator:       in.Accelerator,
+		Runtime:           in.Runtime,
 	}
 }
 
 type StubConfigV1 struct {
-	Runtime            Runtime         `json:"runtime"`
-	Handler            string          `json:"handler"`
-	OnStart            string          `json:"on_start"`
-	OnDeploy           string          `json:"on_deploy"`
-	OnDeployStubId     string          `json:"on_deploy_stub_id"`
-	PythonVersion      string          `json:"python_version"`
-	KeepWarmSeconds    uint            `json:"keep_warm_seconds"`
-	MaxPendingTasks    uint            `json:"max_pending_tasks"`
-	CallbackUrl        string          `json:"callback_url"`
-	TaskPolicy         TaskPolicy      `json:"task_policy"`
-	Workers            uint            `json:"workers"`
-	ConcurrentRequests uint            `json:"concurrent_requests"`
-	Authorized         bool            `json:"authorized"`
-	Volumes            []*pb.Volume    `json:"volumes"`
-	Secrets            []Secret        `json:"secrets,omitempty"`
-	Env                []string        `json:"env,omitempty"`
-	Autoscaler         *Autoscaler     `json:"autoscaler"`
-	Extra              json.RawMessage `json:"extra"`
-	CheckpointEnabled  bool            `json:"checkpoint_enabled"`
-	WorkDir            string          `json:"work_dir"`
-	EntryPoint         []string        `json:"entry_point"`
-	Ports              []uint32        `json:"ports"`
-	Pricing            *PricingPolicy  `json:"pricing"`
-	Inputs             *Schema         `json:"inputs"`
-	Outputs            *Schema         `json:"outputs"`
-	TCP                bool            `json:"tcp"`
-	BlockNetwork       bool            `json:"block_network"`
-	AllowList          []string        `json:"allow_list"`
-	DockerEnabled      bool            `json:"docker_enabled"`
+	Runtime            Runtime            `json:"runtime"`
+	Handler            string             `json:"handler"`
+	OnStart            string             `json:"on_start"`
+	OnDeploy           string             `json:"on_deploy"`
+	OnDeployStubId     string             `json:"on_deploy_stub_id"`
+	PythonVersion      string             `json:"python_version"`
+	KeepWarmSeconds    int                `json:"keep_warm_seconds"`
+	MaxPendingTasks    uint               `json:"max_pending_tasks"`
+	CallbackUrl        string             `json:"callback_url"`
+	TaskPolicy         TaskPolicy         `json:"task_policy"`
+	Workers            uint               `json:"workers"`
+	ConcurrentRequests uint               `json:"concurrent_requests"`
+	Authorized         bool               `json:"authorized"`
+	Volumes            []*pb.Volume       `json:"volumes"`
+	Secrets            []Secret           `json:"secrets,omitempty"`
+	Env                []string           `json:"env,omitempty"`
+	Autoscaler         *Autoscaler        `json:"autoscaler"`
+	Extra              json.RawMessage    `json:"extra"`
+	CheckpointEnabled  bool               `json:"checkpoint_enabled"`
+	CheckpointTrigger  *CheckpointTrigger `json:"checkpoint_trigger,omitempty"`
+	WorkDir            string             `json:"work_dir"`
+	EntryPoint         []string           `json:"entry_point"`
+	Ports              []uint32           `json:"ports"`
+	Pricing            *PricingPolicy     `json:"pricing"`
+	Inputs             *Schema            `json:"inputs"`
+	Outputs            *Schema            `json:"outputs"`
+	TCP                bool               `json:"tcp"`
+	BlockNetwork       bool               `json:"block_network"`
+	AllowList          []string           `json:"allow_list"`
+	DockerEnabled      bool               `json:"docker_enabled"`
+	AllowMarketplace   bool               `json:"allow_marketplace"`
+	// Hostname to set inside the container.
+	Hostname string `json:"hostname,omitempty"`
+	// MachineID pins the stub's containers to one agent machine. Only set by
+	// the gateway for marketplace rental workloads; not exposed to the SDK.
+	MachineID string            `json:"machine_id,omitempty"`
+	IsService bool              `json:"is_service"`
+	Serving   *ServingConfig    `json:"serving,omitempty"`
+	Pool      *PoolConfig       `json:"pool,omitempty"`
+	Disks     []*pb.DurableDisk `json:"disks,omitempty"`
+}
+
+const (
+	ForceResourceLimitsMetadata  = "x-beta9-force-resource-limits"
+	forceResourceLimitsConfigKey = "_beta9_force_resource_limits"
+)
+
+// StubConfigWithForcedResourceLimits carries the request-scoped override over
+// the existing stub config wire path. Keeping the config as raw JSON preserves
+// fields introduced by newer clients that this gateway does not know yet.
+func StubConfigWithForcedResourceLimits(config string) (string, error) {
+	fields := map[string]json.RawMessage{}
+	if strings.TrimSpace(config) != "" && strings.TrimSpace(config) != "null" {
+		if err := json.Unmarshal([]byte(config), &fields); err != nil {
+			return "", err
+		}
+	}
+	fields[forceResourceLimitsConfigKey] = json.RawMessage("true")
+	updated, err := json.Marshal(fields)
+	if err != nil {
+		return "", err
+	}
+	return string(updated), nil
+}
+
+func StubConfigForcesResourceLimits(config string) bool {
+	marker := struct {
+		Enabled bool `json:"_beta9_force_resource_limits"`
+	}{}
+	return json.Unmarshal([]byte(config), &marker) == nil && marker.Enabled
+}
+
+type ServingConfig struct {
+	AppKind         string                 `json:"app_kind,omitempty" serializer:"app_kind,omitempty"`
+	ServingProtocol string                 `json:"serving_protocol,omitempty" serializer:"serving_protocol,omitempty"`
+	LLM             *LLMConfig             `json:"llm,omitempty" serializer:"llm,omitempty"`
+	Database        *DatabaseServingConfig `json:"database,omitempty" serializer:"database,omitempty"`
+}
+
+type DatabaseServingConfig struct {
+	Kind                    string   `json:"kind,omitempty" serializer:"kind,omitempty"`
+	Port                    uint32   `json:"port,omitempty" serializer:"port,omitempty"`
+	ReadinessProbe          string   `json:"readiness_probe,omitempty" serializer:"readiness_probe,omitempty"`
+	ConnectionEnvName       string   `json:"connection_env_name,omitempty" serializer:"connection_env_name,omitempty"`
+	ConnectionURL           string   `json:"connection_url,omitempty" serializer:"connection_url,omitempty"`
+	CredentialSecretNames   []string `json:"credential_secret_names,omitempty" serializer:"credential_secret_names,omitempty"`
+	DurabilityMode          string   `json:"durability_mode,omitempty" serializer:"durability_mode,omitempty"`
+	UsernameSecretName      string   `json:"username_secret_name,omitempty" serializer:"username_secret_name,omitempty"`
+	PasswordSecretName      string   `json:"password_secret_name,omitempty" serializer:"password_secret_name,omitempty"`
+	DatabaseSecretName      string   `json:"database_secret_name,omitempty" serializer:"database_secret_name,omitempty"`
+	ConnectionURLSecretName string   `json:"connection_url_secret_name,omitempty" serializer:"connection_url_secret_name,omitempty"`
+}
+
+func (d *DatabaseServingConfig) ClearSecretNames() {
+	if d == nil {
+		return
+	}
+	d.CredentialSecretNames = nil
+	d.UsernameSecretName = ""
+	d.PasswordSecretName = ""
+	d.DatabaseSecretName = ""
+	d.ConnectionURLSecretName = ""
+}
+
+const (
+	DatabaseKindPostgres      = "postgres"
+	DatabaseKindPostgresAlias = "postgresql"
+	DatabaseKindRedis         = "redis"
+	DatabaseKindValkey        = "valkey"
+
+	PostgresDataMountPath = "/var/lib/postgresql/data"
+)
+
+func NormalizeDatabaseKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	switch kind {
+	case DatabaseKindPostgresAlias:
+		return DatabaseKindPostgres
+	default:
+		return kind
+	}
+}
+
+func (c *DatabaseServingConfig) NormalizedKind() string {
+	if c == nil {
+		return ""
+	}
+	return NormalizeDatabaseKind(c.Kind)
+}
+
+func (c *DatabaseServingConfig) IsPostgres() bool {
+	return c.NormalizedKind() == DatabaseKindPostgres
+}
+
+func (c *DatabaseServingConfig) IsRedisCompatible() bool {
+	switch c.NormalizedKind() {
+	case DatabaseKindRedis, DatabaseKindValkey:
+		return true
+	default:
+		return false
+	}
+}
+
+type LLMConfig struct {
+	ModelID         string `json:"model_id,omitempty" serializer:"model_id,omitempty"`
+	Engine          string `json:"engine,omitempty" serializer:"engine,omitempty"`
+	ServedModelName string `json:"served_model_name,omitempty" serializer:"served_model_name,omitempty"`
+	ContextLength   int    `json:"context_length,omitempty" serializer:"context_length,omitempty"`
+	Tokenizer       string `json:"tokenizer,omitempty" serializer:"tokenizer,omitempty"`
+	MetricsPath     string `json:"metrics_path,omitempty" serializer:"metrics_path,omitempty"`
+	SLOTier         string `json:"slo_tier,omitempty" serializer:"slo_tier,omitempty"`
+}
+
+func (c *StubConfigV1) EffectiveServingConfig() *ServingConfig {
+	if c == nil || c.Serving == nil {
+		return nil
+	}
+	if c.Serving.AppKind == "" && c.Serving.ServingProtocol == "" && c.Serving.LLM == nil && c.Serving.Database == nil {
+		return nil
+	}
+	return c.Serving
+}
+
+func (c *StubConfigV1) EffectiveAppKind() string {
+	if serving := c.EffectiveServingConfig(); serving != nil {
+		return serving.AppKind
+	}
+	return ""
+}
+
+func (c *StubConfigV1) EffectiveServingProtocol() string {
+	if serving := c.EffectiveServingConfig(); serving != nil {
+		return serving.ServingProtocol
+	}
+	return ""
+}
+
+func (c *StubConfigV1) EffectiveLLMConfig() *LLMConfig {
+	if serving := c.EffectiveServingConfig(); serving != nil {
+		return serving.LLM
+	}
+	return nil
+}
+
+func (c *StubConfigV1) EffectiveDatabaseConfig() *DatabaseServingConfig {
+	if serving := c.EffectiveServingConfig(); serving != nil {
+		return serving.Database
+	}
+	return nil
+}
+
+type PoolConfig struct {
+	Name           string   `json:"name,omitempty"`
+	GPUs           []string `json:"gpu,omitempty"`
+	Nodes          uint32   `json:"nodes,omitempty"`
+	OfferID        string   `json:"offer_id,omitempty"`
+	TTL            string   `json:"ttl,omitempty"`
+	MaxSpend       float64  `json:"max_spend,omitempty"`
+	Providers      []string `json:"providers,omitempty"`
+	Regions        []string `json:"regions,omitempty"`
+	MinReliability float64  `json:"min_reliability,omitempty"`
+	Selector       string   `json:"selector,omitempty"`
+	Fallback       string   `json:"fallback,omitempty"`
+}
+
+func (p *PoolConfig) RequiresReservation() bool {
+	if p == nil {
+		return false
+	}
+	return p.Nodes > 0 ||
+		p.OfferID != "" ||
+		p.TTL != "" ||
+		p.MaxSpend > 0 ||
+		len(p.Providers) > 0 ||
+		len(p.Regions) > 0 ||
+		p.MinReliability > 0
+}
+
+func (c *StubConfigV1) PoolSelector() string {
+	if c == nil || c.Pool == nil {
+		return ""
+	}
+	if c.Pool.Selector != "" {
+		return c.Pool.Selector
+	}
+	if c.Pool.Name != "" {
+		return c.Pool.Name
+	}
+	return ""
 }
 
 type StubConfigLimitedValues struct {
@@ -526,13 +832,19 @@ type SchemaField struct {
 }
 
 func (c *StubConfigV1) RequiresGPU() bool {
-	return len(c.Runtime.Gpus) > 0 || c.Runtime.Gpu != ""
+	for _, gpu := range c.Runtime.Gpus {
+		if gpu != "" && gpu != NO_GPU {
+			return true
+		}
+	}
+	return c.Runtime.Gpu != "" && c.Runtime.Gpu != NO_GPU
 }
 
 type AutoscalerType string
 
 const (
-	QueueDepthAutoscaler AutoscalerType = "queue_depth"
+	QueueDepthAutoscaler       AutoscalerType = "queue_depth"
+	LLMTokenPressureAutoscaler AutoscalerType = "llm_token_pressure"
 )
 
 type Autoscaler struct {
@@ -540,6 +852,30 @@ type Autoscaler struct {
 	MaxContainers     uint           `json:"max_containers"`
 	TasksPerContainer uint           `json:"tasks_per_container"`
 	MinContainers     uint           `json:"min_containers"`
+}
+
+func (c *StubConfigV1) SetReplicaCount(containers uint) {
+	if c.Autoscaler == nil {
+		c.Autoscaler = &Autoscaler{
+			Type:              QueueDepthAutoscaler,
+			TasksPerContainer: 1,
+		}
+	}
+	if c.Autoscaler.Type == "" {
+		c.Autoscaler.Type = QueueDepthAutoscaler
+	}
+	if c.Autoscaler.TasksPerContainer == 0 {
+		c.Autoscaler.TasksPerContainer = 1
+	}
+	if containers == 0 {
+		c.Autoscaler.MinContainers = 0
+		if c.Autoscaler.MaxContainers == 0 {
+			c.Autoscaler.MaxContainers = 1
+		}
+		return
+	}
+	c.Autoscaler.MinContainers = containers
+	c.Autoscaler.MaxContainers = containers
 }
 
 // @go2proto
@@ -641,6 +977,9 @@ func (s *Stub) SanitizeConfig() error {
 	// Remove secret values from config
 	for i := range config.Secrets {
 		config.Secrets[i].Value = ""
+	}
+	if config.Serving != nil {
+		config.Serving.Database.ClearSecretNames()
 	}
 
 	data, err := json.Marshal(config)

@@ -11,21 +11,26 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/beam-cloud/beta9/pkg/cache"
 	"github.com/beam-cloud/beta9/pkg/types"
-	blobcache "github.com/beam-cloud/blobcache-v2/pkg"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	baseFileCachePath string = "/cache"
+	baseFileCachePath      string = types.AgentCacheFSMountPath
+	volumeCacheLibraryPath string = "/usr/local/lib/volume_cache.so"
+	volumeCacheMapEnv      string = "VOLUME_CACHE_MAP"
+	ldPreloadEnv           string = "LD_PRELOAD"
 )
 
 type FileCacheManager struct {
-	config types.AppConfig
-	client *blobcache.BlobCacheClient
+	config              types.AppConfig
+	client              *cache.Client
+	initializationGroup singleflight.Group
 }
 
-func NewFileCacheManager(config types.AppConfig, client *blobcache.BlobCacheClient) *FileCacheManager {
+func NewFileCacheManager(config types.AppConfig, client *cache.Client) *FileCacheManager {
 	return &FileCacheManager{
 		config: config,
 		client: client,
@@ -40,14 +45,10 @@ func (cm *FileCacheManager) CacheFilesInPath(sourcePath string) {
 		}
 
 		if !info.IsDir() {
-			_, err := cm.client.StoreContentFromFUSE(struct {
-				Path string
-			}{
-				Path: path,
-			}, struct {
-				RoutingKey string
-				Lock       bool
-			}{
+			_, err := cm.client.StoreContentFromLocalFile(cache.LocalContentSource{
+				Path:      path,
+				CachePath: path,
+			}, cache.StoreContentOptions{
 				RoutingKey: path,
 			})
 			if err != nil {
@@ -61,93 +62,106 @@ func (cm *FileCacheManager) CacheFilesInPath(sourcePath string) {
 
 func (cm *FileCacheManager) EnableVolumeCaching(workspaceName string, volumeCacheMap map[string]string, spec *specs.Spec) error {
 	if !cm.CacheAvailable() || !cm.client.HostsAvailable() {
-		return blobcache.ErrHostNotFound
+		return cache.ErrHostNotFound
 	}
 
-	volumeCacheMapStr := "{}"
-	volumeCacheMapBytes, err := json.Marshal(volumeCacheMap)
+	if spec.Process == nil {
+		return fmt.Errorf("container spec missing process")
+	}
+
+	volumeCacheMapStr, err := encodeVolumeCacheMap(volumeCacheMap)
 	if err != nil {
 		return err
 	}
-	volumeCacheMapStr = string(volumeCacheMapBytes)
 
 	workspaceVolumePath, err := cm.initWorkspace(workspaceName)
 	if err != nil {
 		return err
 	}
 
-	cacheMount := specs.Mount{
+	spec.Mounts = append(spec.Mounts, volumeCacheMounts(workspaceVolumePath)...)
+	spec.Process.Env = withVolumeCacheEnv(spec.Process.Env, volumeCacheMapStr)
+	return nil
+}
+
+func encodeVolumeCacheMap(volumeCacheMap map[string]string) (string, error) {
+	volumeCacheMapBytes, err := json.Marshal(volumeCacheMap)
+	if err != nil {
+		return "", err
+	}
+	return string(volumeCacheMapBytes), nil
+}
+
+func volumeCacheMounts(workspaceVolumePath string) []specs.Mount {
+	return []specs.Mount{{
 		Type:        "none",
 		Source:      filepath.Join(baseFileCachePath, workspaceVolumePath),
-		Destination: "/cache",
-		Options: []string{"ro",
-			"rbind",
-			"rprivate",
-			"nosuid",
-			"noexec",
-			"nodev"},
-	}
-
-	interceptMount := specs.Mount{
+		Destination: types.AgentCacheFSMountPath,
+		Options:     []string{"ro", "rbind", "rprivate", "nosuid", "noexec", "nodev"},
+	}, {
 		Type:        "none",
-		Source:      "/usr/local/lib/volume_cache.so",
-		Destination: "/usr/local/lib/volume_cache.so",
-		Options: []string{"ro",
-			"rbind",
-			"rprivate",
-			"nosuid",
-			"nodev"},
+		Source:      volumeCacheLibraryPath,
+		Destination: volumeCacheLibraryPath,
+		Options:     []string{"ro", "rbind", "rprivate", "nosuid", "nodev"},
+	}}
+}
+
+func withVolumeCacheEnv(env []string, volumeCacheMapStr string) []string {
+	env = withLDPreload(env, volumeCacheLibraryPath)
+	return append(env, fmt.Sprintf("%s=%s", volumeCacheMapEnv, volumeCacheMapStr))
+}
+
+func withLDPreload(env []string, libraryPath string) []string {
+	prefix := ldPreloadEnv + "="
+	for i, envVar := range env {
+		if !strings.HasPrefix(envVar, prefix) {
+			continue
+		}
+
+		value := strings.TrimPrefix(envVar, prefix)
+		if value == "" {
+			env[i] = prefix + libraryPath
+		} else if !envListContains(value, libraryPath) {
+			env[i] = fmt.Sprintf("%s%s:%s", prefix, value, libraryPath)
+		}
+		return env
 	}
 
-	spec.Mounts = append(spec.Mounts, cacheMount)
-	spec.Mounts = append(spec.Mounts, interceptMount)
+	return append(env, prefix+libraryPath)
+}
 
-	for i, envVar := range spec.Process.Env {
-		if strings.HasPrefix(envVar, "LD_PRELOAD=") {
-			spec.Process.Env[i] = fmt.Sprintf("%s:%s", envVar, "/usr/local/lib/volume_cache.so")
-			break
+func envListContains(value string, item string) bool {
+	for _, part := range strings.Split(value, ":") {
+		if part == item {
+			return true
 		}
 	}
-
-	spec.Process.Env = append(spec.Process.Env, []string{fmt.Sprintf("VOLUME_CACHE_MAP=%s", volumeCacheMapStr)}...)
-	return nil
+	return false
 }
 
 func (cm *FileCacheManager) initWorkspace(workspaceName string) (string, error) {
 	workspaceVolumePath := filepath.Join(types.DefaultVolumesPath, workspaceName)
-	fileName := fmt.Sprintf("%s/.cache", workspaceVolumePath)
-
-	_, err := os.Stat(fileName)
-	if os.IsNotExist(err) {
-		file, err := os.Create(fileName)
-		if err != nil {
-			return "", err
+	_, err, _ := cm.initializationGroup.Do(workspaceVolumePath, func() (interface{}, error) {
+		fileName := fmt.Sprintf("%s/.cache", workspaceVolumePath)
+		if cm.client.IsPathCachedReachable(context.Background(), fileName) {
+			return nil, nil
 		}
-		defer file.Close()
-	} else if cm.CacheAvailable() && cm.client.IsPathCachedNearby(context.Background(), workspaceVolumePath) {
-		return workspaceVolumePath, nil
-	}
 
-	_, err = cm.client.StoreContentFromFUSE(struct {
-		Path string
-	}{
-		Path: fileName,
-	}, struct {
-		RoutingKey string
-		Lock       bool
-	}{
-		RoutingKey: fileName,
-		Lock:       true,
+		_, err := cm.client.StoreContentAtPath([]byte{}, fileName, cache.StoreContentOptions{
+			RoutingKey: fileName,
+			Lock:       true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return nil, nil
 	})
-	if err != nil {
-		return "", err
-	}
 
-	return workspaceVolumePath, nil
+	return workspaceVolumePath, err
 }
 
-// GetClient returns the blobcache client instance.
-func (cm *FileCacheManager) GetClient() *blobcache.BlobCacheClient {
+// GetClient returns the cache client instance.
+func (cm *FileCacheManager) GetClient() *cache.Client {
 	if !cm.CacheAvailable() {
 		return nil
 	}
@@ -157,7 +171,7 @@ func (cm *FileCacheManager) GetClient() *blobcache.BlobCacheClient {
 
 // CacheAvailable checks if the file cache is available
 func (cm *FileCacheManager) CacheAvailable() bool {
-	if !cm.config.Worker.BlobCacheEnabled {
+	if !cm.config.Worker.CacheEnabled || !cm.config.Cache.Enabled {
 		return false
 	}
 

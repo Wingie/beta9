@@ -2,29 +2,113 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/beam-cloud/beta9/pkg/types"
+	goproc "github.com/beam-cloud/goproc/pkg"
+	goprocpb "github.com/beam-cloud/goproc/proto"
 	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
 	// Timing strategy for Docker daemon startup:
-	// 1. Wait up to 10s for goproc to be ready (usually takes 100-500ms)
+	// 1. Wait for goproc to be ready (usually 100-500ms; bounded by the container's lifetime)
 	// 2. Setup cgroups (fast, ~100ms)
 	// 3. Start dockerd in background
 	// 4. Wait up to 30s for dockerd to be ready (usually takes 2-5s)
-	goprocReadyTimeout             = 10 * time.Second
-	goprocInitialBackoff           = 100 * time.Millisecond
-	goprocMaxBackoff               = 2 * time.Second
-	goprocBackoffMultiplier        = 1.5
-	goprocCommandCompletionWait    = 100 * time.Millisecond
-	cgroupSetupCompletionWait      = 500 * time.Millisecond
-	dockerDaemonStartupTimeout     = 30 * time.Second
-	dockerDaemonReadyPollInterval  = 1 * time.Second
-	dockerInfoCommandTimeout       = 2 * time.Second
-	dockerInfoCommandCheckInterval = 100 * time.Millisecond
+	goprocReadyProbeTimeout       = 50 * time.Millisecond
+	goprocSlowReadyLogInterval    = 30 * time.Second
+	goprocInitialBackoff          = 5 * time.Millisecond
+	goprocMaxBackoff              = 15 * time.Millisecond
+	goprocBackoffMultiplier       = 1.5
+	sandboxSetupCommandTimeout    = 10 * time.Second
+	dockerDaemonStartupTimeout    = 30 * time.Second
+	dockerDaemonReadyPollInterval = 1 * time.Second
+	dockerInfoCommandTimeout      = 2 * time.Second
+	sandboxMissingProcessExitCode = 137
 )
+
+func (i *ContainerInstance) signalProcessManagerReadiness(ready bool) {
+	i.processManagerReadyMu.Lock()
+	defer i.processManagerReadyMu.Unlock()
+	if i.SandboxProcessManagerReady && !ready {
+		return
+	}
+	i.SandboxProcessManagerReady = ready
+	if i.ProcessManagerReadyChan != nil {
+		i.ProcessManagerReadyOnce.Do(func() {
+			close(i.ProcessManagerReadyChan)
+		})
+	}
+}
+
+func (i *ContainerInstance) initializeProcessManagerReadiness() {
+	i.processManagerReadyMu.Lock()
+	defer i.processManagerReadyMu.Unlock()
+	i.SandboxProcessManagerReady = false
+	i.ProcessManagerReadyOnce = sync.Once{}
+	i.ProcessManagerReadyChan = make(chan struct{})
+}
+
+func (i *ContainerInstance) processManagerReady() bool {
+	i.processManagerReadyMu.RLock()
+	defer i.processManagerReadyMu.RUnlock()
+	return i.SandboxProcessManagerReady
+}
+
+func (i *ContainerInstance) processManagerReadyChannel() <-chan struct{} {
+	i.processManagerReadyMu.RLock()
+	defer i.processManagerReadyMu.RUnlock()
+	return i.ProcessManagerReadyChan
+}
+
+type processManagerWaitStats struct {
+	Attempts       int
+	Failures       int
+	FailureClasses map[string]int
+	LastClass      string
+	LastError      string
+}
+
+func (s processManagerWaitStats) attrs() map[string]string {
+	attrs := map[string]string{
+		types.EventAttrAttempts:     strconv.Itoa(s.Attempts),
+		types.EventAttrFailureCount: strconv.Itoa(s.Failures),
+	}
+	if s.LastClass != "" {
+		attrs[types.EventAttrFailureClass] = s.LastClass
+	}
+	if s.LastError != "" {
+		attrs[types.EventAttrLastError] = s.LastError
+	}
+	if len(s.FailureClasses) > 0 {
+		attrs[types.EventAttrFailureClasses] = failureClassSummary(s.FailureClasses)
+	}
+	return attrs
+}
+
+func failureClassSummary(classes map[string]int) string {
+	if len(classes) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(classes))
+	for class, count := range classes {
+		parts = append(parts, fmt.Sprintf("%s=%d", class, count))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
 
 // startDockerDaemon starts the Docker daemon inside a sandbox container
 func (s *Worker) startDockerDaemon(ctx context.Context, containerId string, instance *ContainerInstance) {
@@ -33,16 +117,43 @@ func (s *Worker) startDockerDaemon(ctx context.Context, containerId string, inst
 		return
 	}
 
+	// A memory restore brings dockerd and its socket back with the sandbox.
+	// Reusing that process preserves the daemon's in-memory state and avoids
+	// launching a second daemon against the same data root.
+	if err := s.probeDockerDaemon(ctx, instance); err == nil {
+		log.Info().Str("container_id", containerId).Msg("restored docker daemon is ready")
+		return
+	}
+
 	log.Info().Str("container_id", containerId).Msg("starting docker daemon in sandbox")
 
+	// A filesystem checkpoint preserves /run from the sandbox root. The old
+	// dockerd and its managed containerd are gone after a cold restore, but
+	// their pidfiles can name PIDs that the replacement container has already
+	// reused, making dockerd reject its own startup as if they were still
+	// running.
+	if err := runSandboxShell(ctx, instance.SandboxProcessManager, "docker sandbox startup cleanup", dockerSandboxStartupCleanupScript()); err != nil {
+		if s.logDockerStartupCanceled(ctx, containerId, "clean stale docker state", err) {
+			return
+		}
+		log.Error().Str("container_id", containerId).Err(err).Msg("failed to clean stale docker startup state")
+		return
+	}
+
 	// Setup cgroups for Docker-in-Docker
-	if err := s.setupDockerCgroups(ctx, containerId, instance); err != nil {
+	if err := s.setupDockerCgroups(ctx, instance); err != nil {
+		if s.logDockerStartupCanceled(ctx, containerId, "setup cgroups", err) {
+			return
+		}
 		log.Error().Str("container_id", containerId).Err(err).Msg("failed to setup cgroups")
 		return
 	}
 
 	// Enable IPv4 forwarding (required for Docker networking)
-	if err := s.enableIPv4Forwarding(ctx, containerId, instance); err != nil {
+	if err := s.enableIPv4Forwarding(ctx, instance); err != nil {
+		if s.logDockerStartupCanceled(ctx, containerId, "enable IPv4 forwarding", err) {
+			return
+		}
 		log.Error().Str("container_id", containerId).Err(err).Msg("failed to enable IPv4 forwarding")
 		return
 	}
@@ -51,17 +162,23 @@ func (s *Worker) startDockerDaemon(ctx context.Context, containerId string, inst
 	// Per https://gvisor.dev/docs/tutorials/docker-in-gvisor/:
 	// --iptables=false --ip6tables=false are REQUIRED for gVisor
 	// --bridge=none disables default bridge network (gVisor doesn't support veth interfaces)
+	// --storage-driver=vfs avoids nested overlay mounts, which are not supported by gVisor
 	// This means inner containers MUST use --network=host
 	cmd := []string{
 		"dockerd",
 		"--iptables=false",
 		"--ip6tables=false",
 		"--bridge=none",
+		"--storage-driver=vfs",
 	}
 
-	pid, err := instance.SandboxProcessManager.Exec(cmd, "/", []string{}, true)
+	// dockerd runs in the foreground; waiting here would block readiness checks.
+	pid, err := instance.SandboxProcessManager.Exec(cmd, "/", []string{}, false)
 
 	if err != nil {
+		if s.logDockerStartupCanceled(ctx, containerId, "start dockerd", err) {
+			return
+		}
 		log.Error().Str("container_id", containerId).Err(err).Msg("failed to start docker daemon")
 		return
 	}
@@ -72,98 +189,485 @@ func (s *Worker) startDockerDaemon(ctx context.Context, containerId string, inst
 	s.waitForDockerDaemon(ctx, containerId, instance, pid)
 }
 
+func (s *Worker) stopDockerSandbox(containerId string, instance *ContainerInstance, force bool) {
+	if force || instance == nil || instance.Request == nil || !instance.Request.DockerEnabled {
+		return
+	}
+	// A terminal memory checkpoint already captured the live Docker process tree
+	// and its runtime filesystem. Mutating that filesystem afterward makes the
+	// checkpoint internally inconsistent, most visibly when runsc restores its
+	// saved 9p paths. The outer runtime stop below is sufficient here.
+	if instance.terminalCheckpointCreated.Load() {
+		log.Info().Str("container_id", containerId).Msg("preserving Docker state captured by terminal checkpoint")
+		return
+	}
+	if instance.SandboxProcessManager == nil || !instance.processManagerReady() {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sandboxSetupCommandTimeout)
+	defer cancel()
+
+	if err := runSandboxShell(ctx, instance.SandboxProcessManager, "docker sandbox pre-stop", dockerSandboxShutdownScript()); err != nil {
+		if s.logDockerStartupCanceled(ctx, containerId, "stop docker", err) {
+			return
+		}
+		log.Debug().Str("container_id", containerId).Err(err).Msg("docker sandbox pre-stop did not complete cleanly")
+		return
+	}
+
+	log.Info().Str("container_id", containerId).Msg("docker sandbox pre-stop complete")
+}
+
+func runSandboxShell(ctx context.Context, manager *goproc.GoProcClient, name, script string) error {
+	return runSandboxProcessManagerCommand(ctx, manager, []string{"sh", "-c", script}, "/", nil, name)
+}
+
+func runSandboxProcessManagerCommand(ctx context.Context, manager *goproc.GoProcClient, args []string, cwd string, env []string, name string) error {
+	stream, err := manager.StreamExec(ctx, args, cwd, env, true)
+	if err != nil {
+		return fmt.Errorf("%s start failed: %w", name, err)
+	}
+
+	output := sandboxCommandOutput{}
+
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			return sandboxCommandStreamError(name, err)
+		}
+
+		if resp.GetStarted() != nil {
+			continue
+		}
+
+		if chunk := resp.GetChunk(); chunk != nil {
+			output.write(chunk)
+			if err := ackSandboxCommandChunk(stream, chunk.Seq); err != nil {
+				return fmt.Errorf("%s log ack failed: %w", name, err)
+			}
+			continue
+		}
+
+		if exited := resp.GetExited(); exited != nil {
+			return output.exitError(name, exited)
+		}
+	}
+}
+
+type sandboxCommandOutput struct {
+	stdout strings.Builder
+	stderr strings.Builder
+}
+
+func (o *sandboxCommandOutput) write(chunk *goprocpb.ProcessLogChunk) {
+	if chunk.Stream == "stderr" {
+		o.stderr.Write(chunk.Data)
+		return
+	}
+	o.stdout.Write(chunk.Data)
+}
+
+func (o *sandboxCommandOutput) exitError(name string, exited *goprocpb.ExecProcessExited) error {
+	if exited.ExitCode == 0 {
+		return nil
+	}
+
+	msg := fmt.Sprintf("%s failed with exit code %d", name, exited.ExitCode)
+	if exited.ErrorMsg != "" {
+		msg += ": " + exited.ErrorMsg
+	}
+	return fmt.Errorf("%s stdout=%q stderr=%q", msg, o.stdout.String(), o.stderr.String())
+}
+
+func sandboxCommandStreamError(name string, err error) error {
+	if errors.Is(err, io.EOF) {
+		return fmt.Errorf("%s stream closed before process exit", name)
+	}
+	return fmt.Errorf("%s stream failed: %w", name, err)
+}
+
+func ackSandboxCommandChunk(stream goprocpb.GoProc_StreamExecClient, seq uint64) error {
+	return stream.Send(&goprocpb.StreamExecRequest{
+		Message: &goprocpb.StreamExecRequest_Ack{
+			Ack: &goprocpb.ProcessLogAck{Seq: seq, Ok: true},
+		},
+	})
+}
+
+func sandboxProcessMissing(manager *goproc.GoProcClient, pid int32) (bool, error) {
+	checkPID, err := manager.Exec([]string{
+		"sh",
+		"-c",
+		fmt.Sprintf("if [ -d /proc/%d ]; then echo alive; else echo missing; fi", pid),
+	}, "/", []string{}, true)
+	if err != nil {
+		return false, err
+	}
+
+	output, err := manager.Stdout(checkPID)
+	if err != nil {
+		return false, err
+	}
+
+	return strings.TrimSpace(output) == "missing", nil
+}
+
+func waitForSandboxProcessMissing(ctx context.Context, manager *goproc.GoProcClient, pid int32, timeout time.Duration) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		missing, err := sandboxProcessMissing(manager, pid)
+		if err != nil {
+			return false, err
+		}
+		if missing {
+			return true, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return false, nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func dockerSandboxStartupCleanupScript() string {
+	return "rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid"
+}
+
+func dockerSandboxShutdownScript() string {
+	return `
+set +e
+run() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3s "$@"
+  else
+    "$@"
+  fi
+}
+if command -v docker >/dev/null 2>&1; then
+  # Stop inner workloads without deleting their metadata. A cold restore needs
+  # the container records so Docker can honor each workload's restart policy.
+  ids="$(run docker ps -q 2>/dev/null || true)"
+  if [ -n "$ids" ]; then
+    run docker stop -t 2 $ids >/dev/null 2>&1 || true
+    ids="$(run docker ps -q 2>/dev/null || true)"
+    if [ -n "$ids" ]; then
+      run docker kill $ids >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+if command -v pkill >/dev/null 2>&1; then
+  pkill -TERM dockerd >/dev/null 2>&1 || true
+  pkill -TERM containerd-shim >/dev/null 2>&1 || true
+  pkill -TERM containerd >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5; do
+    pgrep dockerd >/dev/null 2>&1 || pgrep containerd >/dev/null 2>&1 || pgrep containerd-shim >/dev/null 2>&1 || exit 0
+    sleep 0.2
+  done
+  pkill -KILL dockerd >/dev/null 2>&1 || true
+  pkill -KILL containerd-shim >/dev/null 2>&1 || true
+  pkill -KILL containerd >/dev/null 2>&1 || true
+fi
+exit 0
+`
+}
+
+func (s *Worker) logDockerStartupCanceled(ctx context.Context, containerId, phase string, err error) bool {
+	if !s.dockerStartupCanceled(ctx, containerId, err) {
+		return false
+	}
+
+	log.Debug().
+		Str("container_id", containerId).
+		Str("phase", phase).
+		Err(err).
+		Msg("docker daemon startup canceled during sandbox shutdown")
+	return true
+}
+
+func (s *Worker) dockerStartupCanceled(ctx context.Context, containerId string, err error) bool {
+	if dockerStartupCanceled(ctx, err) {
+		return true
+	}
+	if err == nil || s == nil || s.containerInstances == nil {
+		return false
+	}
+
+	instance, exists := s.containerInstances.Get(containerId)
+	if !exists {
+		return true
+	}
+	if instance == nil {
+		return false
+	}
+	_, stopReason := instance.lifecycleState()
+	return stopReason != ""
+}
+
+func dockerStartupCanceled(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	switch status.Code(err) {
+	case codes.Canceled, codes.DeadlineExceeded:
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	shutdownTransport := strings.Contains(msg, "graceful_stop") ||
+		strings.Contains(msg, "received prior goaway") ||
+		strings.Contains(msg, "transport is closing")
+
+	return shutdownTransport ||
+		strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "code = canceled") ||
+		strings.Contains(msg, "code = deadlineexceeded") ||
+		strings.Contains(msg, "code = deadline exceeded")
+}
+
 // setupDockerCgroups configures cgroups required for Docker-in-Docker in gVisor
-func (s *Worker) setupDockerCgroups(ctx context.Context, containerId string, instance *ContainerInstance) error {
+func (s *Worker) setupDockerCgroups(ctx context.Context, instance *ContainerInstance) error {
 	script := `
 set -e
-mount -t tmpfs cgroups /sys/fs/cgroup
+mkdir -p /sys/fs/cgroup
+if ! grep -q ' /sys/fs/cgroup ' /proc/self/mountinfo; then
+  mount -t tmpfs cgroups /sys/fs/cgroup
+fi
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  exit 0
+fi
 mkdir -p /sys/fs/cgroup/devices
-mount -t cgroup -o devices devices /sys/fs/cgroup/devices
+if ! grep -q ' /sys/fs/cgroup/devices ' /proc/self/mountinfo; then
+  mount -t cgroup -o devices devices /sys/fs/cgroup/devices
+fi
 `
 
-	pid, err := instance.SandboxProcessManager.Exec([]string{"sh", "-c", script}, "/", []string{}, false)
-	if err != nil {
-		return err
-	}
-
-	// Wait for cgroup setup to complete
-	time.Sleep(cgroupSetupCompletionWait)
-
-	exitCode, _ := instance.SandboxProcessManager.Status(pid)
-	if exitCode != 0 {
-		return fmt.Errorf("cgroup setup failed with exit code %d", exitCode)
-	}
-
-	return nil
+	return runSandboxShell(ctx, instance.SandboxProcessManager, "cgroup setup", script)
 }
 
 // enableIPv4Forwarding enables IPv4 forwarding which is required for Docker networking in gVisor sandboxes
-func (s *Worker) enableIPv4Forwarding(ctx context.Context, containerId string, instance *ContainerInstance) error {
-	script := `echo 1 > /proc/sys/net/ipv4/ip_forward`
-
-	pid, err := instance.SandboxProcessManager.Exec([]string{"sh", "-c", script}, "/", []string{}, false)
-	if err != nil {
-		return err
-	}
-
-	time.Sleep(cgroupSetupCompletionWait)
-
-	exitCode, _ := instance.SandboxProcessManager.Status(pid)
-	if exitCode != 0 {
-		stderr, _ := instance.SandboxProcessManager.Stderr(pid)
-		return fmt.Errorf("IPv4 forwarding failed with exit code %d: %s", exitCode, stderr)
-	}
-
-	return nil
+func (s *Worker) enableIPv4Forwarding(ctx context.Context, instance *ContainerInstance) error {
+	return runSandboxShell(ctx, instance.SandboxProcessManager, "IPv4 forwarding", `echo 1 > /proc/sys/net/ipv4/ip_forward`)
 }
 
-// waitForProcessManager waits for the goproc process manager to be ready to accept commands
-// Uses exponential backoff to efficiently wait for goproc startup
-// This should be called ONCE during container initialization, not on every exec
-func (s *Worker) waitForProcessManager(ctx context.Context, containerId string, instance *ContainerInstance) bool {
+// waitForProcessManager blocks until the goproc process manager inside the
+// sandbox answers a readiness RPC, or the container's context ends.
+//
+// The wait is bounded by the container's lifetime, not a wall clock. The
+// process manager cannot start until the runtime has exec'd the entrypoint,
+// and on a cold node that can sit behind image layer materialization for
+// well over 30s. Giving up on a timer leaves a container that is otherwise
+// healthy permanently marked unusable; a container that never comes up is
+// instead handled by callers' own exec deadlines and eventual teardown.
+//
+// Called once per container start, not on every exec.
+func (s *Worker) waitForProcessManager(ctx context.Context, containerId string, instance *ContainerInstance) (*goproc.GoProcClient, bool, processManagerWaitStats) {
 	start := time.Now()
 	backoff := goprocInitialBackoff
+	stats := processManagerWaitStats{FailureClasses: map[string]int{}}
+	nextSlowLog := goprocSlowReadyLogInterval
 
-	for time.Since(start) < goprocReadyTimeout {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-
-		// Try a simple echo command to check if goproc is ready
-		pid, err := instance.SandboxProcessManager.Exec(
-			[]string{"echo", "ready"},
-			"/",
-			[]string{},
-			false,
-		)
-
+	for {
+		stats.Attempts++
+		client, err := newProcessManagerClient(ctx, instance)
 		if err == nil {
-			// Successfully executed - goproc is ready
-			time.Sleep(goprocCommandCompletionWait)
-			instance.SandboxProcessManager.Status(pid)
 			log.Info().
 				Str("container_id", containerId).
 				Dur("wait_time", time.Since(start)).
+				Int("attempts", stats.Attempts).
 				Msg("process manager is ready")
-			return true
+			return client, true, stats
 		}
 
-		// Not ready yet - wait with exponential backoff
-		time.Sleep(backoff)
+		stats.Failures++
+		stats.LastError = err.Error()
+		stats.LastClass = classifyProcessManagerReadyError(err)
+		stats.FailureClasses[stats.LastClass]++
 
-		backoff = time.Duration(float64(backoff) * goprocBackoffMultiplier)
-		if backoff > goprocMaxBackoff {
-			backoff = goprocMaxBackoff
+		if waited := time.Since(start); waited >= nextSlowLog {
+			log.Warn().
+				Err(err).
+				Str("container_id", containerId).
+				Dur("waited", waited).
+				Msg("process manager not ready yet; still waiting")
+			nextSlowLog += goprocSlowReadyLogInterval
+		}
+
+		if err := waitProcessManagerBackoff(ctx, backoff); err != nil {
+			stats.LastError = err.Error()
+			return nil, false, stats
+		}
+		backoff = nextProcessManagerBackoff(backoff)
+	}
+}
+
+func nextProcessManagerBackoff(delay time.Duration) time.Duration {
+	delay = time.Duration(float64(delay) * goprocBackoffMultiplier)
+	if delay > goprocMaxBackoff {
+		return goprocMaxBackoff
+	}
+	return delay
+}
+
+func newProcessManagerClient(ctx context.Context, instance *ContainerInstance) (*goproc.GoProcClient, error) {
+	endpoints := sandboxProcessManagerEndpoints(instance)
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("sandbox process manager address unavailable")
+	}
+	return newProcessManagerClientFromEndpoints(ctx, endpoints)
+}
+
+// newProcessManagerClientFromEndpoints tries each endpoint in order and returns
+// the first that answers Ready. When none does, a retryable (dial) failure from
+// any endpoint takes precedence over a non-retryable one: a restored sandbox
+// briefly refuses on its container IP while its published host-mapped address
+// fails hard (the worker itself cannot reach a PREROUTING-only DNAT), and the
+// later hard failure must not turn the transient refusal into a fatal exec.
+func newProcessManagerClientFromEndpoints(ctx context.Context, endpoints []processManagerEndpoint) (*goproc.GoProcClient, error) {
+	var lastErr, retryableErr error
+	recordErr := func(err error) {
+		lastErr = err
+		if retryableErr == nil && isProcessManagerDialFailure(err) {
+			retryableErr = err
 		}
 	}
 
-	log.Error().
-		Str("container_id", containerId).
-		Msg("process manager did not become ready within timeout")
+	for _, endpoint := range endpoints {
+		client, err := goproc.NewGoProcClient(ctx, endpoint.dialHost(), uint(endpoint.port))
+		if err != nil {
+			recordErr(err)
+			continue
+		}
 
-	return false
+		probeCtx, cancel := context.WithTimeout(ctx, goprocReadyProbeTimeout)
+		err = client.ReadyContext(probeCtx)
+		cancel()
+		if err != nil {
+			_ = client.Cleanup()
+			recordErr(err)
+			continue
+		}
+
+		return client, nil
+	}
+
+	if retryableErr != nil {
+		return nil, retryableErr
+	}
+	return nil, lastErr
+}
+
+type processManagerEndpoint struct {
+	host string
+	port int
+}
+
+// dialHost returns the host in the form goproc's client can join with a port
+// ("%s:%d" into grpc.NewClient). An IPv6 literal has to be bracketed there,
+// otherwise the dns resolver rejects the target ("too many colons") and the
+// host-mapped fallback endpoint is dead on every dual-stack node.
+func (e processManagerEndpoint) dialHost() string {
+	host := strings.TrimSuffix(strings.TrimPrefix(e.host, "["), "]")
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+func sandboxProcessManagerEndpoints(instance *ContainerInstance) []processManagerEndpoint {
+	if instance == nil {
+		return nil
+	}
+
+	endpoints := make([]processManagerEndpoint, 0, 2)
+	if instance.ContainerIp != "" {
+		endpoints = appendProcessManagerEndpoint(endpoints, processManagerEndpoint{
+			host: instance.ContainerIp,
+			port: int(types.WorkerSandboxProcessManagerPort),
+		})
+	}
+
+	if endpoint, ok := processManagerEndpointFromAddress(instance.containerAddress(types.WorkerSandboxProcessManagerPort)); ok {
+		endpoints = appendProcessManagerEndpoint(endpoints, endpoint)
+	}
+
+	return endpoints
+}
+
+func appendProcessManagerEndpoint(endpoints []processManagerEndpoint, endpoint processManagerEndpoint) []processManagerEndpoint {
+	if endpoint.host == "" || endpoint.port <= 0 {
+		return endpoints
+	}
+	for _, existing := range endpoints {
+		if existing == endpoint {
+			return endpoints
+		}
+	}
+	return append(endpoints, endpoint)
+}
+
+func processManagerEndpointFromAddress(address string) (processManagerEndpoint, bool) {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return processManagerEndpoint{}, false
+	}
+
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 {
+		return processManagerEndpoint{}, false
+	}
+
+	return processManagerEndpoint{host: host, port: port}, true
+}
+
+func classifyProcessManagerReadyError(err error) string {
+	switch code := status.Code(err); code {
+	case codes.OK:
+		return "ok"
+	case codes.Unavailable:
+		return "unavailable"
+	case codes.DeadlineExceeded:
+		return "timeout"
+	case codes.Unimplemented:
+		return "unimplemented"
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "connection refused"):
+		return "connection_refused"
+	case strings.Contains(msg, "no route") || strings.Contains(msg, "network is unreachable") || strings.Contains(msg, "host is unreachable"):
+		return "no_route"
+	case strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "i/o timeout"):
+		return "timeout"
+	default:
+		return "other"
+	}
+}
+
+func waitProcessManagerBackoff(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // waitForDockerDaemon waits for the Docker daemon to be ready to accept commands
@@ -191,9 +695,11 @@ func (s *Worker) waitForDockerDaemon(ctx context.Context, containerId string, in
 			}
 
 			// Check if daemon is ready
-			if s.isDockerDaemonReady(containerId, instance) {
+			if err := s.probeDockerDaemon(ctx, instance); err == nil {
 				log.Info().Str("container_id", containerId).Msg("docker daemon is ready")
 				return
+			} else {
+				log.Debug().Str("container_id", containerId).Err(err).Msg("docker daemon readiness check failed")
 			}
 		}
 	}
@@ -216,32 +722,10 @@ func (s *Worker) dockerDaemonCrashed(containerId string, instance *ContainerInst
 	return false
 }
 
-// isDockerDaemonReady checks if docker daemon responds to 'docker info'
-func (s *Worker) isDockerDaemonReady(containerId string, instance *ContainerInstance) bool {
-	checkPid, err := instance.SandboxProcessManager.Exec(
-		[]string{"docker", "info"},
-		"/",
-		[]string{},
-		false,
-	)
-	if err != nil {
-		return false
-	}
+// probeDockerDaemon checks if Docker responds to commands inside the sandbox.
+func (s *Worker) probeDockerDaemon(ctx context.Context, instance *ContainerInstance) error {
+	infoCtx, cancel := context.WithTimeout(ctx, dockerInfoCommandTimeout)
+	defer cancel()
 
-	// Wait for docker info to complete with timeout
-	deadline := time.Now().Add(dockerInfoCommandTimeout)
-	for time.Now().Before(deadline) {
-		exitCode, err := instance.SandboxProcessManager.Status(checkPid)
-		if err == nil && exitCode == 0 {
-			return true
-		} else if err == nil && exitCode > 0 {
-			return false
-		}
-
-		// Still running, wait a bit
-		time.Sleep(dockerInfoCommandCheckInterval)
-	}
-
-	// Timed out
-	return false
+	return runSandboxProcessManagerCommand(infoCtx, instance.SandboxProcessManager, []string{"docker", "info"}, "/", nil, "docker info")
 }

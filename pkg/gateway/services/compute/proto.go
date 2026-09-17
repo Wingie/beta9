@@ -1,0 +1,460 @@
+package compute
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	model "github.com/beam-cloud/beta9/pkg/compute"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+func normalizePoolConfig(in *pb.PoolConfig) *pb.PoolConfig {
+	if in == nil {
+		return nil
+	}
+	out := proto.Clone(in).(*pb.PoolConfig)
+	if out.Selector == "" {
+		out.Selector = out.Name
+	}
+	if out.Mode == "" {
+		out.Mode = string(types.PoolModePrivate)
+	}
+	if out.Transport == "" {
+		out.Transport = defaultPrivateTransport
+	}
+	out.Transport = strings.ReplaceAll(out.Transport, "-", "_")
+	if out.Fallback == "" {
+		out.Fallback = defaultPrivateFallback
+	}
+	if out.Priority == 0 {
+		out.Priority = defaultPrivatePriority
+	}
+	if out.ContainerRuntime == "" {
+		out.ContainerRuntime = types.ContainerRuntimeRunc.String()
+	}
+	return out
+}
+
+func computePoolFromProto(in *pb.PoolConfig, nodeCount uint32, requireReservation bool) (model.Pool, error) {
+	if in == nil {
+		return model.Pool{}, fmt.Errorf("pool config is required")
+	}
+	if in.Mode != "" && in.Mode != string(types.PoolModePrivate) {
+		return model.Pool{}, fmt.Errorf("private pool mode must be %q", types.PoolModePrivate)
+	}
+	switch in.Transport {
+	case "", defaultPrivateTransport:
+	default:
+		return model.Pool{}, fmt.Errorf("unsupported agent transport %q", in.Transport)
+	}
+	switch in.Fallback {
+	case "", types.PrivatePoolFallbackInternal, types.PrivatePoolFallbackWait, types.PrivatePoolFallbackFail:
+	default:
+		return model.Pool{}, fmt.Errorf("unsupported private pool fallback %q", in.Fallback)
+	}
+	switch in.ContainerRuntime {
+	case "", types.ContainerRuntimeRunc.String(), types.ContainerRuntimeGvisor.String():
+	default:
+		return model.Pool{}, fmt.Errorf("unsupported container runtime %q", in.ContainerRuntime)
+	}
+	ttl, err := model.ParseTTL(in.Ttl)
+	if err != nil {
+		return model.Pool{}, err
+	}
+	gpus, err := poolGPUConfig(in.Gpu)
+	if err != nil {
+		return model.Pool{}, err
+	}
+
+	pool := model.Pool{
+		Name:           in.Name,
+		Selector:       in.Selector,
+		GPUs:           gpus,
+		Nodes:          firstNonZeroUint32(nodeCount, in.Nodes),
+		OfferID:        in.OfferId,
+		TTL:            ttl,
+		MaxSpendMicros: model.DollarsToMicros(in.MaxSpend),
+		Providers:      in.Providers,
+		Regions:        in.Regions,
+		MinReliability: in.MinReliability,
+	}
+	if requireReservation {
+		if err := pool.Validate(); err != nil {
+			return model.Pool{}, err
+		}
+	} else if pool.MinReliability < 0 || pool.MinReliability > 1 {
+		return model.Pool{}, fmt.Errorf("min_reliability must be between 0 and 1")
+	}
+	return pool, nil
+}
+
+func poolOfferToProto(offer model.Offer) *pb.PoolOffer {
+	return &pb.PoolOffer{
+		Id:                offer.ID,
+		Provider:          offer.Provider,
+		Cloud:             offer.Cloud,
+		InstanceType:      offer.InstanceType,
+		Region:            offer.Region,
+		Gpu:               offer.GPU,
+		GpuCount:          offer.GPUCount,
+		NodeCount:         offer.NodeCount,
+		CpuMillicores:     offer.CPUMillicores,
+		MemoryMb:          offer.MemoryMB,
+		StorageMb:         offer.StorageMB,
+		HourlyCostMicros:  offer.HourlyCostMicros,
+		Reliability:       offer.Reliability,
+		Available:         offer.Available,
+		DisplayName:       offer.DisplayName,
+		Category:          offer.Category,
+		RegionDisplayName: offer.RegionDisplayName,
+		Latitude:          offer.Latitude,
+		Longitude:         offer.Longitude,
+	}
+}
+
+type computeCostProjector func(int64) int64
+
+func providerInstanceToProto(reservation model.Reservation, projectCost computeCostProjector) *pb.ProviderInstance {
+	if projectCost == nil {
+		projectCost = identityCost
+	}
+	machineID := reservation.MachineID
+	if machineID == "" && reservation.Managed() && reservation.Status == model.ReservationFailed {
+		machineID = reservation.ID
+	}
+	return &pb.ProviderInstance{
+		Id:                reservation.ID,
+		PoolName:          reservation.PoolName,
+		Provider:          reservation.Provider,
+		Cloud:             reservation.Cloud,
+		Region:            reservation.Region,
+		OfferId:           reservation.OfferID,
+		Status:            string(reservation.Status),
+		GpuCount:          reservation.GPUCount,
+		HourlyCostMicros:  projectCost(reservation.HourlyCostMicros),
+		Source:            string(reservation.Source),
+		CreatedAt:         timestampOrNil(reservation.CreatedAt),
+		ExpiresAt:         timestampOrNil(reservation.ExpiresAt),
+		BillingRenewalAt:  timestampOrNil(reservation.BillingRenewalAt),
+		StatusMessage:     reservation.LastStatusMessage,
+		TerminatingReason: reservation.TerminatingReason,
+		MachineId:         machineID,
+		NodeCount:         reservation.NodeCount,
+		InstanceType:      reservation.InstanceType,
+		CpuMillicores:     reservation.CPUMillicores,
+		MemoryMb:          reservation.MemoryMB,
+		StorageMb:         reservation.StorageMB,
+	}
+}
+
+func identityCost(value int64) int64 {
+	return value
+}
+
+func agentRouteToProto(route types.BackendRoute) *pb.AgentRoute {
+	return &pb.AgentRoute{
+		RouteId:     route.RouteID,
+		WorkspaceId: route.WorkspaceID,
+		PoolName:    route.PoolName,
+		MachineId:   route.MachineID,
+		WorkerId:    route.WorkerID,
+		ContainerId: route.ContainerID,
+		Kind:        route.Kind,
+		Port:        route.Port,
+		Protocol:    route.Protocol,
+		Transport:   route.Transport,
+		LocalTarget: route.LocalTarget,
+		ProxyTarget: route.ProxyTarget,
+		State:       route.State,
+		Error:       route.Error,
+		UpdatedAt:   route.UpdatedAt,
+	}
+}
+
+func (s *Service) privatePoolStateToProto(state *model.PoolState) *pb.PrivatePool {
+	return s.privatePoolStateToProtoWithMachines(state, nil)
+}
+
+func (s *Service) privatePoolStateToProtoWithMachines(state *model.PoolState, machines []*model.AgentTokenState) *pb.PrivatePool {
+	pool := privatePoolStateToProtoWithMachines(state, machines, s.billableMicros, s.appConfig.ManagedCompute)
+	if state == nil || state.Config == nil {
+		return pool
+	}
+	requiredRuntime := strings.TrimSpace(state.Config.ContainerRuntime)
+	if requiredRuntime == "" {
+		return pool
+	}
+
+	// Explicit runtimes are ready only when a matching worker is available.
+	pool.ReadyMachineCount = 0
+	now := time.Now()
+	for _, machine := range machines {
+		worker := s.agentMachineStatusWorker(machine)
+		workerRuntime := ""
+		if worker != nil {
+			workerRuntime = strings.TrimSpace(worker.Runtime)
+			if workerRuntime == "" {
+				workerRuntime = types.ContainerRuntimeRunc.String()
+			}
+		}
+		if model.AgentMachineConnected(machine, now) && worker != nil &&
+			worker.Status == types.WorkerStatusAvailable &&
+			workerRuntime == requiredRuntime {
+			pool.ReadyMachineCount++
+		}
+	}
+	return pool
+}
+
+func privatePoolStateToProtoWithMachines(state *model.PoolState, machines []*model.AgentTokenState, projectCost computeCostProjector, managedCompute types.ManagedComputeConfig) *pb.PrivatePool {
+	if state == nil {
+		return nil
+	}
+	reservations := make([]*pb.ProviderInstance, 0, len(state.Reservations))
+	for _, reservation := range state.Reservations {
+		reservations = append(reservations, providerInstanceToProto(reservation, projectCost))
+	}
+	readyMachineCount := uint32(0)
+	now := time.Now()
+	for _, machine := range machines {
+		if model.AgentMachineConnected(machine, now) {
+			readyMachineCount++
+		}
+	}
+	config := normalizePoolConfig(state.Config)
+	pool := &pb.PrivatePool{
+		Name:                 state.Name,
+		Selector:             state.Selector,
+		Config:               config,
+		Reservations:         reservations,
+		CommittedSpendMicros: state.CommittedSpendMicros,
+		Status:               state.Status,
+		Source:               string(state.Source.Canonical()),
+		CreatedAt:            timestampOrNil(state.CreatedAt),
+		ExpiresAt:            timestampOrNil(state.ExpiresAt),
+		MachineCount:         uint32(len(machines)),
+		ReadyMachineCount:    readyMachineCount,
+		ReservedNodes:        state.ReservedNodes,
+	}
+	pool.Byoc = byocPoolStateToProto(state, pool, managedCompute)
+	return pool
+}
+
+func timestampOrNil(t time.Time) *timestamppb.Timestamp {
+	if t.IsZero() {
+		return nil
+	}
+	return timestamppb.New(t)
+}
+
+func (s *Service) agentMachineToProto(state *model.AgentTokenState) *pb.Machine {
+	machine := agentMachineToProto(state, s.agentMachineStatusWorker(state))
+	s.applyAgentContainerCount(state, machine.MachineMetrics)
+	return machine
+}
+
+// applyAgentContainerCount replaces the derived container count with the
+// scheduler's container index. Worker state does not persist active
+// containers and the agent does not report them, so the count computed by
+// agentMachineMetrics is otherwise always zero.
+func (s *Service) applyAgentContainerCount(state *model.AgentTokenState, metrics *pb.MachineMetrics) {
+	if s == nil || s.containerRepo == nil || state == nil || metrics == nil {
+		return
+	}
+	containers, err := s.containerRepo.GetActiveContainersByWorkerId(model.AgentMachineWorkerID(state.MachineID))
+	if err != nil {
+		return
+	}
+	metrics.ContainerCount = int32(len(containers))
+}
+
+func (s *Service) agentMachineStatusWorker(state *model.AgentTokenState) *types.Worker {
+	if s == nil || s.workerRepo == nil || state == nil {
+		return nil
+	}
+	worker, err := s.workerRepo.GetWorkerById(model.AgentMachineWorkerID(state.MachineID))
+	if err != nil || worker == nil {
+		return nil
+	}
+	if worker.MachineId != state.MachineID || worker.PoolName != state.PoolName {
+		return nil
+	}
+	return worker
+}
+
+func agentMachineToProto(state *model.AgentTokenState, worker *types.Worker) *pb.Machine {
+	if state == nil {
+		return &pb.Machine{}
+	}
+	gpu := ""
+	if len(state.GPUs) > 0 {
+		gpu = strings.Join(state.GPUs, ",")
+	}
+	lastKeepalive := model.AgentMachineLastSeen(state)
+	metrics := agentMachineMetrics(state, worker)
+	return &pb.Machine{
+		Id:             state.MachineID,
+		Cpu:            state.CPUMillicores,
+		Memory:         int64(state.MemoryMB),
+		Gpu:            gpu,
+		GpuCount:       state.GPUCount,
+		Status:         string(agentMachineStatus(state, worker, time.Now())),
+		PoolName:       state.PoolName,
+		ProviderName:   types.DefaultAgentName,
+		Created:        formatComputeTime(state.CreatedAt),
+		LastKeepalive:  formatComputeTime(lastKeepalive),
+		MachineMetrics: metrics,
+	}
+}
+
+func agentMachineMetrics(state *model.AgentTokenState, worker *types.Worker) *pb.MachineMetrics {
+	totalCPU := state.CPUMillicores
+	totalMemory := int64(firstNonZeroUint64(state.Metrics.MemoryTotalMB, state.MemoryMB))
+	freeGPU := state.Metrics.FreeGPUCount
+	containerCount := state.Metrics.ContainerCount
+	workerCount := state.Metrics.WorkerCount
+	var cpuPct, memoryPct float32
+	var usedMemory int64
+
+	if worker != nil {
+		totalCPU = firstNonZeroInt64(worker.TotalCpu, totalCPU)
+		totalMemory = firstNonZeroInt64(worker.TotalMemory, totalMemory)
+		cpuPct = capacityUtilizationPct(worker.TotalCpu, worker.FreeCpu)
+		memoryPct = capacityUtilizationPct(worker.TotalMemory, worker.FreeMemory)
+		usedMemory = maxInt64(worker.TotalMemory-worker.FreeMemory, 0)
+		freeGPU = worker.FreeGpuCount
+		containerCount = uint32(len(worker.ActiveContainers))
+		workerCount = 1
+	} else {
+		cpuPct = state.Metrics.CPUUtilizationPct
+		memoryPct = state.Metrics.MemoryUtilizationPct
+		usedMemory = int64(state.Metrics.MemoryUsedMB)
+	}
+
+	return &pb.MachineMetrics{
+		TotalCpuAvailable:    int32(totalCPU),
+		TotalMemoryAvailable: int32(totalMemory),
+		CpuUtilizationPct:    cpuPct,
+		MemoryUtilizationPct: memoryPct,
+		WorkerCount:          int32(workerCount),
+		ContainerCount:       int32(containerCount),
+		FreeGpuCount:         int32(freeGPU),
+		CacheUsagePct:        state.Metrics.DiskUsagePct,
+		CacheCapacity:        int32(state.Metrics.DiskTotalMB),
+		CacheMemoryUsage:     int32(state.Metrics.MemoryUsedMB),
+		MemoryUsedMb:         usedMemory,
+		MemoryTotalMb:        totalMemory,
+		DiskUsedMb:           int64(state.Metrics.DiskUsedMB),
+		DiskTotalMb:          int64(state.Metrics.DiskTotalMB),
+		DiskUsagePct:         state.Metrics.DiskUsagePct,
+		PathMetrics:          agentPathMetricsToProto(state.Metrics.PathMetrics),
+	}
+}
+
+func agentPathMetricsToProto(items []model.AgentPathMetric) []*pb.MachinePathMetrics {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]*pb.MachinePathMetrics, 0, len(items))
+	for _, item := range items {
+		out = append(out, &pb.MachinePathMetrics{
+			Label:       item.Label,
+			Path:        item.Path,
+			UsedMb:      item.UsedMB,
+			TotalMb:     item.TotalMB,
+			AvailableMb: item.AvailableMB,
+			UsagePct:    item.UsagePct,
+		})
+	}
+	return out
+}
+
+func capacityUtilizationPct(total, free int64) float32 {
+	if total <= 0 {
+		return 0
+	}
+	used := maxInt64(total-free, 0)
+	return float32(used) * 100 / float32(total)
+}
+
+func agentMachineStatus(state *model.AgentTokenState, worker *types.Worker, now time.Time) types.MachineStatus {
+	if state == nil {
+		return ""
+	}
+	if model.AgentMachineStatus(state, now) == types.AgentMachineStatusPreflightFail {
+		return types.MachineStatusDisabled
+	}
+	if !model.AgentMachineConnected(state, now) {
+		return types.MachineStatusRegistered
+	}
+	if state.Cordoned {
+		return types.MachineStatusDisabled
+	}
+	if worker == nil {
+		return types.MachineStatusRegistered
+	}
+	switch worker.Status {
+	case types.WorkerStatusAvailable:
+		return types.MachineStatusAvailable
+	case types.WorkerStatusPending:
+		return types.MachineStatusPending
+	case types.WorkerStatusDisabled:
+		return types.MachineStatusDisabled
+	default:
+		return types.MachineStatusPending
+	}
+}
+
+func formatComputeTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNonZeroInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func firstNonZeroUint64(values ...uint64) uint64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstNonZeroUint32(values ...uint32) uint32 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}

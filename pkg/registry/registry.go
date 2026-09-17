@@ -80,6 +80,10 @@ func (r *ImageRegistry) Pull(ctx context.Context, localPath string, imageId stri
 	return r.store.Get(ctx, fmt.Sprintf("%s.%s", imageId, r.ImageFileExtension), localPath)
 }
 
+func (r *ImageRegistry) GetReader(ctx context.Context, key string) (io.ReadCloser, error) {
+	return r.store.GetReader(ctx, key)
+}
+
 func (r *ImageRegistry) Size(ctx context.Context, imageId string) (int64, error) {
 	return r.store.Size(ctx, fmt.Sprintf("%s.%s", imageId, r.ImageFileExtension))
 }
@@ -103,8 +107,23 @@ type S3Store struct {
 	config types.S3ImageRegistryConfig
 }
 
+type S3StoreOptions struct {
+	UseAmbientCredentials bool
+}
+
 func NewS3Store(config types.S3ImageRegistryConfig) (*S3Store, error) {
-	cfg, err := common.GetAWSConfig(config.AccessKey, config.SecretKey, config.Region, config.Endpoint)
+	return NewS3StoreWithOptions(config, S3StoreOptions{})
+}
+
+func NewS3StoreWithOptions(config types.S3ImageRegistryConfig, opts S3StoreOptions) (*S3Store, error) {
+	accessKey := config.AccessKey
+	secretKey := config.SecretKey
+	if opts.UseAmbientCredentials {
+		accessKey = ""
+		secretKey = ""
+	}
+
+	cfg, err := common.GetAWSConfig(accessKey, secretKey, config.Region, config.Endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +136,21 @@ func NewS3Store(config types.S3ImageRegistryConfig) (*S3Store, error) {
 		}),
 		config: config,
 	}, nil
+}
+
+func (s *S3Store) PresignGet(ctx context.Context, key string, expires time.Duration) (string, error) {
+	if expires <= 0 {
+		expires = 15 * time.Minute
+	}
+
+	req, err := s3.NewPresignClient(s.client).PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.config.BucketName),
+		Key:    aws.String(key),
+	}, s3.WithPresignExpires(expires))
+	if err != nil {
+		return "", err
+	}
+	return req.URL, nil
 }
 
 func (s *S3Store) Put(ctx context.Context, localPath string, key string) error {
@@ -271,6 +305,18 @@ func (s *S3Store) objectExists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
+func IsObjectNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if os.IsNotExist(err) {
+		return true
+	}
+
+	return errors.As(err, new(*s3types.NoSuchKey)) || errors.As(err, new(*s3types.NotFound))
+}
+
 func NewLocalObjectStore() (*LocalObjectStore, error) {
 	return &LocalObjectStore{
 		Path: "/images",
@@ -367,7 +413,11 @@ func copyObjects(ctx context.Context, keys []string, sourceObjectStore, destinat
 
 		reader, err := sourceObjectStore.GetReader(ctx, key)
 		if err != nil {
-			log.Error().Err(err).Str("key", key).Msg("failed to get object from source object store")
+			if IsObjectNotFound(err) {
+				log.Debug().Err(err).Str("key", key).Msg("source object not found while copying registry object")
+			} else {
+				log.Error().Err(err).Str("key", key).Msg("failed to get object from source object store")
+			}
 			return err
 		}
 		defer reader.Close()

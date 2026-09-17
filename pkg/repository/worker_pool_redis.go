@@ -14,6 +14,8 @@ type WorkerPoolRedisRepository struct {
 	lock *common.RedisLock
 }
 
+const workerPoolSizerLockTTLSeconds = 30
+
 func NewWorkerPoolRedisRepository(rdb *common.RedisClient) WorkerPoolRepository {
 	return &WorkerPoolRedisRepository{rdb: rdb, lock: common.NewRedisLock(rdb)}
 }
@@ -36,6 +38,14 @@ func (r *WorkerPoolRedisRepository) GetWorkerPoolState(ctx context.Context, pool
 	}
 
 	return state, nil
+}
+
+// DeleteWorkerPoolState removes the cached health snapshot for a pool. Pool
+// configuration lives elsewhere, so this is safe to call while deleting a
+// API-managed pool and prevents a later same-name pool from inheriting
+// stale health or capacity data.
+func (r *WorkerPoolRedisRepository) DeleteWorkerPoolState(ctx context.Context, poolName string) error {
+	return r.rdb.Del(ctx, common.RedisKeys.WorkerPoolState(poolName)).Err()
 }
 
 func (r *WorkerPoolRedisRepository) SetWorkerPoolStateLock(poolName string) error {
@@ -61,11 +71,12 @@ func (r *WorkerPoolRedisRepository) SetWorkerPoolState(ctx context.Context, pool
 		"running_containers", state.RunningContainers,
 		"registered_machines", state.RegisteredMachines,
 		"pending_machines", state.PendingMachines,
+		"ready_machines", state.ReadyMachines,
 	).Err()
 }
 
 func (r *WorkerPoolRedisRepository) SetWorkerPoolSizerLock(poolName string) error {
-	return r.lock.Acquire(context.TODO(), common.RedisKeys.WorkerPoolSizerLock(poolName), common.RedisLockOptions{TtlS: 3, Retries: 0})
+	return r.lock.Acquire(context.TODO(), common.RedisKeys.WorkerPoolSizerLock(poolName), common.RedisLockOptions{TtlS: workerPoolSizerLockTTLSeconds, Retries: 0})
 }
 
 func (r *WorkerPoolRedisRepository) RemoveWorkerPoolSizerLock(poolName string) error {

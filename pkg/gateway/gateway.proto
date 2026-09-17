@@ -34,6 +34,9 @@ service GatewayService {
     };
   }
   rpc PutObjectStream(stream PutObjectRequest) returns (PutObjectResponse) {}
+  rpc CompleteObjectUpload(CompleteObjectUploadRequest) returns (CompleteObjectUploadResponse) {}
+  rpc CreateObjectDelta(CreateObjectDeltaRequest) returns (CreateObjectDeltaResponse) {}
+  rpc CommitObjectDelta(CommitObjectDeltaRequest) returns (CommitObjectDeltaResponse) {}
 
   // Containers
   rpc CheckpointContainer(CheckpointContainerRequest)
@@ -136,6 +139,248 @@ service GatewayService {
     };
   }
 
+  // Private compute pools
+  rpc ListPoolOffers(ListPoolOffersRequest)
+      returns (ListPoolOffersResponse) {
+    option (google.api.http) = {
+      post : "/pools:offers"
+      body : "*"
+    };
+  }
+  rpc LaunchPoolCapacity(LaunchPoolCapacityRequest)
+      returns (LaunchPoolCapacityResponse) {
+    option (google.api.http) = {
+      post : "/pools:launch"
+      body : "*"
+    };
+  }
+  rpc ListPrivatePools(ListPrivatePoolsRequest) returns (ListPrivatePoolsResponse) {
+    option (google.api.http) = {
+      get : "/pools/private"
+    };
+  }
+  rpc CreateBYOCPool(CreateBYOCPoolRequest)
+      returns (CreateBYOCPoolResponse) {
+    option (google.api.http) = {
+      post : "/pools/byoc"
+      body : "*"
+    };
+  }
+  rpc GetBYOCPool(GetBYOCPoolRequest)
+      returns (GetBYOCPoolResponse) {
+    option (google.api.http) = {
+      get : "/pools/{pool_name}/byoc"
+    };
+  }
+  rpc ScaleBYOCPool(ScaleBYOCPoolRequest)
+      returns (ScaleBYOCPoolResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/byoc/scale"
+      body : "*"
+    };
+  }
+  rpc CreateMarketplaceListing(CreateMarketplaceListingRequest)
+      returns (CreateMarketplaceListingResponse) {
+    option (google.api.http) = {
+      post : "/marketplace/listings"
+      body : "*"
+    };
+  }
+  rpc UpdateMarketplaceListing(UpdateMarketplaceListingRequest)
+      returns (UpdateMarketplaceListingResponse) {
+    option (google.api.http) = {
+      post : "/marketplace/listings/{listing_id}"
+      body : "*"
+    };
+  }
+  rpc DeleteMarketplaceListing(DeleteMarketplaceListingRequest)
+      returns (DeleteMarketplaceListingResponse) {
+    option (google.api.http) = {
+      delete : "/marketplace/listings/{listing_id}"
+    };
+  }
+  rpc ListMarketplaceListings(ListMarketplaceListingsRequest)
+      returns (ListMarketplaceListingsResponse) {
+    option (google.api.http) = {
+      get : "/marketplace/listings"
+    };
+  }
+  rpc GetMarketplaceJoinCommand(GetMarketplaceJoinCommandRequest)
+      returns (GetMarketplaceJoinCommandResponse) {
+    option (google.api.http) = {
+      post : "/marketplace/listings/{listing_id}/join-command"
+      body : "*"
+    };
+  }
+  rpc ListMarketplaceOffers(ListMarketplaceOffersRequest)
+      returns (ListMarketplaceOffersResponse) {
+    option (google.api.http) = {
+      get : "/marketplace/offers"
+    };
+  }
+  rpc GetMarketplaceOffer(GetMarketplaceOfferRequest)
+      returns (GetMarketplaceOfferResponse) {
+    option (google.api.http) = {
+      get : "/marketplace/offers/{listing_id}"
+    };
+  }
+  rpc CreateMarketplaceRental(CreateMarketplaceRentalRequest)
+      returns (CreateMarketplaceRentalResponse) {
+    option (google.api.http) = {
+      post : "/marketplace/rentals"
+      body : "*"
+    };
+  }
+  rpc ListMarketplaceRentals(ListMarketplaceRentalsRequest)
+      returns (ListMarketplaceRentalsResponse) {
+    option (google.api.http) = {
+      get : "/marketplace/rentals"
+    };
+  }
+  rpc DeleteMarketplaceRental(DeleteMarketplaceRentalRequest)
+      returns (DeleteMarketplaceRentalResponse) {
+    option (google.api.http) = {
+      delete : "/marketplace/rentals/{rental_id}"
+    };
+  }
+  rpc LaunchRentalWorkload(LaunchRentalWorkloadRequest)
+      returns (LaunchRentalWorkloadResponse) {
+    option (google.api.http) = {
+      post : "/marketplace/rentals/{rental_id}/launch"
+      body : "*"
+    };
+  }
+  rpc ListMarketplaceMachines(ListMarketplaceMachinesRequest)
+      returns (ListMarketplaceMachinesResponse) {
+    option (google.api.http) = {
+      get : "/marketplace/listings/{listing_id}/machines"
+    };
+  }
+  rpc ListMachineContainers(ListMachineContainersRequest)
+      returns (ListMachineContainersResponse) {
+    option (google.api.http) = {
+      get : "/pools/{pool_name}/machines/{machine_id}/containers"
+    };
+  }
+  rpc CreatePool(CreatePoolRequest)
+      returns (CreatePoolResponse) {
+    option (google.api.http) = {
+      post : "/pools"
+      body : "*"
+    };
+  }
+  rpc DeletePool(DeletePoolRequest)
+      returns (DeletePoolResponse) {
+    option (google.api.http) = {
+      delete : "/pools/{name}"
+    };
+  }
+  rpc ExtendPoolCapacity(ExtendPoolCapacityRequest)
+      returns (ExtendPoolCapacityResponse) {
+    option (google.api.http) = {
+      post : "/pools/{name}/extend"
+      body : "*"
+    };
+  }
+  rpc CreatePoolJoinToken(CreatePoolJoinTokenRequest)
+      returns (CreatePoolJoinTokenResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/join-tokens"
+      body : "*"
+    };
+  }
+  rpc RevokePoolJoinToken(RevokePoolJoinTokenRequest)
+      returns (RevokePoolJoinTokenResponse) {
+    option (google.api.http) = {
+      post : "/pools/join-tokens/revoke"
+      body : "*"
+    };
+  }
+  rpc GetPoolJoinCommand(GetPoolJoinCommandRequest)
+      returns (GetPoolJoinCommandResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/join-command"
+      body : "*"
+    };
+  }
+  rpc ListPoolMachines(ListPoolMachinesRequest)
+      returns (ListPoolMachinesResponse) {
+    option (google.api.http) = {
+      get : "/pools/{pool_name}/machines"
+    };
+  }
+  rpc DownloadMachineSSHKey(DownloadMachineSSHKeyRequest)
+      returns (DownloadMachineSSHKeyResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/machines/{machine_id}/ssh/key:download"
+      body : "*"
+    };
+  }
+  rpc RotateMachineSSHKey(RotateMachineSSHKeyRequest)
+      returns (RotateMachineSSHKeyResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/machines/{machine_id}/ssh/key:rotate"
+      body : "*"
+    };
+  }
+  rpc ActivateMachineSSHKey(ActivateMachineSSHKeyRequest)
+      returns (ActivateMachineSSHKeyResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/machines/{machine_id}/ssh/key:activate"
+      body : "*"
+    };
+  }
+  rpc JoinAgent(JoinAgentRequest) returns (JoinAgentResponse) {
+    option (google.api.http) = {
+      post : "/agent/join"
+      body : "*"
+    };
+  }
+  rpc RequestAgentTransportCredential(RequestAgentTransportCredentialRequest)
+      returns (RequestAgentTransportCredentialResponse) {
+    option (google.api.http) = {
+      post : "/agent/transport-credential"
+      body : "*"
+    };
+  }
+  rpc GetAgentPoolVirtualization(GetAgentPoolVirtualizationRequest)
+      returns (GetAgentPoolVirtualizationResponse);
+  rpc CreateNodeEnrollment(CreateNodeEnrollmentRequest)
+      returns (CreateNodeEnrollmentResponse);
+  rpc DeleteNodeEnrollment(DeleteNodeEnrollmentRequest)
+      returns (DeleteNodeEnrollmentResponse);
+  rpc ListAgentRoutes(ListAgentRoutesRequest)
+      returns (ListAgentRoutesResponse) {
+    option (google.api.http) = {
+      post : "/agent/routes:list"
+      body : "*"
+    };
+  }
+  rpc UpdateAgentRouteStatus(UpdateAgentRouteStatusRequest)
+      returns (UpdateAgentRouteStatusResponse) {
+    option (google.api.http) = {
+      post : "/agent/routes/status"
+      body : "*"
+    };
+  }
+  rpc UpdateAgentSSHStatus(UpdateAgentSSHStatusRequest)
+      returns (UpdateAgentSSHStatusResponse) {
+    option (google.api.http) = {
+      post : "/agent/ssh/status"
+      body : "*"
+    };
+  }
+  rpc UpdateAgentAvailability(UpdateAgentAvailabilityRequest)
+      returns (UpdateAgentAvailabilityResponse) {
+    option (google.api.http) = {
+      post : "/agent/availability"
+      body : "*"
+    };
+  }
+  rpc StreamAgent(StreamAgentRequest) returns (stream StreamAgentResponse);
+  rpc StreamAgentTelemetry(stream AgentTelemetryRequest)
+      returns (AgentTelemetryResponse);
+
   // Machines
   rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse) {
     option (google.api.http) = {
@@ -230,7 +475,10 @@ message ObjectMetadata {
   int64 size = 2;
 }
 
-message HeadObjectRequest { string hash = 1; }
+message HeadObjectRequest {
+  string hash = 1;
+  bool supports_put_headers = 2;
+}
 
 message HeadObjectResponse {
   bool ok = 1;
@@ -246,6 +494,21 @@ message CreateObjectRequest {
   string hash = 2;
   int64 size = 3;
   bool overwrite = 4;
+  bool supports_put_headers = 5;
+  // When > 0 the client can upload the object as concurrent parts of this
+  // many bytes; the gateway answers with upload_parts instead of a single
+  // presigned_url for objects larger than one part.
+  int64 multipart_part_size = 6;
+  // Byte length of the archive the parts cover (size is the manifest's
+  // uncompressed total, which is what the object record stores).
+  int64 multipart_total_size = 7;
+}
+
+message ObjectUploadPart {
+  uint32 number = 1;
+  int64 start = 2;
+  int64 end = 3;
+  string url = 4;
 }
 
 message CreateObjectResponse {
@@ -253,6 +516,25 @@ message CreateObjectResponse {
   string object_id = 2;
   string presigned_url = 3;
   string error_msg = 4;
+  map<string, string> put_headers = 5;
+  string upload_id = 6;
+  repeated ObjectUploadPart upload_parts = 7;
+}
+
+message ObjectUploadedPart {
+  uint32 number = 1;
+  string etag = 2;
+}
+
+message CompleteObjectUploadRequest {
+  string object_id = 1;
+  string upload_id = 2;
+  repeated ObjectUploadedPart parts = 3;
+}
+
+message CompleteObjectUploadResponse {
+  bool ok = 1;
+  string error_msg = 2;
 }
 
 message PutObjectRequest {
@@ -266,6 +548,39 @@ message PutObjectResponse {
   bool ok = 1;
   string object_id = 2;
   string error_msg = 3;
+}
+
+// Incremental sync: instead of re-uploading a whole workspace archive when a
+// few files changed, the client uploads an archive holding only the added and
+// modified files (the delta) and the gateway merges it with the archive of a
+// previous object of the same workspace into the new object.
+message CreateObjectDeltaRequest {
+  string hash = 1;           // identity of the merged object (content manifest hash)
+  int64 size = 2;            // expected size of the merged archive
+  string base_object_id = 3; // object the delta is relative to
+  int64 delta_size = 4;
+}
+
+message CreateObjectDeltaResponse {
+  bool ok = 1;
+  string object_id = 2;
+  string presigned_url = 3; // PUT the delta archive here
+  map<string, string> put_headers = 4;
+  string error_msg = 5;
+  bool base_missing = 6; // base object is gone: fall back to a full upload
+}
+
+message CommitObjectDeltaRequest {
+  string object_id = 1;
+  string base_object_id = 2;
+  repeated string removed_paths = 3; // base archive entries that no longer exist
+}
+
+message CommitObjectDeltaResponse {
+  bool ok = 1;
+  string object_id = 2;
+  int64 size = 3;
+  string error_msg = 4;
 }
 
 enum SyncContainerWorkspaceOperation {
@@ -395,6 +710,61 @@ message Autoscaler {
   uint32 min_containers = 4;
 }
 
+message LLMConfig {
+  string model_id = 1;
+  string engine = 2;
+  string served_model_name = 3;
+  int64 context_length = 4;
+  string tokenizer = 5;
+  string metrics_path = 6;
+  string slo_tier = 7;
+}
+
+message DatabaseServingConfig {
+  string kind = 1;
+  uint32 port = 2;
+  string readiness_probe = 3;
+  string connection_env_name = 4;
+  repeated string credential_secret_names = 5;
+  string durability_mode = 6;
+  string username_secret_name = 7;
+  string password_secret_name = 8;
+  string database_secret_name = 9;
+  string connection_url_secret_name = 10;
+}
+
+message ServingConfig {
+  string app_kind = 1;
+  string serving_protocol = 2;
+  LLMConfig llm = 3;
+  DatabaseServingConfig database = 4;
+}
+
+message DurableDisk {
+  string name = 1;
+  string size = 2;
+  string mount_path = 3;
+  string filesystem = 4;
+  string driver = 5;
+  bool read_only = 6;
+  // Snapshot used to initialize a disk with no snapshot history.
+  string source_snapshot_id = 7;
+}
+
+// A durable machine-root disk. The container's entire root filesystem delta
+// lives on a qcow-backed volume mounted at "/", so disk snapshots capture the
+// whole machine state. Shorthand for a DurableDisk with mount_path "/" and
+// the qcow driver.
+message PersistentRoot {
+  string size = 1;
+  // Snapshot used to initialize the root with no snapshot history.
+  string source_snapshot_id = 2;
+  // Disk name backing the root. Disk snapshot history is keyed by this name
+  // within the workspace, so each machine wanting its own root lineage must
+  // use a distinct name (e.g. the machine id). Defaults to "root".
+  string name = 3;
+}
+
 message TaskPolicy {
   int64 timeout = 1;
   uint32 max_retries = 2;
@@ -448,6 +818,15 @@ message GetOrCreateStubRequest {
   bool block_network = 38;
   repeated string allow_list = 39;
   bool docker_enabled = 40;
+  PoolConfig pool = 41;
+  bool is_service = 42;
+  ServingConfig serving = 43;
+  repeated DurableDisk disks = 44;
+  bool allow_marketplace = 45;
+  types.CheckpointTrigger checkpoint_trigger = 46;
+  // Hostname to set inside the container.
+  string hostname = 47;
+  PersistentRoot persistent_root = 48;
 }
 
 message GetOrCreateStubResponse {
@@ -455,11 +834,22 @@ message GetOrCreateStubResponse {
   string stub_id = 2;
   string err_msg = 3;
   string warn_msg = 4;
+  // Capacity verdict for the requested GPU types, computed at stub creation:
+  // "available", "low", or "none". Empty when no check applies (CPU-only
+  // workloads, private-pool-only stubs, or pool-selector-bound stubs).
+  string capacity_status = 5;
+  // GPU types from the request that no serverless pool supports.
+  repeated string unsupported_gpus = 6;
+  // Name of an existing ready private pool in the workspace that satisfies
+  // the GPU request. Set instead of capacity_status "none" so clients can
+  // re-issue stub creation targeting this pool.
+  string matched_private_pool = 7;
 }
 
 message DeployStubRequest {
   string stub_id = 1;
   string name = 2;
+  string rollout = 3;
 }
 
 message DeployStubResponse {
@@ -467,6 +857,9 @@ message DeployStubResponse {
   string deployment_id = 2;
   uint32 version = 3;
   string invoke_url = 4;
+  string err_msg = 5;
+  string warn_msg = 6;
+  string rollout_action = 7;
 }
 
 message Deployment {
@@ -482,6 +875,9 @@ message Deployment {
   google.protobuf.Timestamp created_at = 10;
   google.protobuf.Timestamp updated_at = 11;
   string app_id = 12;
+  string database_kind = 13;
+  string connection_string_secret = 14;
+  string connection_env_name = 15;
 }
 
 message ListDeploymentsRequest {
@@ -550,6 +946,742 @@ message ListPoolsResponse {
   repeated Pool pools = 3;
 }
 
+message PoolConfig {
+  string name = 1;
+  repeated string gpu = 2;
+  uint32 nodes = 3;
+  string ttl = 4;
+  double max_spend = 5;
+  repeated string providers = 6;
+  repeated string regions = 7;
+  double min_reliability = 8;
+  string selector = 9;
+  string mode = 10;
+  string transport = 11;
+  string fallback = 12;
+  int32 priority = 13;
+  string offer_id = 14;
+  // Runtime for workers in this pool.
+  string container_runtime = 15;
+}
+
+message PoolOffer {
+  string id = 1;
+  string provider = 2;
+  string instance_type = 3;
+  string region = 4;
+  string gpu = 5;
+  uint32 gpu_count = 6;
+  int64 cpu_millicores = 7;
+  int64 memory_mb = 8;
+  int64 hourly_cost_micros = 9;
+  double reliability = 10;
+  uint32 available = 11;
+  int64 storage_mb = 12;
+  string cloud = 13;
+  uint32 node_count = 14;
+  string display_name = 15;
+  string category = 16;
+  string region_display_name = 17;
+  double latitude = 18;
+  double longitude = 19;
+}
+
+message ProviderInstance {
+  string id = 1;
+  string pool_name = 2;
+  string provider = 3;
+  string offer_id = 4;
+  string status = 5;
+  uint32 gpu_count = 6;
+  int64 hourly_cost_micros = 7;
+  string source = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  google.protobuf.Timestamp billing_renewal_at = 11;
+  string status_message = 12;
+  string terminating_reason = 13;
+  string machine_id = 14;
+  string cloud = 15;
+  string region = 16;
+  uint32 node_count = 17;
+  string instance_type = 18;
+  int64 cpu_millicores = 19;
+  int64 memory_mb = 20;
+  int64 storage_mb = 21;
+}
+
+message PrivatePool {
+  string name = 1;
+  string selector = 2;
+  PoolConfig config = 3;
+  repeated ProviderInstance reservations = 4;
+  int64 committed_spend_micros = 6;
+  string status = 7;
+  string source = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  uint32 machine_count = 11;
+  uint32 ready_machine_count = 12;
+  uint32 reserved_nodes = 13;
+  BYOCPoolState byoc = 14;
+}
+
+message ListPoolOffersRequest { PoolConfig pool = 1; }
+
+message ListPoolOffersResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated PoolOffer offers = 3;
+}
+
+message LaunchPoolCapacityRequest {
+  PoolConfig pool = 1;
+  uint32 nodes = 2;
+}
+
+message LaunchPoolCapacityResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+  string error_code = 4;
+  int64 required_cents = 5;
+  int64 available_cents = 6;
+}
+
+message ListPrivatePoolsRequest {
+  map<string, StringList> filters = 1;
+  uint32 limit = 2;
+}
+
+message ListPrivatePoolsResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated PrivatePool pools = 3;
+}
+
+message CreateBYOCPoolRequest {
+  string provider = 1;
+  string pool_name = 2;
+  string region = 3;
+  string instance_type = 4;
+  uint32 desired_nodes = 5;
+  uint32 max_nodes = 6;
+  string account_id = 7;
+  string gpu = 8;
+  uint32 gpu_count = 9;
+}
+
+message CreateBYOCPoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+  string setup_url = 4;
+  string resource_name = 5;
+  string resource_url = 6;
+  BYOCPoolState byoc = 7;
+}
+
+message BYOCPoolState {
+  string provider = 1;
+  string account_id = 2;
+  string region = 3;
+  string resource_name = 4;
+  string resource_url = 5;
+  string destroy_url = 6;
+  string phase = 7;
+  uint32 desired_nodes = 8;
+  uint32 max_nodes = 9;
+  uint32 target_sandboxes = 10;
+  uint32 sandboxes_per_node = 11;
+  string instance_type = 12;
+  uint32 machine_count = 13;
+  uint32 ready_machine_count = 14;
+  string message = 15;
+  int64 hourly_cost_micros = 16;
+  int64 total_hourly_cost_micros = 17;
+  bool direct_scale_enabled = 18;
+  string gpu = 19;
+  uint32 gpu_count = 20;
+}
+
+message GetBYOCPoolRequest {
+  string pool_name = 1;
+}
+
+message GetBYOCPoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+  bool ready = 4;
+  uint32 ready_machine_count = 5;
+  uint32 machine_count = 6;
+  BYOCPoolState byoc = 7;
+}
+
+message ScaleBYOCPoolRequest {
+  string pool_name = 1;
+  uint32 desired_nodes = 2;
+  uint32 max_nodes = 3;
+}
+
+message ScaleBYOCPoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+  BYOCPoolState byoc = 4;
+}
+
+message MarketplaceListing {
+  string id = 1;
+  string seller_workspace_id = 2;
+  string display_name = 3;
+  string gpu = 4;
+  uint32 gpu_count = 5;
+  string source = 6;
+  bool preemptible = 7;
+  bool public = 8;
+  string status = 9;
+  string pool_name = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  uint32 machine_count = 13;
+  uint32 ready_machine_count = 14;
+  string region = 15;
+  string runtime = 16;
+  // Seller-set on-demand rate, per GPU per hour.
+  uint32 price_per_gpu_hour_cents = 17;
+}
+
+message MarketplaceOffer {
+  string listing_id = 1;
+  string seller_workspace_id = 2;
+  string display_name = 3;
+  string gpu = 4;
+  uint32 gpu_count = 5;
+  string source = 6;
+  bool preemptible = 7;
+  uint32 machine_count = 8;
+  uint32 ready_machine_count = 9;
+  string runtime = 10;
+  string region = 11;
+  uint32 cpu_cores = 12;
+  uint64 memory_mb = 13;
+  uint64 disk_gb = 14;
+  uint32 free_gpu_count = 15;
+  float reliability = 16;
+  google.protobuf.Timestamp created_at = 17;
+  // False for unlisted offers: reachable via direct share link only, never
+  // returned by marketplace search.
+  bool public = 18;
+  uint32 price_per_gpu_hour_cents = 19;
+}
+
+message CreateMarketplaceListingRequest {
+  string display_name = 1;
+  string gpu = 2;
+  uint32 gpu_count = 3;
+  string source = 4;
+  bool preemptible = 5;
+  bool public = 6;
+  string region = 7;
+  // Optional pool the listing's machines join. Reusing a pool across listings
+  // shares machine caches; defaults to a name derived from the GPU type.
+  string pool_name = 8;
+  uint32 price_per_gpu_hour_cents = 9;
+}
+
+message CreateMarketplaceListingResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  MarketplaceListing listing = 3;
+}
+
+message UpdateMarketplaceListingRequest {
+  string listing_id = 1;
+  string display_name = 2;
+  string gpu = 3;
+  uint32 gpu_count = 4;
+  string source = 5;
+  optional bool preemptible = 6;
+  optional bool public = 7;
+  string status = 8;
+  string region = 9;
+  optional uint32 price_per_gpu_hour_cents = 10;
+}
+
+message UpdateMarketplaceListingResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  MarketplaceListing listing = 3;
+}
+
+message DeleteMarketplaceListingRequest { string listing_id = 1; }
+
+message DeleteMarketplaceListingResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message ListMarketplaceListingsRequest { uint32 limit = 1; }
+
+message ListMarketplaceListingsResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated MarketplaceListing listings = 3;
+}
+
+message GetMarketplaceJoinCommandRequest {
+  string listing_id = 1;
+  string ttl = 2;
+}
+
+message GetMarketplaceJoinCommandResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string command = 3;
+  string token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message ListMarketplaceOffersRequest {
+  string gpu = 1;
+  uint32 limit = 2;
+}
+
+message ListMarketplaceOffersResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated MarketplaceOffer offers = 3;
+}
+
+message GetMarketplaceOfferRequest { string listing_id = 1; }
+
+message GetMarketplaceOfferResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  MarketplaceOffer offer = 3;
+}
+
+// A buyer's exclusive hold on GPUs of one seller machine. Billed on-demand
+// while held; workloads are launched onto it machine-pinned.
+message MarketplaceRental {
+  string id = 1;
+  string listing_id = 2;
+  string listing_name = 3;
+  string pool_name = 4;
+  string machine_id = 5;
+  string gpu = 6;
+  uint32 gpu_count = 7;
+  string region = 8;
+  bool machine_connected = 9;
+  google.protobuf.Timestamp created_at = 10;
+  // Rate snapshotted when the rental was created; seller price changes don't
+  // affect rentals already held.
+  uint32 price_per_gpu_hour_cents = 11;
+}
+
+message CreateMarketplaceRentalRequest {
+  string listing_id = 1;
+  string machine_id = 2;
+  uint32 gpu_count = 3;
+}
+
+message CreateMarketplaceRentalResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  MarketplaceRental rental = 3;
+}
+
+message ListMarketplaceRentalsRequest {}
+
+message ListMarketplaceRentalsResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated MarketplaceRental rentals = 3;
+}
+
+message DeleteMarketplaceRentalRequest { string rental_id = 1; }
+
+message DeleteMarketplaceRentalResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message LaunchRentalWorkloadRequest {
+  string rental_id = 1;
+  // "pod" runs the image's own entrypoint (e.g. a vLLM server); "shell"
+  // starts an SSH-able container reachable via `beam shell`.
+  string kind = 2;
+  string image_id = 3;
+  repeated string command = 4;
+  repeated uint32 ports = 5;
+  uint32 gpu_count = 6;
+  repeated string env = 7;
+}
+
+message LaunchRentalWorkloadResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string container_id = 3;
+  string stub_id = 4;
+  string url = 5;
+  string shell_command = 6;
+  string username = 7;
+  string password = 8;
+}
+
+message ListMarketplaceMachinesRequest {
+  string listing_id = 1;
+  uint32 limit = 2;
+}
+
+message ListMarketplaceMachinesResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Machine machines = 3;
+}
+
+message ListMachineContainersRequest {
+  string pool_name = 1;
+  string machine_id = 2;
+}
+
+message MachineContainer {
+  string container_id = 1;
+  string stub_id = 2;
+  string status = 3;
+  string workspace_id = 4;
+  string gpu = 5;
+  uint32 gpu_count = 6;
+  int64 cpu = 7;
+  int64 memory = 8;
+  int64 scheduled_at = 9;
+  int64 started_at = 10;
+}
+
+message ListMachineContainersResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated MachineContainer containers = 3;
+}
+
+message CreatePoolRequest { PoolConfig pool = 1; }
+
+message CreatePoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+}
+
+message DeletePoolRequest { string name = 1; }
+
+message DeletePoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message ExtendPoolCapacityRequest {
+  string name = 1;
+  string ttl = 2;
+  double max_spend = 3;
+}
+
+message ExtendPoolCapacityResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+}
+
+message CreatePoolJoinTokenRequest {
+  string pool_name = 1;
+  string ttl = 2;
+}
+
+message CreatePoolJoinTokenResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string token = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message RevokePoolJoinTokenRequest { string token = 1; }
+
+message RevokePoolJoinTokenResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message GetPoolJoinCommandRequest {
+  string pool_name = 1;
+  string ttl = 2;
+}
+
+message GetPoolJoinCommandResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string command = 3;
+  string token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message ListPoolMachinesRequest {
+  string pool_name = 1;
+  uint32 limit = 2;
+}
+
+message ListPoolMachinesResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Machine machines = 3;
+}
+
+message AgentBootstrapConfig {
+  string gateway_http_url = 1;
+  string gateway_grpc_host = 2;
+  int32 gateway_grpc_port = 3;
+  bool gateway_grpc_tls = 4;
+  string workspace_id = 5;
+  string pool_name = 6;
+  string transport = 7;
+  string executor = 8;
+  string fallback = 9;
+  repeated string disabled_services = 10;
+  string image_registry_store = 11;
+  uint32 image_clip_version = 12;
+  bool image_local_cache_enabled = 13;
+  AgentTelemetryConfig telemetry = 14;
+  // Only set for marketplace pools: lets workers on seller machines meter
+  // buyer usage and report it to the billing service.
+  AgentBillingConfig billing = 15;
+}
+
+message AgentBillingConfig {
+  string usage_endpoint = 1;
+  string usage_token = 2;
+  string cost_hook_endpoint = 3;
+  string cost_hook_token = 4;
+  double billable_margin_pct = 5;
+}
+
+message AgentTelemetryConfig {
+  bool enabled = 1;
+  string stream_prefix = 2;
+  AgentTelemetrySinkConfig logs = 3;
+  AgentTelemetrySinkConfig events = 4;
+}
+
+message AgentTelemetrySinkConfig {
+  string destination = 1;
+  string credential = 2;
+  string stream_prefix = 3;
+}
+
+message JoinAgentRequest {
+  string join_token = 1;
+  string machine_fingerprint = 2;
+  string hostname = 3;
+  string os = 4;
+  string arch = 5;
+  uint32 cpu_count = 6;
+  uint64 memory_mb = 7;
+  repeated string gpu = 8;
+  uint32 gpu_count = 9;
+  repeated AgentPreflightCheck preflight = 10;
+  bool schedulable = 11;
+  string executor = 12;
+  int64 cpu_millicores = 13;
+  repeated string gpu_ids = 14;
+  uint32 network_slot_pool_size = 15;
+  uint32 container_start_concurrency = 16;
+  // Optional per-machine worker image override. The gateway remembers the
+  // generated value as a baseline so untouched installs continue to follow
+  // future image tag changes while manually edited values remain pinned.
+  string worker_image = 17;
+  repeated string capabilities = 18;
+}
+
+message JoinAgentResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string workspace_id = 3;
+  string pool_name = 4;
+  string machine_id = 5;
+  string agent_token = 6;
+  AgentBootstrapConfig bootstrap = 7;
+}
+
+message AgentPreflightCheck {
+  string name = 1;
+  bool ok = 2;
+  string message = 3;
+  string severity = 4;
+}
+
+message AgentRoute {
+  string route_id = 1;
+  string workspace_id = 2;
+  string pool_name = 3;
+  string machine_id = 4;
+  string worker_id = 5;
+  string container_id = 6;
+  string kind = 7;
+  int32 port = 8;
+  string protocol = 9;
+  string transport = 10;
+  string local_target = 11;
+  string proxy_target = 12;
+  string state = 13;
+  string error = 14;
+  int64 updated_at = 15;
+}
+
+message RequestAgentTransportCredentialRequest {
+  string agent_token = 1;
+  string transport = 2;
+}
+
+message RequestAgentTransportCredentialResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string auth_key = 3;
+  string control_url = 4;
+  string hostname = 5;
+  bool ephemeral = 6;
+}
+
+message CreateNodeEnrollmentRequest { string agent_token = 1; }
+
+message CreateNodeEnrollmentResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string enrollment_token = 3;
+}
+
+message DeleteNodeEnrollmentRequest { string agent_token = 1; }
+
+message DeleteNodeEnrollmentResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ListAgentRoutesRequest { string agent_token = 1; }
+
+message ListAgentRoutesResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated AgentRoute routes = 3;
+}
+
+message UpdateAgentRouteStatusRequest {
+  string agent_token = 1;
+  string route_id = 2;
+  string state = 3;
+  string proxy_target = 4;
+  string error = 5;
+  map<string, string> attrs = 6;
+}
+
+message UpdateAgentRouteStatusResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message AgentWorkerSlot {
+  string worker_id = 1;
+  string worker_token = 2;
+  string pool_name = 3;
+  string machine_id = 4;
+  int64 cpu = 5;
+  int64 memory = 6;
+  string gpu = 7;
+  uint32 gpu_count = 8;
+  string gpu_assignment = 9;
+  string network_prefix = 10;
+  string worker_image = 11;
+  uint32 network_slot_pool_size = 12;
+  uint32 container_start_concurrency = 13;
+  // Pool mode ("private" / "marketplace" / "external") and the container
+  // runtime the worker must run with. Marketplace slots prefer gVisor but can
+  // fall back to runc for incompatible GPU families.
+  string mode = 14;
+  string container_runtime = 15;
+  // Marketplace identity of the machine backing this slot. Machines join a
+  // (possibly shared) pool through exactly one listing; the worker reports
+  // buyer usage against it, so the request itself carries no billing fields.
+  string marketplace_listing_id = 16;
+  string seller_workspace_id = 17;
+  bool requires_pool_selector = 18;
+  int32 priority = 19;
+  bool preemptable = 20;
+  // Distinguishes an explicitly configured zero priority from legacy
+  // gateways that did not send scheduling priority metadata.
+  bool priority_set = 21;
+  string gvisor_platform = 22;
+  string gvisor_root = 23;
+  repeated string gvisor_extra_args = 24;
+  // Deterministic identity of the restart-relevant slot specification.
+  string generation = 25;
+  bool cpu_affinity_enforced = 26;
+  AgentPoolRuntimeConfig pool_config = 27;
+}
+
+message StreamAgentRequest { string agent_token = 1; }
+
+message StreamAgentResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated AgentRoute routes = 3;
+  repeated AgentWorkerSlot slots = 4;
+  AgentSSHConfig ssh = 5;
+}
+
+message AgentLogRecord {
+  string source = 1;
+  string worker_id = 2;
+  string level = 3;
+  string stream = 4;
+  string line = 5;
+  int64 timestamp_unix_nano = 6;
+}
+
+message AgentMetricSnapshot {
+  int64 timestamp_unix_nano = 1;
+  float cpu_utilization_pct = 2;
+  uint64 memory_used_mb = 3;
+  uint64 memory_total_mb = 4;
+  float memory_utilization_pct = 5;
+  uint64 disk_used_mb = 6;
+  uint64 disk_total_mb = 7;
+  float disk_usage_pct = 8;
+  string disk_path = 9;
+  uint32 worker_count = 10;
+  uint32 container_count = 11;
+  uint32 free_gpu_count = 12;
+  repeated MachinePathMetrics path_metrics = 13;
+}
+
+message AgentEventRecord {
+  string action = 1;
+  string status = 2;
+  string message = 3;
+  map<string, string> attrs = 4;
+  int64 timestamp_unix_nano = 5;
+  string event_type = 6;
+}
+
+message AgentTelemetryRequest {
+  string agent_token = 1;
+  repeated AgentLogRecord logs = 2;
+  AgentMetricSnapshot metrics = 3;
+  repeated AgentEventRecord events = 4;
+}
+
+message AgentTelemetryResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
 message Machine {
   string id = 1;
   int64 cpu = 2;
@@ -567,6 +1699,7 @@ message Machine {
   string agent_version = 14;
   MachineMetrics machine_metrics = 15;
   string user_data = 16;
+  MachineSSHAccess ssh = 17;
 }
 
 message MachineMetrics {
@@ -581,6 +1714,21 @@ message MachineMetrics {
   int32 cache_capacity = 9;
   int32 cache_memory_usage = 10;
   float cache_cpu_usage = 11;
+  int64 memory_used_mb = 12;
+  int64 memory_total_mb = 13;
+  int64 disk_used_mb = 14;
+  int64 disk_total_mb = 15;
+  float disk_usage_pct = 16;
+  repeated MachinePathMetrics path_metrics = 17;
+}
+
+message MachinePathMetrics {
+  string label = 1;
+  string path = 2;
+  uint64 used_mb = 3;
+  uint64 total_mb = 4;
+  uint64 available_mb = 5;
+  float usage_pct = 6;
 }
 
 message ListMachinesRequest {
@@ -592,7 +1740,16 @@ message ListMachinesResponse {
   bool ok = 1;
   string err_msg = 2;
   repeated Machine machines = 3;
+  // gpus reports live worker availability per GPU type (a worker with that
+  // GPU is currently registered).
   map<string, bool> gpus = 4;
+  // supported_gpus reports pool-config-based serverless support per GPU
+  // type: true when a pool could serve the GPU even if scaled to zero.
+  map<string, bool> supported_gpus = 5;
+  // Resource ceilings enforced when creating a serverless stub. Private
+  // on-demand pools own their machine and do not use these limits.
+  uint32 max_cpu_millicores = 6;
+  uint32 max_memory_mb = 7;
 }
 
 message CreateMachineRequest { string pool_name = 1; }
@@ -604,6 +1761,9 @@ message CreateMachineResponse {
   string agent_upstream_url = 4;
   string agent_upstream_branch = 5;
   string agent_upstream_token = 6;
+  // Agent-backed managed pools return the systemd installer here. The join
+  // token embedded in the command is short-lived and machine-bound.
+  string install_command = 7;
 }
 
 message DeleteMachineRequest {
@@ -712,4 +1872,139 @@ message ExportWorkspaceConfigResponse {
   int32 gateway_grpc_port = 5;
   bool gateway_grpc_tls = 6;
   string workspace_id = 7;
+}
+
+message UpdateAgentAvailabilityRequest {
+  string agent_token = 1;
+  bool schedulable = 2;
+  string reason = 3;
+  // Unix nanoseconds, matching the *_unix_nano convention used elsewhere in
+  // this file (e.g. AgentLogRecord.timestamp_unix_nano).
+  int64 observed_at_unix_nano = 4;
+}
+
+message UpdateAgentAvailabilityResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+// Managed SSH messages live at the end of this file so adding the feature
+// does not renumber every existing generated message implementation.
+message DownloadMachineSSHKeyRequest {
+  string pool_name = 1;
+  string machine_id = 2;
+}
+
+message DownloadMachineSSHKeyResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string private_key = 3;
+  string filename = 4;
+  uint64 generation = 5;
+  string fingerprint = 6;
+  bool activation_required = 7;
+}
+
+message RotateMachineSSHKeyRequest {
+  string pool_name = 1;
+  string machine_id = 2;
+}
+
+message RotateMachineSSHKeyResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  MachineSSHAccess ssh = 3;
+}
+
+message ActivateMachineSSHKeyRequest {
+  string pool_name = 1;
+  string machine_id = 2;
+  uint64 generation = 3;
+}
+
+message ActivateMachineSSHKeyResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  MachineSSHAccess ssh = 3;
+}
+
+message AgentSSHConfig {
+  bool enabled = 1;
+  string username = 2;
+  string public_key = 3;
+  string key_fingerprint = 4;
+  uint64 generation = 5;
+}
+
+message UpdateAgentSSHStatusRequest {
+  string agent_token = 1;
+  uint64 generation = 2;
+  string status = 3;
+  string public_ip = 4;
+  string host_key_fingerprint = 5;
+  string error = 6;
+  uint32 listen_port = 7;
+}
+
+message UpdateAgentSSHStatusResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message MachineSSHAccess {
+  bool supported = 1;
+  string status = 2;
+  string public_ip = 3;
+  string host = 4;
+  uint32 port = 5;
+  string username = 6;
+  uint64 active_generation = 7;
+  uint64 applied_generation = 8;
+  string key_fingerprint = 9;
+  string host_key_fingerprint = 10;
+  bool private_key_available = 11;
+  bool pending_rotation = 12;
+  uint64 pending_generation = 13;
+  string pending_fingerprint = 14;
+  bool pending_key_available = 15;
+  bool pending_key_downloaded = 16;
+  string error = 17;
+  google.protobuf.Timestamp updated_at = 18;
+}
+
+// Host-backed runtime settings for an agent worker. Presence of this message
+// means the managed pool configuration is authoritative; older gateways omit
+// it and agents retain their installer-level state/cache defaults.
+message AgentPoolCacheDiskConfig {
+  bool enabled = 1;
+  string host_path = 2;
+  string mount_path = 3;
+  double max_usage_pct = 4;
+  int64 min_free_bytes = 5;
+}
+
+message AgentPoolCacheConfig {
+  bool enabled = 1;
+  AgentPoolCacheDiskConfig disk = 2;
+}
+
+message AgentPoolRuntimeConfig {
+  bool network_preallocation = 1;
+  bool criu_enabled = 2;
+  string tmp_size_limit = 3;
+  string storage_mode = 4;
+  string storage_path = 5;
+  string images_path = 6;
+  string durable_disks_path = 7;
+  AgentPoolCacheConfig cache = 8;
+  string config_group = 9;
+  bool gpu_virtualized = 10;
+}
+
+message GetAgentPoolVirtualizationRequest { string agent_token = 1; }
+
+message GetAgentPoolVirtualizationResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  bool gpu_virtualized = 3;
 }

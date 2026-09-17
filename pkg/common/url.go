@@ -59,25 +59,44 @@ func BuildPodURL(externalUrl, urlType string, stub *types.StubWithRelated, stubC
 	if urlType == InvokeUrlTypeHost {
 		url = fmt.Sprintf("%s://%s-%s.%s", parsedUrl.Scheme, stub.ExternalId, portPlaceholder, parsedUrl.Host)
 	} else {
-		url = fmt.Sprintf("%s://%s/%s/id/%s/%s", parsedUrl.Scheme, parsedUrl.Host, stub.Type.Kind(), stub.ExternalId, portPlaceholder)
+		routeKind := "id"
+		if !stubConfig.Authorized {
+			routeKind = "public"
+		}
+
+		url = fmt.Sprintf("%s://%s/%s/%s/%s/%s", parsedUrl.Scheme, parsedUrl.Host, stub.Type.Kind(), routeKind, stub.ExternalId, portPlaceholder)
 	}
 
 	return url
 }
 
-func BuildSandboxURL(externalUrl, urlType string, stub *types.StubWithRelated, port int32) string {
+func BuildPodDeploymentURL(externalUrl, urlType string, deployment *types.Deployment, stubConfig *types.StubConfigV1) string {
 	parsedUrl, err := url.Parse(externalUrl)
 	if err != nil {
 		return ""
 	}
 
-	url := ""
-
-	if urlType == InvokeUrlTypeHost {
-		url = fmt.Sprintf("%s://%s-%d.%s", parsedUrl.Scheme, stub.ExternalId, port, parsedUrl.Host)
-	} else {
-		url = fmt.Sprintf("%s://%s/%s/id/%s/%d", parsedUrl.Scheme, parsedUrl.Host, stub.Type.Kind(), stub.ExternalId, port)
+	portPlaceholder := "<PORT>"
+	if len(stubConfig.Ports) == 1 {
+		portPlaceholder = fmt.Sprintf("%d", stubConfig.Ports[0])
 	}
 
-	return url
+	if urlType == InvokeUrlTypeHost {
+		return fmt.Sprintf("%s://%s-latest-%s.%s", parsedUrl.Scheme, deployment.Subdomain, portPlaceholder, parsedUrl.Host)
+	}
+
+	return fmt.Sprintf("%s://%s/pod/%s/latest/%s", parsedUrl.Scheme, parsedUrl.Host, deployment.Name, portPlaceholder)
+}
+
+func BuildSandboxURL(externalUrl, urlType string, stub *types.StubWithRelated, containerId string, port int32) string {
+	parsedUrl, err := url.Parse(externalUrl)
+	if err != nil {
+		return ""
+	}
+
+	if urlType == InvokeUrlTypeHost {
+		return fmt.Sprintf("%s://%s-%d.%s", parsedUrl.Scheme, containerId, port, parsedUrl.Host)
+	}
+
+	return fmt.Sprintf("%s://%s/%s/container/%s/%s/%d", parsedUrl.Scheme, parsedUrl.Host, stub.Type.Kind(), stub.ExternalId, containerId, port)
 }

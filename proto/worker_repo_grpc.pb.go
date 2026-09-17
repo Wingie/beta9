@@ -19,22 +19,50 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	WorkerRepositoryService_GetNextContainerRequest_FullMethodName   = "/WorkerRepositoryService/GetNextContainerRequest"
-	WorkerRepositoryService_SetImagePullLock_FullMethodName          = "/WorkerRepositoryService/SetImagePullLock"
-	WorkerRepositoryService_RemoveImagePullLock_FullMethodName       = "/WorkerRepositoryService/RemoveImagePullLock"
-	WorkerRepositoryService_AddContainerToWorker_FullMethodName      = "/WorkerRepositoryService/AddContainerToWorker"
-	WorkerRepositoryService_RemoveContainerFromWorker_FullMethodName = "/WorkerRepositoryService/RemoveContainerFromWorker"
-	WorkerRepositoryService_GetWorkerById_FullMethodName             = "/WorkerRepositoryService/GetWorkerById"
-	WorkerRepositoryService_ToggleWorkerAvailable_FullMethodName     = "/WorkerRepositoryService/ToggleWorkerAvailable"
-	WorkerRepositoryService_RemoveWorker_FullMethodName              = "/WorkerRepositoryService/RemoveWorker"
-	WorkerRepositoryService_UpdateWorkerCapacity_FullMethodName      = "/WorkerRepositoryService/UpdateWorkerCapacity"
-	WorkerRepositoryService_SetWorkerKeepAlive_FullMethodName        = "/WorkerRepositoryService/SetWorkerKeepAlive"
-	WorkerRepositoryService_SetNetworkLock_FullMethodName            = "/WorkerRepositoryService/SetNetworkLock"
-	WorkerRepositoryService_RemoveNetworkLock_FullMethodName         = "/WorkerRepositoryService/RemoveNetworkLock"
-	WorkerRepositoryService_SetContainerIp_FullMethodName            = "/WorkerRepositoryService/SetContainerIp"
-	WorkerRepositoryService_GetContainerIp_FullMethodName            = "/WorkerRepositoryService/GetContainerIp"
-	WorkerRepositoryService_GetContainerIps_FullMethodName           = "/WorkerRepositoryService/GetContainerIps"
-	WorkerRepositoryService_RemoveContainerIp_FullMethodName         = "/WorkerRepositoryService/RemoveContainerIp"
+	WorkerRepositoryService_GetNextContainerRequest_FullMethodName          = "/WorkerRepositoryService/GetNextContainerRequest"
+	WorkerRepositoryService_PushContainerLifecycleEvents_FullMethodName     = "/WorkerRepositoryService/PushContainerLifecycleEvents"
+	WorkerRepositoryService_StreamWorkerEvents_FullMethodName               = "/WorkerRepositoryService/StreamWorkerEvents"
+	WorkerRepositoryService_SetImagePullLock_FullMethodName                 = "/WorkerRepositoryService/SetImagePullLock"
+	WorkerRepositoryService_RemoveImagePullLock_FullMethodName              = "/WorkerRepositoryService/RemoveImagePullLock"
+	WorkerRepositoryService_AddContainerToWorker_FullMethodName             = "/WorkerRepositoryService/AddContainerToWorker"
+	WorkerRepositoryService_ClaimContainer_FullMethodName                   = "/WorkerRepositoryService/ClaimContainer"
+	WorkerRepositoryService_RemoveContainerFromWorker_FullMethodName        = "/WorkerRepositoryService/RemoveContainerFromWorker"
+	WorkerRepositoryService_GetWorkerById_FullMethodName                    = "/WorkerRepositoryService/GetWorkerById"
+	WorkerRepositoryService_ToggleWorkerAvailable_FullMethodName            = "/WorkerRepositoryService/ToggleWorkerAvailable"
+	WorkerRepositoryService_DisableWorker_FullMethodName                    = "/WorkerRepositoryService/DisableWorker"
+	WorkerRepositoryService_RemoveWorker_FullMethodName                     = "/WorkerRepositoryService/RemoveWorker"
+	WorkerRepositoryService_UpdateWorkerCapacity_FullMethodName             = "/WorkerRepositoryService/UpdateWorkerCapacity"
+	WorkerRepositoryService_SetWorkerKeepAlive_FullMethodName               = "/WorkerRepositoryService/SetWorkerKeepAlive"
+	WorkerRepositoryService_RegisterCacheHost_FullMethodName                = "/WorkerRepositoryService/RegisterCacheHost"
+	WorkerRepositoryService_UnregisterCacheHost_FullMethodName              = "/WorkerRepositoryService/UnregisterCacheHost"
+	WorkerRepositoryService_ListCacheHosts_FullMethodName                   = "/WorkerRepositoryService/ListCacheHosts"
+	WorkerRepositoryService_SetCacheClientLock_FullMethodName               = "/WorkerRepositoryService/SetCacheClientLock"
+	WorkerRepositoryService_RemoveCacheClientLock_FullMethodName            = "/WorkerRepositoryService/RemoveCacheClientLock"
+	WorkerRepositoryService_SetCacheStoreFromContentLock_FullMethodName     = "/WorkerRepositoryService/SetCacheStoreFromContentLock"
+	WorkerRepositoryService_RemoveCacheStoreFromContentLock_FullMethodName  = "/WorkerRepositoryService/RemoveCacheStoreFromContentLock"
+	WorkerRepositoryService_RefreshCacheStoreFromContentLock_FullMethodName = "/WorkerRepositoryService/RefreshCacheStoreFromContentLock"
+	WorkerRepositoryService_AddRecentCacheStub_FullMethodName               = "/WorkerRepositoryService/AddRecentCacheStub"
+	WorkerRepositoryService_ListRecentCacheStubs_FullMethodName             = "/WorkerRepositoryService/ListRecentCacheStubs"
+	WorkerRepositoryService_MarkCacheStubReported_FullMethodName            = "/WorkerRepositoryService/MarkCacheStubReported"
+	WorkerRepositoryService_AcquireCacheReconcileLock_FullMethodName        = "/WorkerRepositoryService/AcquireCacheReconcileLock"
+	WorkerRepositoryService_ReleaseCacheReconcileLock_FullMethodName        = "/WorkerRepositoryService/ReleaseCacheReconcileLock"
+	WorkerRepositoryService_GetCacheOriginCredentials_FullMethodName        = "/WorkerRepositoryService/GetCacheOriginCredentials"
+	WorkerRepositoryService_GetContainerRuntimeCredentials_FullMethodName   = "/WorkerRepositoryService/GetContainerRuntimeCredentials"
+	WorkerRepositoryService_PruneStaleCacheCheckpoints_FullMethodName       = "/WorkerRepositoryService/PruneStaleCacheCheckpoints"
+	WorkerRepositoryService_SetCacheFsNode_FullMethodName                   = "/WorkerRepositoryService/SetCacheFsNode"
+	WorkerRepositoryService_GetCacheFsNode_FullMethodName                   = "/WorkerRepositoryService/GetCacheFsNode"
+	WorkerRepositoryService_AddCacheFsNodeChild_FullMethodName              = "/WorkerRepositoryService/AddCacheFsNodeChild"
+	WorkerRepositoryService_RemoveCacheFsNode_FullMethodName                = "/WorkerRepositoryService/RemoveCacheFsNode"
+	WorkerRepositoryService_RemoveCacheFsNodeChild_FullMethodName           = "/WorkerRepositoryService/RemoveCacheFsNodeChild"
+	WorkerRepositoryService_GetCacheFsNodeChildren_FullMethodName           = "/WorkerRepositoryService/GetCacheFsNodeChildren"
+	WorkerRepositoryService_SetNetworkLock_FullMethodName                   = "/WorkerRepositoryService/SetNetworkLock"
+	WorkerRepositoryService_RemoveNetworkLock_FullMethodName                = "/WorkerRepositoryService/RemoveNetworkLock"
+	WorkerRepositoryService_SetContainerIp_FullMethodName                   = "/WorkerRepositoryService/SetContainerIp"
+	WorkerRepositoryService_MoveContainerIp_FullMethodName                  = "/WorkerRepositoryService/MoveContainerIp"
+	WorkerRepositoryService_GetContainerIp_FullMethodName                   = "/WorkerRepositoryService/GetContainerIp"
+	WorkerRepositoryService_GetContainerIps_FullMethodName                  = "/WorkerRepositoryService/GetContainerIps"
+	WorkerRepositoryService_GetContainerIpAssignments_FullMethodName        = "/WorkerRepositoryService/GetContainerIpAssignments"
+	WorkerRepositoryService_RemoveContainerIp_FullMethodName                = "/WorkerRepositoryService/RemoveContainerIp"
 )
 
 // WorkerRepositoryServiceClient is the client API for WorkerRepositoryService service.
@@ -42,20 +70,50 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type WorkerRepositoryServiceClient interface {
 	GetNextContainerRequest(ctx context.Context, in *GetNextContainerRequestRequest, opts ...grpc.CallOption) (WorkerRepositoryService_GetNextContainerRequestClient, error)
+	PushContainerLifecycleEvents(ctx context.Context, in *PushContainerLifecycleEventsRequest, opts ...grpc.CallOption) (*PushContainerLifecycleEventsResponse, error)
+	StreamWorkerEvents(ctx context.Context, in *StreamWorkerEventsRequest, opts ...grpc.CallOption) (WorkerRepositoryService_StreamWorkerEventsClient, error)
 	SetImagePullLock(ctx context.Context, in *SetImagePullLockRequest, opts ...grpc.CallOption) (*SetImagePullLockResponse, error)
 	RemoveImagePullLock(ctx context.Context, in *RemoveImagePullLockRequest, opts ...grpc.CallOption) (*RemoveImagePullLockResponse, error)
+	// Deprecated: workers claim containers with ClaimContainer. Kept so a
+	// gateway upgrade does not strand workers still running the old binary.
 	AddContainerToWorker(ctx context.Context, in *AddContainerToWorkerRequest, opts ...grpc.CallOption) (*AddContainerToWorkerResponse, error)
+	ClaimContainer(ctx context.Context, in *ClaimContainerRequest, opts ...grpc.CallOption) (*ClaimContainerResponse, error)
 	RemoveContainerFromWorker(ctx context.Context, in *RemoveContainerFromWorkerRequest, opts ...grpc.CallOption) (*RemoveContainerFromWorkerResponse, error)
 	GetWorkerById(ctx context.Context, in *GetWorkerByIdRequest, opts ...grpc.CallOption) (*GetWorkerByIdResponse, error)
 	ToggleWorkerAvailable(ctx context.Context, in *ToggleWorkerAvailableRequest, opts ...grpc.CallOption) (*ToggleWorkerAvailableResponse, error)
+	DisableWorker(ctx context.Context, in *DisableWorkerRequest, opts ...grpc.CallOption) (*DisableWorkerResponse, error)
 	RemoveWorker(ctx context.Context, in *RemoveWorkerRequest, opts ...grpc.CallOption) (*RemoveWorkerResponse, error)
 	UpdateWorkerCapacity(ctx context.Context, in *UpdateWorkerCapacityRequest, opts ...grpc.CallOption) (*UpdateWorkerCapacityResponse, error)
 	SetWorkerKeepAlive(ctx context.Context, in *SetWorkerKeepAliveRequest, opts ...grpc.CallOption) (*SetWorkerKeepAliveResponse, error)
+	RegisterCacheHost(ctx context.Context, in *RegisterCacheHostRequest, opts ...grpc.CallOption) (*RegisterCacheHostResponse, error)
+	UnregisterCacheHost(ctx context.Context, in *UnregisterCacheHostRequest, opts ...grpc.CallOption) (*UnregisterCacheHostResponse, error)
+	ListCacheHosts(ctx context.Context, in *ListCacheHostsRequest, opts ...grpc.CallOption) (*ListCacheHostsResponse, error)
+	SetCacheClientLock(ctx context.Context, in *SetCacheClientLockRequest, opts ...grpc.CallOption) (*SetCacheClientLockResponse, error)
+	RemoveCacheClientLock(ctx context.Context, in *RemoveCacheClientLockRequest, opts ...grpc.CallOption) (*RemoveCacheClientLockResponse, error)
+	SetCacheStoreFromContentLock(ctx context.Context, in *SetCacheStoreFromContentLockRequest, opts ...grpc.CallOption) (*SetCacheStoreFromContentLockResponse, error)
+	RemoveCacheStoreFromContentLock(ctx context.Context, in *RemoveCacheStoreFromContentLockRequest, opts ...grpc.CallOption) (*RemoveCacheStoreFromContentLockResponse, error)
+	RefreshCacheStoreFromContentLock(ctx context.Context, in *RefreshCacheStoreFromContentLockRequest, opts ...grpc.CallOption) (*RefreshCacheStoreFromContentLockResponse, error)
+	AddRecentCacheStub(ctx context.Context, in *AddRecentCacheStubRequest, opts ...grpc.CallOption) (*AddRecentCacheStubResponse, error)
+	ListRecentCacheStubs(ctx context.Context, in *ListRecentCacheStubsRequest, opts ...grpc.CallOption) (*ListRecentCacheStubsResponse, error)
+	MarkCacheStubReported(ctx context.Context, in *MarkCacheStubReportedRequest, opts ...grpc.CallOption) (*MarkCacheStubReportedResponse, error)
+	AcquireCacheReconcileLock(ctx context.Context, in *AcquireCacheReconcileLockRequest, opts ...grpc.CallOption) (*AcquireCacheReconcileLockResponse, error)
+	ReleaseCacheReconcileLock(ctx context.Context, in *ReleaseCacheReconcileLockRequest, opts ...grpc.CallOption) (*ReleaseCacheReconcileLockResponse, error)
+	GetCacheOriginCredentials(ctx context.Context, in *GetCacheOriginCredentialsRequest, opts ...grpc.CallOption) (*GetCacheOriginCredentialsResponse, error)
+	GetContainerRuntimeCredentials(ctx context.Context, in *GetContainerRuntimeCredentialsRequest, opts ...grpc.CallOption) (*GetContainerRuntimeCredentialsResponse, error)
+	PruneStaleCacheCheckpoints(ctx context.Context, in *PruneStaleCacheCheckpointsRequest, opts ...grpc.CallOption) (*PruneStaleCacheCheckpointsResponse, error)
+	SetCacheFsNode(ctx context.Context, in *SetCacheFsNodeRequest, opts ...grpc.CallOption) (*SetCacheFsNodeResponse, error)
+	GetCacheFsNode(ctx context.Context, in *GetCacheFsNodeRequest, opts ...grpc.CallOption) (*GetCacheFsNodeResponse, error)
+	AddCacheFsNodeChild(ctx context.Context, in *AddCacheFsNodeChildRequest, opts ...grpc.CallOption) (*AddCacheFsNodeChildResponse, error)
+	RemoveCacheFsNode(ctx context.Context, in *RemoveCacheFsNodeRequest, opts ...grpc.CallOption) (*RemoveCacheFsNodeResponse, error)
+	RemoveCacheFsNodeChild(ctx context.Context, in *RemoveCacheFsNodeChildRequest, opts ...grpc.CallOption) (*RemoveCacheFsNodeChildResponse, error)
+	GetCacheFsNodeChildren(ctx context.Context, in *GetCacheFsNodeChildrenRequest, opts ...grpc.CallOption) (*GetCacheFsNodeChildrenResponse, error)
 	SetNetworkLock(ctx context.Context, in *SetNetworkLockRequest, opts ...grpc.CallOption) (*SetNetworkLockResponse, error)
 	RemoveNetworkLock(ctx context.Context, in *RemoveNetworkLockRequest, opts ...grpc.CallOption) (*RemoveNetworkLockResponse, error)
 	SetContainerIp(ctx context.Context, in *SetContainerIpRequest, opts ...grpc.CallOption) (*SetContainerIpResponse, error)
+	MoveContainerIp(ctx context.Context, in *MoveContainerIpRequest, opts ...grpc.CallOption) (*MoveContainerIpResponse, error)
 	GetContainerIp(ctx context.Context, in *GetContainerIpRequest, opts ...grpc.CallOption) (*GetContainerIpResponse, error)
 	GetContainerIps(ctx context.Context, in *GetContainerIpsRequest, opts ...grpc.CallOption) (*GetContainerIpsResponse, error)
+	GetContainerIpAssignments(ctx context.Context, in *GetContainerIpAssignmentsRequest, opts ...grpc.CallOption) (*GetContainerIpAssignmentsResponse, error)
 	RemoveContainerIp(ctx context.Context, in *RemoveContainerIpRequest, opts ...grpc.CallOption) (*RemoveContainerIpResponse, error)
 }
 
@@ -99,6 +157,47 @@ func (x *workerRepositoryServiceGetNextContainerRequestClient) Recv() (*GetNextC
 	return m, nil
 }
 
+func (c *workerRepositoryServiceClient) PushContainerLifecycleEvents(ctx context.Context, in *PushContainerLifecycleEventsRequest, opts ...grpc.CallOption) (*PushContainerLifecycleEventsResponse, error) {
+	out := new(PushContainerLifecycleEventsResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_PushContainerLifecycleEvents_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) StreamWorkerEvents(ctx context.Context, in *StreamWorkerEventsRequest, opts ...grpc.CallOption) (WorkerRepositoryService_StreamWorkerEventsClient, error) {
+	stream, err := c.cc.NewStream(ctx, &WorkerRepositoryService_ServiceDesc.Streams[1], WorkerRepositoryService_StreamWorkerEvents_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &workerRepositoryServiceStreamWorkerEventsClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type WorkerRepositoryService_StreamWorkerEventsClient interface {
+	Recv() (*WorkerEvent, error)
+	grpc.ClientStream
+}
+
+type workerRepositoryServiceStreamWorkerEventsClient struct {
+	grpc.ClientStream
+}
+
+func (x *workerRepositoryServiceStreamWorkerEventsClient) Recv() (*WorkerEvent, error) {
+	m := new(WorkerEvent)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func (c *workerRepositoryServiceClient) SetImagePullLock(ctx context.Context, in *SetImagePullLockRequest, opts ...grpc.CallOption) (*SetImagePullLockResponse, error) {
 	out := new(SetImagePullLockResponse)
 	err := c.cc.Invoke(ctx, WorkerRepositoryService_SetImagePullLock_FullMethodName, in, out, opts...)
@@ -120,6 +219,15 @@ func (c *workerRepositoryServiceClient) RemoveImagePullLock(ctx context.Context,
 func (c *workerRepositoryServiceClient) AddContainerToWorker(ctx context.Context, in *AddContainerToWorkerRequest, opts ...grpc.CallOption) (*AddContainerToWorkerResponse, error) {
 	out := new(AddContainerToWorkerResponse)
 	err := c.cc.Invoke(ctx, WorkerRepositoryService_AddContainerToWorker_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) ClaimContainer(ctx context.Context, in *ClaimContainerRequest, opts ...grpc.CallOption) (*ClaimContainerResponse, error) {
+	out := new(ClaimContainerResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_ClaimContainer_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +261,15 @@ func (c *workerRepositoryServiceClient) ToggleWorkerAvailable(ctx context.Contex
 	return out, nil
 }
 
+func (c *workerRepositoryServiceClient) DisableWorker(ctx context.Context, in *DisableWorkerRequest, opts ...grpc.CallOption) (*DisableWorkerResponse, error) {
+	out := new(DisableWorkerResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_DisableWorker_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *workerRepositoryServiceClient) RemoveWorker(ctx context.Context, in *RemoveWorkerRequest, opts ...grpc.CallOption) (*RemoveWorkerResponse, error) {
 	out := new(RemoveWorkerResponse)
 	err := c.cc.Invoke(ctx, WorkerRepositoryService_RemoveWorker_FullMethodName, in, out, opts...)
@@ -174,6 +291,204 @@ func (c *workerRepositoryServiceClient) UpdateWorkerCapacity(ctx context.Context
 func (c *workerRepositoryServiceClient) SetWorkerKeepAlive(ctx context.Context, in *SetWorkerKeepAliveRequest, opts ...grpc.CallOption) (*SetWorkerKeepAliveResponse, error) {
 	out := new(SetWorkerKeepAliveResponse)
 	err := c.cc.Invoke(ctx, WorkerRepositoryService_SetWorkerKeepAlive_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) RegisterCacheHost(ctx context.Context, in *RegisterCacheHostRequest, opts ...grpc.CallOption) (*RegisterCacheHostResponse, error) {
+	out := new(RegisterCacheHostResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_RegisterCacheHost_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) UnregisterCacheHost(ctx context.Context, in *UnregisterCacheHostRequest, opts ...grpc.CallOption) (*UnregisterCacheHostResponse, error) {
+	out := new(UnregisterCacheHostResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_UnregisterCacheHost_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) ListCacheHosts(ctx context.Context, in *ListCacheHostsRequest, opts ...grpc.CallOption) (*ListCacheHostsResponse, error) {
+	out := new(ListCacheHostsResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_ListCacheHosts_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) SetCacheClientLock(ctx context.Context, in *SetCacheClientLockRequest, opts ...grpc.CallOption) (*SetCacheClientLockResponse, error) {
+	out := new(SetCacheClientLockResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_SetCacheClientLock_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) RemoveCacheClientLock(ctx context.Context, in *RemoveCacheClientLockRequest, opts ...grpc.CallOption) (*RemoveCacheClientLockResponse, error) {
+	out := new(RemoveCacheClientLockResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_RemoveCacheClientLock_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) SetCacheStoreFromContentLock(ctx context.Context, in *SetCacheStoreFromContentLockRequest, opts ...grpc.CallOption) (*SetCacheStoreFromContentLockResponse, error) {
+	out := new(SetCacheStoreFromContentLockResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_SetCacheStoreFromContentLock_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) RemoveCacheStoreFromContentLock(ctx context.Context, in *RemoveCacheStoreFromContentLockRequest, opts ...grpc.CallOption) (*RemoveCacheStoreFromContentLockResponse, error) {
+	out := new(RemoveCacheStoreFromContentLockResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_RemoveCacheStoreFromContentLock_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) RefreshCacheStoreFromContentLock(ctx context.Context, in *RefreshCacheStoreFromContentLockRequest, opts ...grpc.CallOption) (*RefreshCacheStoreFromContentLockResponse, error) {
+	out := new(RefreshCacheStoreFromContentLockResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_RefreshCacheStoreFromContentLock_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) AddRecentCacheStub(ctx context.Context, in *AddRecentCacheStubRequest, opts ...grpc.CallOption) (*AddRecentCacheStubResponse, error) {
+	out := new(AddRecentCacheStubResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_AddRecentCacheStub_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) ListRecentCacheStubs(ctx context.Context, in *ListRecentCacheStubsRequest, opts ...grpc.CallOption) (*ListRecentCacheStubsResponse, error) {
+	out := new(ListRecentCacheStubsResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_ListRecentCacheStubs_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) MarkCacheStubReported(ctx context.Context, in *MarkCacheStubReportedRequest, opts ...grpc.CallOption) (*MarkCacheStubReportedResponse, error) {
+	out := new(MarkCacheStubReportedResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_MarkCacheStubReported_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) AcquireCacheReconcileLock(ctx context.Context, in *AcquireCacheReconcileLockRequest, opts ...grpc.CallOption) (*AcquireCacheReconcileLockResponse, error) {
+	out := new(AcquireCacheReconcileLockResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_AcquireCacheReconcileLock_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) ReleaseCacheReconcileLock(ctx context.Context, in *ReleaseCacheReconcileLockRequest, opts ...grpc.CallOption) (*ReleaseCacheReconcileLockResponse, error) {
+	out := new(ReleaseCacheReconcileLockResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_ReleaseCacheReconcileLock_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) GetCacheOriginCredentials(ctx context.Context, in *GetCacheOriginCredentialsRequest, opts ...grpc.CallOption) (*GetCacheOriginCredentialsResponse, error) {
+	out := new(GetCacheOriginCredentialsResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_GetCacheOriginCredentials_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) GetContainerRuntimeCredentials(ctx context.Context, in *GetContainerRuntimeCredentialsRequest, opts ...grpc.CallOption) (*GetContainerRuntimeCredentialsResponse, error) {
+	out := new(GetContainerRuntimeCredentialsResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_GetContainerRuntimeCredentials_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) PruneStaleCacheCheckpoints(ctx context.Context, in *PruneStaleCacheCheckpointsRequest, opts ...grpc.CallOption) (*PruneStaleCacheCheckpointsResponse, error) {
+	out := new(PruneStaleCacheCheckpointsResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_PruneStaleCacheCheckpoints_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) SetCacheFsNode(ctx context.Context, in *SetCacheFsNodeRequest, opts ...grpc.CallOption) (*SetCacheFsNodeResponse, error) {
+	out := new(SetCacheFsNodeResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_SetCacheFsNode_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) GetCacheFsNode(ctx context.Context, in *GetCacheFsNodeRequest, opts ...grpc.CallOption) (*GetCacheFsNodeResponse, error) {
+	out := new(GetCacheFsNodeResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_GetCacheFsNode_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) AddCacheFsNodeChild(ctx context.Context, in *AddCacheFsNodeChildRequest, opts ...grpc.CallOption) (*AddCacheFsNodeChildResponse, error) {
+	out := new(AddCacheFsNodeChildResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_AddCacheFsNodeChild_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) RemoveCacheFsNode(ctx context.Context, in *RemoveCacheFsNodeRequest, opts ...grpc.CallOption) (*RemoveCacheFsNodeResponse, error) {
+	out := new(RemoveCacheFsNodeResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_RemoveCacheFsNode_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) RemoveCacheFsNodeChild(ctx context.Context, in *RemoveCacheFsNodeChildRequest, opts ...grpc.CallOption) (*RemoveCacheFsNodeChildResponse, error) {
+	out := new(RemoveCacheFsNodeChildResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_RemoveCacheFsNodeChild_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) GetCacheFsNodeChildren(ctx context.Context, in *GetCacheFsNodeChildrenRequest, opts ...grpc.CallOption) (*GetCacheFsNodeChildrenResponse, error) {
+	out := new(GetCacheFsNodeChildrenResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_GetCacheFsNodeChildren_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +522,15 @@ func (c *workerRepositoryServiceClient) SetContainerIp(ctx context.Context, in *
 	return out, nil
 }
 
+func (c *workerRepositoryServiceClient) MoveContainerIp(ctx context.Context, in *MoveContainerIpRequest, opts ...grpc.CallOption) (*MoveContainerIpResponse, error) {
+	out := new(MoveContainerIpResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_MoveContainerIp_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *workerRepositoryServiceClient) GetContainerIp(ctx context.Context, in *GetContainerIpRequest, opts ...grpc.CallOption) (*GetContainerIpResponse, error) {
 	out := new(GetContainerIpResponse)
 	err := c.cc.Invoke(ctx, WorkerRepositoryService_GetContainerIp_FullMethodName, in, out, opts...)
@@ -219,6 +543,15 @@ func (c *workerRepositoryServiceClient) GetContainerIp(ctx context.Context, in *
 func (c *workerRepositoryServiceClient) GetContainerIps(ctx context.Context, in *GetContainerIpsRequest, opts ...grpc.CallOption) (*GetContainerIpsResponse, error) {
 	out := new(GetContainerIpsResponse)
 	err := c.cc.Invoke(ctx, WorkerRepositoryService_GetContainerIps_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerRepositoryServiceClient) GetContainerIpAssignments(ctx context.Context, in *GetContainerIpAssignmentsRequest, opts ...grpc.CallOption) (*GetContainerIpAssignmentsResponse, error) {
+	out := new(GetContainerIpAssignmentsResponse)
+	err := c.cc.Invoke(ctx, WorkerRepositoryService_GetContainerIpAssignments_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -239,20 +572,50 @@ func (c *workerRepositoryServiceClient) RemoveContainerIp(ctx context.Context, i
 // for forward compatibility
 type WorkerRepositoryServiceServer interface {
 	GetNextContainerRequest(*GetNextContainerRequestRequest, WorkerRepositoryService_GetNextContainerRequestServer) error
+	PushContainerLifecycleEvents(context.Context, *PushContainerLifecycleEventsRequest) (*PushContainerLifecycleEventsResponse, error)
+	StreamWorkerEvents(*StreamWorkerEventsRequest, WorkerRepositoryService_StreamWorkerEventsServer) error
 	SetImagePullLock(context.Context, *SetImagePullLockRequest) (*SetImagePullLockResponse, error)
 	RemoveImagePullLock(context.Context, *RemoveImagePullLockRequest) (*RemoveImagePullLockResponse, error)
+	// Deprecated: workers claim containers with ClaimContainer. Kept so a
+	// gateway upgrade does not strand workers still running the old binary.
 	AddContainerToWorker(context.Context, *AddContainerToWorkerRequest) (*AddContainerToWorkerResponse, error)
+	ClaimContainer(context.Context, *ClaimContainerRequest) (*ClaimContainerResponse, error)
 	RemoveContainerFromWorker(context.Context, *RemoveContainerFromWorkerRequest) (*RemoveContainerFromWorkerResponse, error)
 	GetWorkerById(context.Context, *GetWorkerByIdRequest) (*GetWorkerByIdResponse, error)
 	ToggleWorkerAvailable(context.Context, *ToggleWorkerAvailableRequest) (*ToggleWorkerAvailableResponse, error)
+	DisableWorker(context.Context, *DisableWorkerRequest) (*DisableWorkerResponse, error)
 	RemoveWorker(context.Context, *RemoveWorkerRequest) (*RemoveWorkerResponse, error)
 	UpdateWorkerCapacity(context.Context, *UpdateWorkerCapacityRequest) (*UpdateWorkerCapacityResponse, error)
 	SetWorkerKeepAlive(context.Context, *SetWorkerKeepAliveRequest) (*SetWorkerKeepAliveResponse, error)
+	RegisterCacheHost(context.Context, *RegisterCacheHostRequest) (*RegisterCacheHostResponse, error)
+	UnregisterCacheHost(context.Context, *UnregisterCacheHostRequest) (*UnregisterCacheHostResponse, error)
+	ListCacheHosts(context.Context, *ListCacheHostsRequest) (*ListCacheHostsResponse, error)
+	SetCacheClientLock(context.Context, *SetCacheClientLockRequest) (*SetCacheClientLockResponse, error)
+	RemoveCacheClientLock(context.Context, *RemoveCacheClientLockRequest) (*RemoveCacheClientLockResponse, error)
+	SetCacheStoreFromContentLock(context.Context, *SetCacheStoreFromContentLockRequest) (*SetCacheStoreFromContentLockResponse, error)
+	RemoveCacheStoreFromContentLock(context.Context, *RemoveCacheStoreFromContentLockRequest) (*RemoveCacheStoreFromContentLockResponse, error)
+	RefreshCacheStoreFromContentLock(context.Context, *RefreshCacheStoreFromContentLockRequest) (*RefreshCacheStoreFromContentLockResponse, error)
+	AddRecentCacheStub(context.Context, *AddRecentCacheStubRequest) (*AddRecentCacheStubResponse, error)
+	ListRecentCacheStubs(context.Context, *ListRecentCacheStubsRequest) (*ListRecentCacheStubsResponse, error)
+	MarkCacheStubReported(context.Context, *MarkCacheStubReportedRequest) (*MarkCacheStubReportedResponse, error)
+	AcquireCacheReconcileLock(context.Context, *AcquireCacheReconcileLockRequest) (*AcquireCacheReconcileLockResponse, error)
+	ReleaseCacheReconcileLock(context.Context, *ReleaseCacheReconcileLockRequest) (*ReleaseCacheReconcileLockResponse, error)
+	GetCacheOriginCredentials(context.Context, *GetCacheOriginCredentialsRequest) (*GetCacheOriginCredentialsResponse, error)
+	GetContainerRuntimeCredentials(context.Context, *GetContainerRuntimeCredentialsRequest) (*GetContainerRuntimeCredentialsResponse, error)
+	PruneStaleCacheCheckpoints(context.Context, *PruneStaleCacheCheckpointsRequest) (*PruneStaleCacheCheckpointsResponse, error)
+	SetCacheFsNode(context.Context, *SetCacheFsNodeRequest) (*SetCacheFsNodeResponse, error)
+	GetCacheFsNode(context.Context, *GetCacheFsNodeRequest) (*GetCacheFsNodeResponse, error)
+	AddCacheFsNodeChild(context.Context, *AddCacheFsNodeChildRequest) (*AddCacheFsNodeChildResponse, error)
+	RemoveCacheFsNode(context.Context, *RemoveCacheFsNodeRequest) (*RemoveCacheFsNodeResponse, error)
+	RemoveCacheFsNodeChild(context.Context, *RemoveCacheFsNodeChildRequest) (*RemoveCacheFsNodeChildResponse, error)
+	GetCacheFsNodeChildren(context.Context, *GetCacheFsNodeChildrenRequest) (*GetCacheFsNodeChildrenResponse, error)
 	SetNetworkLock(context.Context, *SetNetworkLockRequest) (*SetNetworkLockResponse, error)
 	RemoveNetworkLock(context.Context, *RemoveNetworkLockRequest) (*RemoveNetworkLockResponse, error)
 	SetContainerIp(context.Context, *SetContainerIpRequest) (*SetContainerIpResponse, error)
+	MoveContainerIp(context.Context, *MoveContainerIpRequest) (*MoveContainerIpResponse, error)
 	GetContainerIp(context.Context, *GetContainerIpRequest) (*GetContainerIpResponse, error)
 	GetContainerIps(context.Context, *GetContainerIpsRequest) (*GetContainerIpsResponse, error)
+	GetContainerIpAssignments(context.Context, *GetContainerIpAssignmentsRequest) (*GetContainerIpAssignmentsResponse, error)
 	RemoveContainerIp(context.Context, *RemoveContainerIpRequest) (*RemoveContainerIpResponse, error)
 	mustEmbedUnimplementedWorkerRepositoryServiceServer()
 }
@@ -264,6 +627,12 @@ type UnimplementedWorkerRepositoryServiceServer struct {
 func (UnimplementedWorkerRepositoryServiceServer) GetNextContainerRequest(*GetNextContainerRequestRequest, WorkerRepositoryService_GetNextContainerRequestServer) error {
 	return status.Errorf(codes.Unimplemented, "method GetNextContainerRequest not implemented")
 }
+func (UnimplementedWorkerRepositoryServiceServer) PushContainerLifecycleEvents(context.Context, *PushContainerLifecycleEventsRequest) (*PushContainerLifecycleEventsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PushContainerLifecycleEvents not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) StreamWorkerEvents(*StreamWorkerEventsRequest, WorkerRepositoryService_StreamWorkerEventsServer) error {
+	return status.Errorf(codes.Unimplemented, "method StreamWorkerEvents not implemented")
+}
 func (UnimplementedWorkerRepositoryServiceServer) SetImagePullLock(context.Context, *SetImagePullLockRequest) (*SetImagePullLockResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetImagePullLock not implemented")
 }
@@ -272,6 +641,9 @@ func (UnimplementedWorkerRepositoryServiceServer) RemoveImagePullLock(context.Co
 }
 func (UnimplementedWorkerRepositoryServiceServer) AddContainerToWorker(context.Context, *AddContainerToWorkerRequest) (*AddContainerToWorkerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AddContainerToWorker not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) ClaimContainer(context.Context, *ClaimContainerRequest) (*ClaimContainerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ClaimContainer not implemented")
 }
 func (UnimplementedWorkerRepositoryServiceServer) RemoveContainerFromWorker(context.Context, *RemoveContainerFromWorkerRequest) (*RemoveContainerFromWorkerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RemoveContainerFromWorker not implemented")
@@ -282,6 +654,9 @@ func (UnimplementedWorkerRepositoryServiceServer) GetWorkerById(context.Context,
 func (UnimplementedWorkerRepositoryServiceServer) ToggleWorkerAvailable(context.Context, *ToggleWorkerAvailableRequest) (*ToggleWorkerAvailableResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ToggleWorkerAvailable not implemented")
 }
+func (UnimplementedWorkerRepositoryServiceServer) DisableWorker(context.Context, *DisableWorkerRequest) (*DisableWorkerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DisableWorker not implemented")
+}
 func (UnimplementedWorkerRepositoryServiceServer) RemoveWorker(context.Context, *RemoveWorkerRequest) (*RemoveWorkerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RemoveWorker not implemented")
 }
@@ -290,6 +665,72 @@ func (UnimplementedWorkerRepositoryServiceServer) UpdateWorkerCapacity(context.C
 }
 func (UnimplementedWorkerRepositoryServiceServer) SetWorkerKeepAlive(context.Context, *SetWorkerKeepAliveRequest) (*SetWorkerKeepAliveResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetWorkerKeepAlive not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) RegisterCacheHost(context.Context, *RegisterCacheHostRequest) (*RegisterCacheHostResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RegisterCacheHost not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) UnregisterCacheHost(context.Context, *UnregisterCacheHostRequest) (*UnregisterCacheHostResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UnregisterCacheHost not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) ListCacheHosts(context.Context, *ListCacheHostsRequest) (*ListCacheHostsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListCacheHosts not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) SetCacheClientLock(context.Context, *SetCacheClientLockRequest) (*SetCacheClientLockResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetCacheClientLock not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) RemoveCacheClientLock(context.Context, *RemoveCacheClientLockRequest) (*RemoveCacheClientLockResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveCacheClientLock not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) SetCacheStoreFromContentLock(context.Context, *SetCacheStoreFromContentLockRequest) (*SetCacheStoreFromContentLockResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetCacheStoreFromContentLock not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) RemoveCacheStoreFromContentLock(context.Context, *RemoveCacheStoreFromContentLockRequest) (*RemoveCacheStoreFromContentLockResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveCacheStoreFromContentLock not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) RefreshCacheStoreFromContentLock(context.Context, *RefreshCacheStoreFromContentLockRequest) (*RefreshCacheStoreFromContentLockResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RefreshCacheStoreFromContentLock not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) AddRecentCacheStub(context.Context, *AddRecentCacheStubRequest) (*AddRecentCacheStubResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddRecentCacheStub not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) ListRecentCacheStubs(context.Context, *ListRecentCacheStubsRequest) (*ListRecentCacheStubsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListRecentCacheStubs not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) MarkCacheStubReported(context.Context, *MarkCacheStubReportedRequest) (*MarkCacheStubReportedResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method MarkCacheStubReported not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) AcquireCacheReconcileLock(context.Context, *AcquireCacheReconcileLockRequest) (*AcquireCacheReconcileLockResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AcquireCacheReconcileLock not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) ReleaseCacheReconcileLock(context.Context, *ReleaseCacheReconcileLockRequest) (*ReleaseCacheReconcileLockResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReleaseCacheReconcileLock not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) GetCacheOriginCredentials(context.Context, *GetCacheOriginCredentialsRequest) (*GetCacheOriginCredentialsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetCacheOriginCredentials not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) GetContainerRuntimeCredentials(context.Context, *GetContainerRuntimeCredentialsRequest) (*GetContainerRuntimeCredentialsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetContainerRuntimeCredentials not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) PruneStaleCacheCheckpoints(context.Context, *PruneStaleCacheCheckpointsRequest) (*PruneStaleCacheCheckpointsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PruneStaleCacheCheckpoints not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) SetCacheFsNode(context.Context, *SetCacheFsNodeRequest) (*SetCacheFsNodeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetCacheFsNode not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) GetCacheFsNode(context.Context, *GetCacheFsNodeRequest) (*GetCacheFsNodeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetCacheFsNode not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) AddCacheFsNodeChild(context.Context, *AddCacheFsNodeChildRequest) (*AddCacheFsNodeChildResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddCacheFsNodeChild not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) RemoveCacheFsNode(context.Context, *RemoveCacheFsNodeRequest) (*RemoveCacheFsNodeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveCacheFsNode not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) RemoveCacheFsNodeChild(context.Context, *RemoveCacheFsNodeChildRequest) (*RemoveCacheFsNodeChildResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveCacheFsNodeChild not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) GetCacheFsNodeChildren(context.Context, *GetCacheFsNodeChildrenRequest) (*GetCacheFsNodeChildrenResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetCacheFsNodeChildren not implemented")
 }
 func (UnimplementedWorkerRepositoryServiceServer) SetNetworkLock(context.Context, *SetNetworkLockRequest) (*SetNetworkLockResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetNetworkLock not implemented")
@@ -300,11 +741,17 @@ func (UnimplementedWorkerRepositoryServiceServer) RemoveNetworkLock(context.Cont
 func (UnimplementedWorkerRepositoryServiceServer) SetContainerIp(context.Context, *SetContainerIpRequest) (*SetContainerIpResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetContainerIp not implemented")
 }
+func (UnimplementedWorkerRepositoryServiceServer) MoveContainerIp(context.Context, *MoveContainerIpRequest) (*MoveContainerIpResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method MoveContainerIp not implemented")
+}
 func (UnimplementedWorkerRepositoryServiceServer) GetContainerIp(context.Context, *GetContainerIpRequest) (*GetContainerIpResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetContainerIp not implemented")
 }
 func (UnimplementedWorkerRepositoryServiceServer) GetContainerIps(context.Context, *GetContainerIpsRequest) (*GetContainerIpsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetContainerIps not implemented")
+}
+func (UnimplementedWorkerRepositoryServiceServer) GetContainerIpAssignments(context.Context, *GetContainerIpAssignmentsRequest) (*GetContainerIpAssignmentsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetContainerIpAssignments not implemented")
 }
 func (UnimplementedWorkerRepositoryServiceServer) RemoveContainerIp(context.Context, *RemoveContainerIpRequest) (*RemoveContainerIpResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RemoveContainerIp not implemented")
@@ -341,6 +788,45 @@ type workerRepositoryServiceGetNextContainerRequestServer struct {
 }
 
 func (x *workerRepositoryServiceGetNextContainerRequestServer) Send(m *GetNextContainerRequestResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func _WorkerRepositoryService_PushContainerLifecycleEvents_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PushContainerLifecycleEventsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).PushContainerLifecycleEvents(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_PushContainerLifecycleEvents_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).PushContainerLifecycleEvents(ctx, req.(*PushContainerLifecycleEventsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_StreamWorkerEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamWorkerEventsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(WorkerRepositoryServiceServer).StreamWorkerEvents(m, &workerRepositoryServiceStreamWorkerEventsServer{stream})
+}
+
+type WorkerRepositoryService_StreamWorkerEventsServer interface {
+	Send(*WorkerEvent) error
+	grpc.ServerStream
+}
+
+type workerRepositoryServiceStreamWorkerEventsServer struct {
+	grpc.ServerStream
+}
+
+func (x *workerRepositoryServiceStreamWorkerEventsServer) Send(m *WorkerEvent) error {
 	return x.ServerStream.SendMsg(m)
 }
 
@@ -394,6 +880,24 @@ func _WorkerRepositoryService_AddContainerToWorker_Handler(srv interface{}, ctx 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(WorkerRepositoryServiceServer).AddContainerToWorker(ctx, req.(*AddContainerToWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_ClaimContainer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClaimContainerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).ClaimContainer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_ClaimContainer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).ClaimContainer(ctx, req.(*ClaimContainerRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -452,6 +956,24 @@ func _WorkerRepositoryService_ToggleWorkerAvailable_Handler(srv interface{}, ctx
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WorkerRepositoryService_DisableWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisableWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).DisableWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_DisableWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).DisableWorker(ctx, req.(*DisableWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _WorkerRepositoryService_RemoveWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RemoveWorkerRequest)
 	if err := dec(in); err != nil {
@@ -502,6 +1024,402 @@ func _WorkerRepositoryService_SetWorkerKeepAlive_Handler(srv interface{}, ctx co
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(WorkerRepositoryServiceServer).SetWorkerKeepAlive(ctx, req.(*SetWorkerKeepAliveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_RegisterCacheHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterCacheHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).RegisterCacheHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_RegisterCacheHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).RegisterCacheHost(ctx, req.(*RegisterCacheHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_UnregisterCacheHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnregisterCacheHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).UnregisterCacheHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_UnregisterCacheHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).UnregisterCacheHost(ctx, req.(*UnregisterCacheHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_ListCacheHosts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListCacheHostsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).ListCacheHosts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_ListCacheHosts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).ListCacheHosts(ctx, req.(*ListCacheHostsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_SetCacheClientLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetCacheClientLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).SetCacheClientLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_SetCacheClientLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).SetCacheClientLock(ctx, req.(*SetCacheClientLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_RemoveCacheClientLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveCacheClientLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).RemoveCacheClientLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_RemoveCacheClientLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).RemoveCacheClientLock(ctx, req.(*RemoveCacheClientLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_SetCacheStoreFromContentLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetCacheStoreFromContentLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).SetCacheStoreFromContentLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_SetCacheStoreFromContentLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).SetCacheStoreFromContentLock(ctx, req.(*SetCacheStoreFromContentLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_RemoveCacheStoreFromContentLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveCacheStoreFromContentLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).RemoveCacheStoreFromContentLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_RemoveCacheStoreFromContentLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).RemoveCacheStoreFromContentLock(ctx, req.(*RemoveCacheStoreFromContentLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_RefreshCacheStoreFromContentLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RefreshCacheStoreFromContentLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).RefreshCacheStoreFromContentLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_RefreshCacheStoreFromContentLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).RefreshCacheStoreFromContentLock(ctx, req.(*RefreshCacheStoreFromContentLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_AddRecentCacheStub_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddRecentCacheStubRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).AddRecentCacheStub(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_AddRecentCacheStub_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).AddRecentCacheStub(ctx, req.(*AddRecentCacheStubRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_ListRecentCacheStubs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListRecentCacheStubsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).ListRecentCacheStubs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_ListRecentCacheStubs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).ListRecentCacheStubs(ctx, req.(*ListRecentCacheStubsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_MarkCacheStubReported_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MarkCacheStubReportedRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).MarkCacheStubReported(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_MarkCacheStubReported_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).MarkCacheStubReported(ctx, req.(*MarkCacheStubReportedRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_AcquireCacheReconcileLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcquireCacheReconcileLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).AcquireCacheReconcileLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_AcquireCacheReconcileLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).AcquireCacheReconcileLock(ctx, req.(*AcquireCacheReconcileLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_ReleaseCacheReconcileLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseCacheReconcileLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).ReleaseCacheReconcileLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_ReleaseCacheReconcileLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).ReleaseCacheReconcileLock(ctx, req.(*ReleaseCacheReconcileLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_GetCacheOriginCredentials_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCacheOriginCredentialsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).GetCacheOriginCredentials(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_GetCacheOriginCredentials_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).GetCacheOriginCredentials(ctx, req.(*GetCacheOriginCredentialsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_GetContainerRuntimeCredentials_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetContainerRuntimeCredentialsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).GetContainerRuntimeCredentials(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_GetContainerRuntimeCredentials_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).GetContainerRuntimeCredentials(ctx, req.(*GetContainerRuntimeCredentialsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_PruneStaleCacheCheckpoints_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneStaleCacheCheckpointsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).PruneStaleCacheCheckpoints(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_PruneStaleCacheCheckpoints_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).PruneStaleCacheCheckpoints(ctx, req.(*PruneStaleCacheCheckpointsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_SetCacheFsNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetCacheFsNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).SetCacheFsNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_SetCacheFsNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).SetCacheFsNode(ctx, req.(*SetCacheFsNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_GetCacheFsNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCacheFsNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).GetCacheFsNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_GetCacheFsNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).GetCacheFsNode(ctx, req.(*GetCacheFsNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_AddCacheFsNodeChild_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddCacheFsNodeChildRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).AddCacheFsNodeChild(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_AddCacheFsNodeChild_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).AddCacheFsNodeChild(ctx, req.(*AddCacheFsNodeChildRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_RemoveCacheFsNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveCacheFsNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).RemoveCacheFsNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_RemoveCacheFsNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).RemoveCacheFsNode(ctx, req.(*RemoveCacheFsNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_RemoveCacheFsNodeChild_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveCacheFsNodeChildRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).RemoveCacheFsNodeChild(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_RemoveCacheFsNodeChild_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).RemoveCacheFsNodeChild(ctx, req.(*RemoveCacheFsNodeChildRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerRepositoryService_GetCacheFsNodeChildren_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCacheFsNodeChildrenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).GetCacheFsNodeChildren(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_GetCacheFsNodeChildren_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).GetCacheFsNodeChildren(ctx, req.(*GetCacheFsNodeChildrenRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -560,6 +1478,24 @@ func _WorkerRepositoryService_SetContainerIp_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WorkerRepositoryService_MoveContainerIp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MoveContainerIpRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).MoveContainerIp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_MoveContainerIp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).MoveContainerIp(ctx, req.(*MoveContainerIpRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _WorkerRepositoryService_GetContainerIp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetContainerIpRequest)
 	if err := dec(in); err != nil {
@@ -596,6 +1532,24 @@ func _WorkerRepositoryService_GetContainerIps_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WorkerRepositoryService_GetContainerIpAssignments_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetContainerIpAssignmentsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerRepositoryServiceServer).GetContainerIpAssignments(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerRepositoryService_GetContainerIpAssignments_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerRepositoryServiceServer).GetContainerIpAssignments(ctx, req.(*GetContainerIpAssignmentsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _WorkerRepositoryService_RemoveContainerIp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RemoveContainerIpRequest)
 	if err := dec(in); err != nil {
@@ -622,6 +1576,10 @@ var WorkerRepositoryService_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*WorkerRepositoryServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
+			MethodName: "PushContainerLifecycleEvents",
+			Handler:    _WorkerRepositoryService_PushContainerLifecycleEvents_Handler,
+		},
+		{
 			MethodName: "SetImagePullLock",
 			Handler:    _WorkerRepositoryService_SetImagePullLock_Handler,
 		},
@@ -632,6 +1590,10 @@ var WorkerRepositoryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AddContainerToWorker",
 			Handler:    _WorkerRepositoryService_AddContainerToWorker_Handler,
+		},
+		{
+			MethodName: "ClaimContainer",
+			Handler:    _WorkerRepositoryService_ClaimContainer_Handler,
 		},
 		{
 			MethodName: "RemoveContainerFromWorker",
@@ -646,6 +1608,10 @@ var WorkerRepositoryService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _WorkerRepositoryService_ToggleWorkerAvailable_Handler,
 		},
 		{
+			MethodName: "DisableWorker",
+			Handler:    _WorkerRepositoryService_DisableWorker_Handler,
+		},
+		{
 			MethodName: "RemoveWorker",
 			Handler:    _WorkerRepositoryService_RemoveWorker_Handler,
 		},
@@ -656,6 +1622,94 @@ var WorkerRepositoryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetWorkerKeepAlive",
 			Handler:    _WorkerRepositoryService_SetWorkerKeepAlive_Handler,
+		},
+		{
+			MethodName: "RegisterCacheHost",
+			Handler:    _WorkerRepositoryService_RegisterCacheHost_Handler,
+		},
+		{
+			MethodName: "UnregisterCacheHost",
+			Handler:    _WorkerRepositoryService_UnregisterCacheHost_Handler,
+		},
+		{
+			MethodName: "ListCacheHosts",
+			Handler:    _WorkerRepositoryService_ListCacheHosts_Handler,
+		},
+		{
+			MethodName: "SetCacheClientLock",
+			Handler:    _WorkerRepositoryService_SetCacheClientLock_Handler,
+		},
+		{
+			MethodName: "RemoveCacheClientLock",
+			Handler:    _WorkerRepositoryService_RemoveCacheClientLock_Handler,
+		},
+		{
+			MethodName: "SetCacheStoreFromContentLock",
+			Handler:    _WorkerRepositoryService_SetCacheStoreFromContentLock_Handler,
+		},
+		{
+			MethodName: "RemoveCacheStoreFromContentLock",
+			Handler:    _WorkerRepositoryService_RemoveCacheStoreFromContentLock_Handler,
+		},
+		{
+			MethodName: "RefreshCacheStoreFromContentLock",
+			Handler:    _WorkerRepositoryService_RefreshCacheStoreFromContentLock_Handler,
+		},
+		{
+			MethodName: "AddRecentCacheStub",
+			Handler:    _WorkerRepositoryService_AddRecentCacheStub_Handler,
+		},
+		{
+			MethodName: "ListRecentCacheStubs",
+			Handler:    _WorkerRepositoryService_ListRecentCacheStubs_Handler,
+		},
+		{
+			MethodName: "MarkCacheStubReported",
+			Handler:    _WorkerRepositoryService_MarkCacheStubReported_Handler,
+		},
+		{
+			MethodName: "AcquireCacheReconcileLock",
+			Handler:    _WorkerRepositoryService_AcquireCacheReconcileLock_Handler,
+		},
+		{
+			MethodName: "ReleaseCacheReconcileLock",
+			Handler:    _WorkerRepositoryService_ReleaseCacheReconcileLock_Handler,
+		},
+		{
+			MethodName: "GetCacheOriginCredentials",
+			Handler:    _WorkerRepositoryService_GetCacheOriginCredentials_Handler,
+		},
+		{
+			MethodName: "GetContainerRuntimeCredentials",
+			Handler:    _WorkerRepositoryService_GetContainerRuntimeCredentials_Handler,
+		},
+		{
+			MethodName: "PruneStaleCacheCheckpoints",
+			Handler:    _WorkerRepositoryService_PruneStaleCacheCheckpoints_Handler,
+		},
+		{
+			MethodName: "SetCacheFsNode",
+			Handler:    _WorkerRepositoryService_SetCacheFsNode_Handler,
+		},
+		{
+			MethodName: "GetCacheFsNode",
+			Handler:    _WorkerRepositoryService_GetCacheFsNode_Handler,
+		},
+		{
+			MethodName: "AddCacheFsNodeChild",
+			Handler:    _WorkerRepositoryService_AddCacheFsNodeChild_Handler,
+		},
+		{
+			MethodName: "RemoveCacheFsNode",
+			Handler:    _WorkerRepositoryService_RemoveCacheFsNode_Handler,
+		},
+		{
+			MethodName: "RemoveCacheFsNodeChild",
+			Handler:    _WorkerRepositoryService_RemoveCacheFsNodeChild_Handler,
+		},
+		{
+			MethodName: "GetCacheFsNodeChildren",
+			Handler:    _WorkerRepositoryService_GetCacheFsNodeChildren_Handler,
 		},
 		{
 			MethodName: "SetNetworkLock",
@@ -670,12 +1724,20 @@ var WorkerRepositoryService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _WorkerRepositoryService_SetContainerIp_Handler,
 		},
 		{
+			MethodName: "MoveContainerIp",
+			Handler:    _WorkerRepositoryService_MoveContainerIp_Handler,
+		},
+		{
 			MethodName: "GetContainerIp",
 			Handler:    _WorkerRepositoryService_GetContainerIp_Handler,
 		},
 		{
 			MethodName: "GetContainerIps",
 			Handler:    _WorkerRepositoryService_GetContainerIps_Handler,
+		},
+		{
+			MethodName: "GetContainerIpAssignments",
+			Handler:    _WorkerRepositoryService_GetContainerIpAssignments_Handler,
 		},
 		{
 			MethodName: "RemoveContainerIp",
@@ -686,6 +1748,11 @@ var WorkerRepositoryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "GetNextContainerRequest",
 			Handler:       _WorkerRepositoryService_GetNextContainerRequest_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamWorkerEvents",
+			Handler:       _WorkerRepositoryService_StreamWorkerEvents_Handler,
 			ServerStreams: true,
 		},
 	},

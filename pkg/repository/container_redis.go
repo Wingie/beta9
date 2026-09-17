@@ -3,19 +3,171 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/metrics"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/beam-cloud/redislock"
 	redis "github.com/redis/go-redis/v9"
 )
 
+const (
+	containerStateLockTTL      = 10
+	containerStateLockRetries  = 20
+	containerStateLockInterval = 50 * time.Millisecond
+)
+
+var containerStateLockOptions = common.RedisLockOptions{
+	TtlS:          containerStateLockTTL,
+	Retries:       containerStateLockRetries,
+	RetryInterval: containerStateLockInterval,
+}
+
+const (
+	concurrencyCounterInitialized      = "1"
+	concurrencyCounterRepairing        = "repairing"
+	concurrencyReservationOK           = "ok"
+	concurrencyReservationRepairing    = "repairing"
+	concurrencyReservationGPUExceeded  = "gpu"
+	concurrencyReservationCPUExceeded  = "cpu"
+	concurrencyCounterInitTimeout      = 15 * time.Second
+	concurrencyCounterInitPollInterval = 100 * time.Millisecond
+	concurrencyCounterRepairInterval   = 5 * time.Second
+	concurrencyReservationInFlightTTL  = 2 * time.Minute
+	workerAddressWaitTimeout           = 5 * time.Minute
+	workerAddressPollInterval          = 25 * time.Millisecond
+)
+
+var errConcurrencyCounterRepairing = errors.New("concurrency counter repair in progress")
+
+// Opening worker routes are republished for every container startup. Once the
+// agent has made an identical shared route ready, those registrations must not
+// demote it or erase its proxy target. WorkspaceID is deliberately not part of
+// the target identity because marketplace workers can serve buyer workspaces.
+var setOpeningWorkerBackendRouteScript = redis.NewScript(`
+local incoming = cjson.decode(ARGV[1])
+local current = redis.call("GET", KEYS[1])
+
+if current ~= false then
+	local decoded, existing = pcall(cjson.decode, current)
+	if decoded and
+		existing.state == ARGV[2] and
+		existing.proxy_target and
+		existing.proxy_target ~= "" and
+		existing.route_id == incoming.route_id and
+		existing.pool_name == incoming.pool_name and
+		existing.machine_id == incoming.machine_id and
+		existing.worker_id == incoming.worker_id and
+		existing.container_id == incoming.container_id and
+		existing.kind == incoming.kind and
+		existing.port == incoming.port and
+		existing.protocol == incoming.protocol and
+		existing.transport == incoming.transport and
+		existing.local_target == incoming.local_target then
+		return 0
+	end
+end
+
+redis.call("SET", KEYS[1], ARGV[1])
+return 1
+`)
+
+// Workspace concurrency accounting must stay O(1) during bursts. The old
+// implementation scanned every active container while holding a workspace lock
+// for each request. Instead, the first quota-bearing request rebuilds an
+// aggregate counter from active container state, and each subsequent request
+// atomically creates one reservation record while incrementing the aggregate.
+var reserveConcurrencyReservationScript = redis.NewScript(`
+local used_gpu = tonumber(redis.call("HGET", KEYS[1], "gpu_count") or "0")
+local used_cpu = tonumber(redis.call("HGET", KEYS[1], "cpu") or "0")
+local gpu_limit = tonumber(ARGV[1])
+local cpu_limit = tonumber(ARGV[2])
+local request_gpu = tonumber(ARGV[3])
+local request_cpu = tonumber(ARGV[4])
+
+if redis.call("EXISTS", KEYS[2]) == 1 then
+	redis.call("SADD", KEYS[3], ARGV[6])
+	return "ok"
+end
+
+if redis.call("HGET", KEYS[1], "initialized") ~= "1" then
+	return "repairing"
+end
+
+if used_gpu + request_gpu > gpu_limit then
+	return "gpu"
+end
+
+if used_cpu + request_cpu > cpu_limit then
+	return "cpu"
+end
+
+redis.call("HINCRBY", KEYS[1], "gpu_count", request_gpu)
+redis.call("HINCRBY", KEYS[1], "cpu", request_cpu)
+redis.call("HSET", KEYS[1], "initialized", "1", "updated_at", ARGV[7])
+redis.call("HSET", KEYS[2],
+	"workspace_id", ARGV[5],
+	"container_id", ARGV[6],
+	"gpu_count", request_gpu,
+	"cpu", request_cpu,
+	"created_at", ARGV[7])
+redis.call("SADD", KEYS[3], ARGV[6])
+return "ok"
+`)
+
+var releaseConcurrencyReservationScript = redis.NewScript(`
+if redis.call("EXISTS", KEYS[2]) == 0 then
+	redis.call("SREM", KEYS[3], ARGV[2])
+	return 0
+end
+
+if redis.call("HGET", KEYS[1], "initialized") ~= "1" then
+	return "repairing"
+end
+
+local reserved_gpu = tonumber(redis.call("HGET", KEYS[2], "gpu_count") or "0")
+local reserved_cpu = tonumber(redis.call("HGET", KEYS[2], "cpu") or "0")
+
+local used_gpu = tonumber(redis.call("HGET", KEYS[1], "gpu_count") or "0")
+local used_cpu = tonumber(redis.call("HGET", KEYS[1], "cpu") or "0")
+
+if reserved_gpu ~= 0 then
+	used_gpu = redis.call("HINCRBY", KEYS[1], "gpu_count", -reserved_gpu)
+end
+if reserved_cpu ~= 0 then
+	used_cpu = redis.call("HINCRBY", KEYS[1], "cpu", -reserved_cpu)
+end
+
+if used_gpu < 0 then
+	redis.call("HSET", KEYS[1], "gpu_count", 0)
+end
+if used_cpu < 0 then
+	redis.call("HSET", KEYS[1], "cpu", 0)
+end
+
+redis.call("HSET", KEYS[1], "updated_at", ARGV[1])
+redis.call("DEL", KEYS[2])
+redis.call("SREM", KEYS[3], ARGV[2])
+return 1
+`)
+
 type ContainerRedisRepository struct {
 	rdb  *common.RedisClient
 	lock *common.RedisLock
+}
+
+type concurrencyReservation struct {
+	WorkspaceId string `redis:"workspace_id"`
+	ContainerId string `redis:"container_id"`
+	GpuCount    int64  `redis:"gpu_count"`
+	Cpu         int64  `redis:"cpu"`
+	CreatedAt   int64  `redis:"created_at"`
 }
 
 func NewContainerRedisRepository(r *common.RedisClient) ContainerRepository {
@@ -24,12 +176,6 @@ func NewContainerRedisRepository(r *common.RedisClient) ContainerRepository {
 }
 
 func (cr *ContainerRedisRepository) GetContainerState(containerId string) (*types.ContainerState, error) {
-	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 2})
-	if err != nil {
-		return nil, err
-	}
-	defer cr.lock.Release(common.RedisKeys.SchedulerContainerLock(containerId))
-
 	stateKey := common.RedisKeys.SchedulerContainerState(containerId)
 
 	res, err := cr.rdb.HGetAll(context.TODO(), stateKey).Result()
@@ -49,16 +195,53 @@ func (cr *ContainerRedisRepository) GetContainerState(containerId string) (*type
 	return state, nil
 }
 
+func (cr *ContainerRedisRepository) GetContainerStatuses(containerIds []string) (map[string]types.ContainerStatus, error) {
+	statuses := make(map[string]types.ContainerStatus, len(containerIds))
+	ctx := context.TODO()
+	pipe := cr.rdb.Pipeline()
+	commands := make(map[string]*redis.StringCmd, len(containerIds))
+	for _, containerId := range containerIds {
+		if containerId == "" || commands[containerId] != nil {
+			continue
+		}
+		commands[containerId] = pipe.HGet(ctx, common.RedisKeys.SchedulerContainerState(containerId), "status")
+	}
+	if len(commands) == 0 {
+		return statuses, nil
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	for containerId, command := range commands {
+		if command.Err() == nil {
+			statuses[containerId] = types.ContainerStatus(command.Val())
+		}
+	}
+	return statuses, nil
+}
+
 func (cr *ContainerRedisRepository) SetContainerState(containerId string, state *types.ContainerState) error {
-	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 0})
+	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), containerStateLockOptions)
 	if err != nil {
 		return err
 	}
 	defer cr.lock.Release(common.RedisKeys.SchedulerContainerLock(containerId))
 
+	return cr.setContainerState(containerId, state)
+}
+
+func (cr *ContainerRedisRepository) setContainerState(containerId string, state *types.ContainerState) error {
+	ctx := context.TODO()
 	stateKey := common.RedisKeys.SchedulerContainerState(containerId)
-	err = cr.rdb.HSet(
-		context.TODO(), stateKey,
+	stubIndexKey := common.RedisKeys.SchedulerContainerIndex(state.StubId)
+	workspaceIndexKey := common.RedisKeys.SchedulerContainerWorkspaceIndex(state.WorkspaceId)
+
+	// Commit state and indexes together so stop/list callers cannot miss a
+	// newly-created container between the hash write and index writes.
+	pipe := cr.rdb.TxPipeline()
+	pipe.HSet(
+		ctx, stateKey,
 		"container_id", containerId,
 		"status", string(state.Status),
 		"scheduled_at", state.ScheduledAt,
@@ -68,28 +251,18 @@ func (cr *ContainerRedisRepository) SetContainerState(containerId string, state 
 		"gpu_count", state.GpuCount,
 		"cpu", state.Cpu,
 		"memory", state.Memory,
-	).Err()
-	if err != nil {
-		return fmt.Errorf("failed to set container state <%v>: %w", stateKey, err)
-	}
-
-	err = cr.rdb.Expire(context.TODO(), stateKey, time.Duration(types.ContainerStateTtlSWhilePending)*time.Second).Err()
-	if err != nil {
-		return fmt.Errorf("failed to set container state ttl <%v>: %w", stateKey, err)
-	}
-
-	// Add container state key to index (by stub id)
-	indexKey := common.RedisKeys.SchedulerContainerIndex(state.StubId)
-	err = cr.rdb.SAdd(context.TODO(), indexKey, stateKey).Err()
-	if err != nil {
-		return fmt.Errorf("failed to add container state key to index <%v>: %w", indexKey, err)
-	}
-
-	// Add container state key to index (by workspace id)
-	indexKey = common.RedisKeys.SchedulerContainerWorkspaceIndex(state.WorkspaceId)
-	err = cr.rdb.SAdd(context.TODO(), indexKey, stateKey).Err()
-	if err != nil {
-		return fmt.Errorf("failed to add container state key to workspace index <%v>: %w", indexKey, err)
+		"worker_id", state.WorkerId,
+		"machine_id", state.MachineId,
+	)
+	pipe.Expire(ctx, stateKey, time.Duration(types.ContainerStateTtlSWhilePending)*time.Second)
+	pipe.SAdd(ctx, stubIndexKey, stateKey)
+	pipe.SAdd(ctx, workspaceIndexKey, stateKey)
+	pipe.ZAdd(ctx, common.RedisKeys.SchedulerContainerStateIndex(), redis.Z{
+		Score:  float64(time.Now().Add(time.Duration(types.ContainerStateTtlSWhilePending) * time.Second).Unix()),
+		Member: stateKey,
+	})
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to set container state and indexes <%v>: %w", stateKey, err)
 	}
 
 	return nil
@@ -97,9 +270,34 @@ func (cr *ContainerRedisRepository) SetContainerState(containerId string, state 
 
 func (cr *ContainerRedisRepository) SetContainerExitCode(containerId string, exitCode int) error {
 	exitCodeKey := common.RedisKeys.SchedulerContainerExitCode(containerId)
-	err := cr.rdb.SetEx(context.TODO(), exitCodeKey, exitCode, time.Duration(types.ContainerExitCodeTtlS)*time.Second).Err()
+	ttl := types.ContainerExitCodeTTL
+	if types.ContainerExitCode(exitCode).IsFailed() {
+		ttl = types.ContainerFailureHistoryTTL
+	}
+	err := cr.rdb.SetEx(context.TODO(), exitCodeKey, exitCode, ttl).Err()
 	if err != nil {
 		return fmt.Errorf("failed to set exit code <%v> for container <%v>: %w", exitCodeKey, containerId, err)
+	}
+
+	return nil
+}
+
+func (cr *ContainerRedisRepository) SetContainerFailureCooldown(containerIds []string) error {
+	const clampTTL = `
+if redis.call("PTTL", KEYS[1]) > tonumber(ARGV[1]) then
+	return redis.call("PEXPIRE", KEYS[1], ARGV[1])
+end
+return 0`
+
+	ctx := context.TODO()
+	pipe := cr.rdb.Pipeline()
+	for _, containerId := range containerIds {
+		key := common.RedisKeys.SchedulerContainerExitCode(containerId)
+		pipe.Eval(ctx, clampTTL, []string{key}, types.ContainerFailureCooldown.Milliseconds())
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to set container failure cooldown: %w", err)
 	}
 
 	return nil
@@ -115,17 +313,17 @@ func (cr *ContainerRedisRepository) GetContainerExitCode(containerId string) (in
 	return exitCode, nil
 }
 
-func (cr *ContainerRedisRepository) UpdateContainerStatus(containerId string, status types.ContainerStatus, expirySeconds int64) error {
+func (cr *ContainerRedisRepository) UpdateContainerStatus(containerId string, requestedStatus types.ContainerStatus, expirySeconds int64) error {
 	expiry := time.Duration(expirySeconds) * time.Second
 
-	switch status {
+	switch requestedStatus {
 	case types.ContainerStatusPending, types.ContainerStatusRunning, types.ContainerStatusStopping:
 		// continue
 	default:
-		return fmt.Errorf("invalid status: %s", status)
+		return fmt.Errorf("invalid status: %s", requestedStatus)
 	}
 
-	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 0})
+	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), containerStateLockOptions)
 	if err != nil {
 		return err
 	}
@@ -137,6 +335,9 @@ func (cr *ContainerRedisRepository) UpdateContainerStatus(containerId string, st
 	if err != nil {
 		return err
 	}
+	if len(res) == 0 {
+		return &types.ErrContainerStateNotFound{ContainerId: containerId}
+	}
 
 	// Convert response to struct
 	state := &types.ContainerState{}
@@ -145,91 +346,162 @@ func (cr *ContainerRedisRepository) UpdateContainerStatus(containerId string, st
 		return fmt.Errorf("failed to deserialize container state: %v", err)
 	}
 
+	storedStatus := types.ContainerStatus(state.Status)
+	if !containerStatusTransitionAllowed(storedStatus, requestedStatus) {
+		// A delayed heartbeat must never move lifecycle state backward. In
+		// particular, STOPPING is terminal until the state is deleted.
+		return nil
+	}
+
 	// Update StartedAt if this is the first time we set container status to RUNNING
-	if status == types.ContainerStatusRunning && state.Status != types.ContainerStatusRunning {
+	if requestedStatus == types.ContainerStatusRunning && storedStatus != types.ContainerStatusRunning {
 		state.StartedAt = time.Now().Unix()
 	}
 
 	// Update status
-	state.Status = status
+	state.Status = requestedStatus
 
 	// Save state to database
-	err = cr.rdb.HSet(context.TODO(), stateKey, common.ToSlice(state)).Err()
-	if err != nil {
-		return fmt.Errorf("failed to update container state status <%v>: %w", stateKey, err)
-	}
-
-	// Set ttl on state
-	err = cr.rdb.Expire(context.TODO(), stateKey, expiry).Err()
-	if err != nil {
+	pipe := cr.rdb.TxPipeline()
+	pipe.HSet(context.TODO(), stateKey, common.ToSlice(state))
+	pipe.Expire(context.TODO(), stateKey, expiry)
+	pipe.ZAdd(context.TODO(), common.RedisKeys.SchedulerContainerStateIndex(), redis.Z{
+		Score:  float64(time.Now().Add(expiry).Unix()),
+		Member: stateKey,
+	})
+	if _, err = pipe.Exec(context.TODO()); err != nil {
 		return fmt.Errorf("failed to set container state ttl <%v>: %w", stateKey, err)
 	}
 
+	if requestedStatus == types.ContainerStatusStopping {
+		// The release script is idempotent. Run it on every STOPPING update so
+		// callers can retry if a previous release failed after status persisted.
+		if err := cr.releaseContainerConcurrencyReservation(context.TODO(), state.WorkspaceId, containerId); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
-func (cr *ContainerRedisRepository) UpdateAssignedContainerGPU(containerId string, gpuType string) error {
-	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 0})
-	if err != nil {
-		return err
+func containerStatusTransitionAllowed(storedStatus, requestedStatus types.ContainerStatus) bool {
+	switch storedStatus {
+	case types.ContainerStatusPending:
+		return requestedStatus == types.ContainerStatusPending ||
+			requestedStatus == types.ContainerStatusRunning ||
+			requestedStatus == types.ContainerStatusStopping
+	case types.ContainerStatusRunning:
+		return requestedStatus == types.ContainerStatusRunning ||
+			requestedStatus == types.ContainerStatusStopping
+	case types.ContainerStatusStopping:
+		return requestedStatus == types.ContainerStatusStopping
+	default:
+		return false
 	}
-	defer cr.lock.Release(common.RedisKeys.SchedulerContainerLock(containerId))
+}
 
-	// Get current state
+var markPendingContainerStoppingIfUnassignedScript = redis.NewScript(`
+if redis.call("HGET", KEYS[1], "status") ~= ARGV[1] then
+	return 0
+end
+local worker_id = redis.call("HGET", KEYS[1], "worker_id")
+if worker_id and worker_id ~= "" then
+	return 0
+end
+redis.call("HSET", KEYS[1], "status", ARGV[2])
+redis.call("EXPIRE", KEYS[1], ARGV[3])
+redis.call("ZADD", KEYS[2], ARGV[4], KEYS[1])
+return 1
+`)
+
+func (cr *ContainerRedisRepository) MarkPendingContainerStoppingIfUnassigned(containerId string, expirySeconds int64) (bool, error) {
+	lockKey := common.RedisKeys.SchedulerContainerLock(containerId)
+	if err := cr.lock.Acquire(context.TODO(), lockKey, containerStateLockOptions); err != nil {
+		return false, err
+	}
+	defer cr.lock.Release(lockKey)
+
 	stateKey := common.RedisKeys.SchedulerContainerState(containerId)
-	res, err := cr.rdb.HGetAll(context.TODO(), stateKey).Result()
+	marked, err := markPendingContainerStoppingIfUnassignedScript.Run(context.TODO(), cr.rdb, []string{
+		stateKey,
+		common.RedisKeys.SchedulerContainerStateIndex(),
+	},
+		string(types.ContainerStatusPending), string(types.ContainerStatusStopping), expirySeconds,
+		time.Now().Add(time.Duration(expirySeconds)*time.Second).Unix(),
+	).Bool()
 	if err != nil {
-		return err
+		return false, fmt.Errorf("failed to stop unassigned pending container <%s>: %w", containerId, err)
 	}
-
-	// Convert response to struct
-	state := &types.ContainerState{}
-	err = common.ToStruct(res, state)
-	if err != nil {
-		return fmt.Errorf("failed to deserialize container state: %v", err)
-	}
-
-	// Update GPU
-	state.Gpu = gpuType
-
-	// Save state to database
-	err = cr.rdb.HSet(context.TODO(), stateKey, common.ToSlice(state)).Err()
-	if err != nil {
-		return fmt.Errorf("failed to update container state gpu <%v>: %w", stateKey, err)
-	}
-
-	return nil
+	return marked, nil
 }
 
 func (cr *ContainerRedisRepository) DeleteContainerState(containerId string) error {
-	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 0})
+	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 5})
 	if err != nil {
 		return err
 	}
 	defer cr.lock.Release(common.RedisKeys.SchedulerContainerLock(containerId))
 
+	ctx := context.TODO()
 	stateKey := common.RedisKeys.SchedulerContainerState(containerId)
-	err = cr.rdb.Del(context.TODO(), stateKey).Err()
+	state, err := cr.rdb.HMGet(ctx, stateKey, "workspace_id", "stub_id", "worker_id").Result()
 	if err != nil {
-		return fmt.Errorf("failed to delete container state <%v>: %w", stateKey, err)
+		return fmt.Errorf("failed to get container indexes <%v>: %w", stateKey, err)
+	}
+	indexedValue := func(index int) string {
+		if index >= len(state) || state[index] == nil {
+			return ""
+		}
+		value, _ := state[index].(string)
+		return value
+	}
+	workspaceId := indexedValue(0)
+	stubId := indexedValue(1)
+	workerId := indexedValue(2)
+
+	if workspaceId != "" {
+		if err := cr.rdb.HSet(ctx, stateKey, "status", string(types.ContainerStatusStopping)).Err(); err != nil {
+			return fmt.Errorf("failed to mark container stopping before delete <%v>: %w", stateKey, err)
+		}
+		if err := cr.releaseContainerConcurrencyReservation(ctx, workspaceId, containerId); err != nil {
+			return err
+		}
+	}
+
+	// Failed exit codes intentionally keep their stub-index membership for the
+	// autoscaler's bounded failure-history window. Successful and administrative
+	// stops have no history consumer, so retaining their missing state keys would
+	// leak a permanent stub index after a deployment is deleted.
+	retainFailureHistory := false
+	if exitCode, exitErr := cr.rdb.Get(ctx, common.RedisKeys.SchedulerContainerExitCode(containerId)).Int(); exitErr == nil {
+		retainFailureHistory = types.ContainerExitCode(exitCode).IsFailed()
+	} else if exitErr != redis.Nil {
+		// A Redis read failure must not make failure history disappear. The normal
+		// index reader can prune this member once the exit-code lease is gone.
+		retainFailureHistory = true
 	}
 
 	addrKey := common.RedisKeys.SchedulerContainerAddress(containerId)
-	err = cr.rdb.Del(context.TODO(), addrKey).Err()
-	if err != nil {
-		return fmt.Errorf("failed to delete container addr <%v>: %w", addrKey, err)
-	}
-
 	addrMapKey := common.RedisKeys.SchedulerContainerAddressMap(containerId)
-	err = cr.rdb.Del(context.TODO(), addrMapKey).Err()
-	if err != nil {
-		return fmt.Errorf("failed to delete container addrMap <%v>: %w", addrMapKey, err)
+	workerAddrKey := common.RedisKeys.SchedulerWorkerAddress(containerId)
+	pipe := cr.rdb.TxPipeline()
+	pipe.Del(ctx, stateKey, addrKey, addrMapKey, workerAddrKey)
+	pipe.ZRem(ctx, common.RedisKeys.SchedulerContainerStateIndex(), stateKey)
+	if workspaceId != "" {
+		pipe.SRem(ctx, common.RedisKeys.SchedulerContainerWorkspaceIndex(workspaceId), stateKey)
+	}
+	if workerId != "" {
+		pipe.SRem(ctx, common.RedisKeys.SchedulerContainerWorkerIndex(workerId), stateKey)
+	}
+	if stubId != "" && !retainFailureHistory {
+		pipe.SRem(ctx, common.RedisKeys.SchedulerContainerIndex(stubId), stateKey)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to delete container state <%v>: %w", stateKey, err)
 	}
 
-	workerAddrKey := common.RedisKeys.SchedulerWorkerAddress(containerId)
-	err = cr.rdb.Del(context.TODO(), workerAddrKey).Err()
-	if err != nil {
-		return fmt.Errorf("failed to delete worker addr <%v>: %w", workerAddrKey, err)
+	if err := cr.DeleteBackendRoutesByContainerID(context.TODO(), containerId); err != nil {
+		return err
 	}
 
 	return nil
@@ -241,6 +513,330 @@ func (cr *ContainerRedisRepository) SetContainerAddress(containerId string, addr
 
 func (cr *ContainerRedisRepository) GetContainerAddress(containerId string) (string, error) {
 	return cr.rdb.Get(context.TODO(), common.RedisKeys.SchedulerContainerAddress(containerId)).Result()
+}
+
+func (cr *ContainerRedisRepository) SetBackendRoute(ctx context.Context, route types.BackendRoute) error {
+	return cr.SetBackendRoutes(ctx, []types.BackendRoute{route})
+}
+
+func (cr *ContainerRedisRepository) SetBackendRoutes(ctx context.Context, routes []types.BackendRoute) error {
+	if len(routes) == 0 {
+		return nil
+	}
+
+	type encodedRoute struct {
+		route types.BackendRoute
+		data  []byte
+	}
+	type machineKey struct {
+		workspaceID string
+		poolName    string
+		machineID   string
+	}
+
+	encoded := make([]encodedRoute, 0, len(routes))
+	machines := make(map[machineKey]struct{})
+	machineIDs := make(map[string]struct{})
+	for _, route := range routes {
+		if route.RouteID == "" {
+			return errors.New("route id is required")
+		}
+		if route.UpdatedAt == 0 {
+			route.UpdatedAt = time.Now().Unix()
+		}
+		data, err := json.Marshal(route)
+		if err != nil {
+			return fmt.Errorf("failed to marshal backend route %s: %w", route.RouteID, err)
+		}
+		encoded = append(encoded, encodedRoute{route: route, data: data})
+		if route.WorkspaceID != "" && route.PoolName != "" && route.MachineID != "" {
+			machines[machineKey{workspaceID: route.WorkspaceID, poolName: route.PoolName, machineID: route.MachineID}] = struct{}{}
+		}
+		if route.MachineID != "" {
+			machineIDs[route.MachineID] = struct{}{}
+		}
+	}
+
+	_, err := cr.rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, item := range encoded {
+			route := item.route
+			routeKey := common.RedisKeys.SchedulerBackendRoute(route.RouteID)
+			if route.Kind == types.BackendRouteKindWorker &&
+				route.ContainerID == "" &&
+				route.State == types.BackendRouteStateOpening {
+				setOpeningWorkerBackendRouteScript.Eval(
+					ctx,
+					pipe,
+					[]string{routeKey},
+					item.data,
+					types.BackendRouteStateReady,
+				)
+			} else {
+				pipe.Set(ctx, routeKey, item.data, 0)
+			}
+			if route.ContainerID != "" {
+				pipe.SAdd(ctx, common.RedisKeys.SchedulerBackendRouteIndex(route.ContainerID), route.RouteID)
+			}
+			if route.WorkspaceID != "" && route.PoolName != "" && route.MachineID != "" {
+				pipe.SAdd(ctx, common.RedisKeys.SchedulerBackendRouteMachineIndex(route.WorkspaceID, route.PoolName, route.MachineID), route.RouteID)
+			}
+			if route.MachineID != "" {
+				pipe.SAdd(ctx, common.RedisKeys.SchedulerBackendRouteMachineIDIndex(route.MachineID), route.RouteID)
+			}
+		}
+		for machine := range machines {
+			key := common.RedisKeys.SchedulerBackendRouteMachineRevision(machine.workspaceID, machine.poolName, machine.machineID)
+			pipe.Incr(ctx, key)
+			pipe.Publish(ctx, key, common.KeyOperationSet)
+		}
+		for machineID := range machineIDs {
+			key := common.RedisKeys.SchedulerBackendRouteMachineIDRevision(machineID)
+			pipe.Incr(ctx, key)
+			pipe.Publish(ctx, key, common.KeyOperationSet)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set backend routes: %w", err)
+	}
+	return nil
+}
+
+func (cr *ContainerRedisRepository) GetBackendRoute(ctx context.Context, routeID string) (*types.BackendRoute, error) {
+	data, err := cr.rdb.Get(ctx, common.RedisKeys.SchedulerBackendRoute(routeID)).Bytes()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, fmt.Errorf("backend route %s not found", routeID)
+		}
+		return nil, fmt.Errorf("failed to get backend route %s: %w", routeID, err)
+	}
+	var route types.BackendRoute
+	if err := json.Unmarshal(data, &route); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal backend route %s: %w", routeID, err)
+	}
+	return &route, nil
+}
+
+func (cr *ContainerRedisRepository) ListBackendRoutesByMachine(ctx context.Context, workspaceID, poolName, machineID string) ([]types.BackendRoute, error) {
+	routeIDs, err := cr.rdb.SMembers(ctx, common.RedisKeys.SchedulerBackendRouteMachineIndex(workspaceID, poolName, machineID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(routeIDs)
+	routes, err := cr.routes(ctx, routeIDs)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(routes, func(i, j int) bool {
+		return routes[i].RouteID < routes[j].RouteID
+	})
+	return routes, nil
+}
+
+func (cr *ContainerRedisRepository) ListBackendRoutesByMachineID(ctx context.Context, machineID string) ([]types.BackendRoute, error) {
+	routeIDs, err := cr.rdb.SMembers(ctx, common.RedisKeys.SchedulerBackendRouteMachineIDIndex(machineID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(routeIDs)
+	routes, err := cr.routes(ctx, routeIDs)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(routes, func(i, j int) bool {
+		return routes[i].RouteID < routes[j].RouteID
+	})
+	return routes, nil
+}
+
+func (cr *ContainerRedisRepository) DeleteBackendRoutesByContainerID(ctx context.Context, containerID string) error {
+	indexKey := common.RedisKeys.SchedulerBackendRouteIndex(containerID)
+	routeIDs, err := cr.rdb.SMembers(ctx, indexKey).Result()
+	if err != nil {
+		return err
+	}
+	routes, err := cr.routes(ctx, routeIDs)
+	if err != nil {
+		return err
+	}
+
+	type machineKey struct {
+		workspaceID string
+		poolName    string
+		machineID   string
+	}
+	machines := map[machineKey]struct{}{}
+	machineIDs := map[string]struct{}{}
+	pipe := cr.rdb.Pipeline()
+	for _, routeID := range routeIDs {
+		pipe.Del(ctx, common.RedisKeys.SchedulerBackendRoute(routeID))
+	}
+	for _, route := range routes {
+		if route.WorkspaceID != "" && route.PoolName != "" && route.MachineID != "" {
+			pipe.SRem(ctx, common.RedisKeys.SchedulerBackendRouteMachineIndex(route.WorkspaceID, route.PoolName, route.MachineID), route.RouteID)
+			machines[machineKey{workspaceID: route.WorkspaceID, poolName: route.PoolName, machineID: route.MachineID}] = struct{}{}
+		}
+		if route.MachineID != "" {
+			pipe.SRem(ctx, common.RedisKeys.SchedulerBackendRouteMachineIDIndex(route.MachineID), route.RouteID)
+			machineIDs[route.MachineID] = struct{}{}
+		}
+	}
+	for machine := range machines {
+		pipe.Incr(ctx, common.RedisKeys.SchedulerBackendRouteMachineRevision(machine.workspaceID, machine.poolName, machine.machineID))
+	}
+	for machineID := range machineIDs {
+		pipe.Incr(ctx, common.RedisKeys.SchedulerBackendRouteMachineIDRevision(machineID))
+	}
+	pipe.Del(ctx, indexKey)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+	for machine := range machines {
+		if err := cr.publishBackendRouteMachine(ctx, machine.workspaceID, machine.poolName, machine.machineID); err != nil {
+			return err
+		}
+	}
+	for machineID := range machineIDs {
+		if err := cr.publishBackendRouteMachineID(ctx, machineID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteBackendRoutesByMachine removes all backend routes and index entries
+// for a machine when it is released.
+func (cr *ContainerRedisRepository) DeleteBackendRoutesByMachine(ctx context.Context, workspaceID, poolName, machineID string) error {
+	if workspaceID == "" || poolName == "" || machineID == "" {
+		return nil
+	}
+	indexKey := common.RedisKeys.SchedulerBackendRouteMachineIndex(workspaceID, poolName, machineID)
+	scopedRouteIDs, err := cr.rdb.SMembers(ctx, indexKey).Result()
+	if err != nil {
+		return err
+	}
+	machineRouteIDs, err := cr.rdb.SMembers(ctx, common.RedisKeys.SchedulerBackendRouteMachineIDIndex(machineID)).Result()
+	if err != nil {
+		return err
+	}
+	routeIDs := dedupeRouteIDs(append(scopedRouteIDs, machineRouteIDs...))
+	routes, err := cr.routes(ctx, routeIDs)
+	if err != nil {
+		return err
+	}
+
+	type machineKey struct {
+		workspaceID string
+		poolName    string
+		machineID   string
+	}
+	machines := map[machineKey]struct{}{}
+	machineIDs := map[string]struct{}{}
+	pipe := cr.rdb.Pipeline()
+	for _, route := range routes {
+		if route.MachineID != machineID || route.PoolName != poolName {
+			continue
+		}
+		pipe.Del(ctx, common.RedisKeys.SchedulerBackendRoute(route.RouteID))
+		if route.ContainerID != "" {
+			pipe.SRem(ctx, common.RedisKeys.SchedulerBackendRouteIndex(route.ContainerID), route.RouteID)
+		}
+		if route.WorkspaceID != "" && route.PoolName != "" && route.MachineID != "" {
+			pipe.SRem(ctx, common.RedisKeys.SchedulerBackendRouteMachineIndex(route.WorkspaceID, route.PoolName, route.MachineID), route.RouteID)
+			machines[machineKey{workspaceID: route.WorkspaceID, poolName: route.PoolName, machineID: route.MachineID}] = struct{}{}
+		}
+		if route.MachineID != "" {
+			pipe.SRem(ctx, common.RedisKeys.SchedulerBackendRouteMachineIDIndex(route.MachineID), route.RouteID)
+			machineIDs[route.MachineID] = struct{}{}
+		}
+	}
+	pipe.Del(ctx, indexKey)
+	machines[machineKey{workspaceID: workspaceID, poolName: poolName, machineID: machineID}] = struct{}{}
+	for machine := range machines {
+		pipe.Incr(ctx, common.RedisKeys.SchedulerBackendRouteMachineRevision(machine.workspaceID, machine.poolName, machine.machineID))
+	}
+	for id := range machineIDs {
+		pipe.Incr(ctx, common.RedisKeys.SchedulerBackendRouteMachineIDRevision(id))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+	for machine := range machines {
+		if err := cr.publishBackendRouteMachine(ctx, machine.workspaceID, machine.poolName, machine.machineID); err != nil {
+			return err
+		}
+	}
+	for id := range machineIDs {
+		if err := cr.publishBackendRouteMachineID(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cr *ContainerRedisRepository) publishBackendRouteMachine(ctx context.Context, workspaceID, poolName, machineID string) error {
+	return cr.rdb.Publish(ctx, common.RedisKeys.SchedulerBackendRouteMachineRevision(workspaceID, poolName, machineID), common.KeyOperationSet).Err()
+}
+
+func (cr *ContainerRedisRepository) publishBackendRouteMachineID(ctx context.Context, machineID string) error {
+	return cr.rdb.Publish(ctx, common.RedisKeys.SchedulerBackendRouteMachineIDRevision(machineID), common.KeyOperationSet).Err()
+}
+
+func (cr *ContainerRedisRepository) routes(ctx context.Context, routeIDs []string) ([]types.BackendRoute, error) {
+	if len(routeIDs) == 0 {
+		return []types.BackendRoute{}, nil
+	}
+	keys := make([]string, 0, len(routeIDs))
+	for _, routeID := range routeIDs {
+		keys = append(keys, common.RedisKeys.SchedulerBackendRoute(routeID))
+	}
+	values, err := cr.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	routes := make([]types.BackendRoute, 0, len(values))
+	for _, value := range values {
+		data, ok := routeBytes(value)
+		if !ok {
+			continue
+		}
+		var route types.BackendRoute
+		if err := json.Unmarshal(data, &route); err != nil {
+			continue
+		}
+		routes = append(routes, route)
+	}
+	return routes, nil
+}
+
+func dedupeRouteIDs(routeIDs []string) []string {
+	if len(routeIDs) < 2 {
+		return routeIDs
+	}
+	seen := make(map[string]struct{}, len(routeIDs))
+	out := make([]string, 0, len(routeIDs))
+	for _, routeID := range routeIDs {
+		if routeID == "" {
+			continue
+		}
+		if _, ok := seen[routeID]; ok {
+			continue
+		}
+		seen[routeID] = struct{}{}
+		out = append(out, routeID)
+	}
+	return out
+}
+
+func routeBytes(value any) ([]byte, bool) {
+	switch v := value.(type) {
+	case string:
+		return []byte(v), true
+	case []byte:
+		return v, true
+	default:
+		return nil, false
+	}
 }
 
 func (cr *ContainerRedisRepository) SetContainerAddressMap(containerId string, addressMap map[int32]string) error {
@@ -280,63 +876,88 @@ func (cr *ContainerRedisRepository) SetWorkerAddress(containerId string, addr st
 }
 
 func (cr *ContainerRedisRepository) GetWorkerAddress(ctx context.Context, containerId string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	internalDeadline := time.Now().Add(workerAddressWaitTimeout)
+	ctx, cancel := context.WithDeadline(ctx, internalDeadline)
 	defer cancel()
 
-	var hostname string = ""
-	var err error
+	schedulingFailed := func() bool {
+		requestStatus, err := cr.GetContainerRequestStatus(containerId)
+		return err == nil && requestStatus == types.ContainerRequestStatusFailed
+	}
 
-	ticker := time.NewTicker(1 * time.Second) // Retry every second
+	tryGetWorkerAddress := func() (addr string, found bool, err error) {
+		hostname, err := cr.rdb.Get(ctx, common.RedisKeys.SchedulerWorkerAddress(containerId)).Result()
+		if err == nil {
+			return hostname, true, nil
+		}
+
+		if err != redis.Nil {
+			return "", false, fmt.Errorf("failed to get worker addr for container %s: %w", containerId, err)
+		}
+
+		if schedulingFailed() {
+			return "", false, fmt.Errorf("failed to schedule container, container id: %s", containerId)
+		}
+
+		return "", false, nil
+	}
+
+	if hostname, found, err := tryGetWorkerAddress(); found || err != nil {
+		return hostname, err
+	}
+
+	ticker := time.NewTicker(workerAddressPollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			if ctx.Err() == context.DeadlineExceeded {
+			if time.Now().Before(internalDeadline) {
+				return "", fmt.Errorf("context cancelled while trying to get worker addr, container id: %s", containerId)
+			}
+			if schedulingFailed() {
 				return "", fmt.Errorf("failed to schedule container, container id: %s", containerId)
 			}
-			return "", fmt.Errorf("context cancelled while trying to get worker addr, container id: %s", containerId)
+			return "", fmt.Errorf("failed to schedule container, container id: %s", containerId)
 		case <-ticker.C:
-			hostname, err = cr.rdb.Get(ctx, common.RedisKeys.SchedulerWorkerAddress(containerId)).Result()
-			if err == nil {
-				return hostname, nil
-			}
-
-			if requestStatus, err := cr.GetContainerRequestStatus(containerId); err == nil && requestStatus == types.ContainerRequestStatusFailed {
-				return "", fmt.Errorf("failed to schedule container, container id: %s", containerId)
+			if hostname, found, err := tryGetWorkerAddress(); found || err != nil {
+				return hostname, err
 			}
 		}
 	}
 }
 
+// listContainerStateByIndex resolves the container state hashes behind an
+// index set. Everything is pipelined: one round-trip to read every hash, one
+// to check exit codes for the hashes that have expired, one to prune stale
+// index members. The previous per-key loop cost two serial round-trips per
+// container, which dominated the dashboard's list endpoints on busy workspaces.
 func (cr *ContainerRedisRepository) listContainerStateByIndex(indexKey string, keys []string) ([]types.ContainerState, error) {
-	containerStates := make([]types.ContainerState, 0)
+	containerStates := make([]types.ContainerState, 0, len(keys))
+	if len(keys) == 0 {
+		return containerStates, nil
+	}
+	ctx := context.TODO()
 
-	for _, key := range keys {
-		exists, err := cr.rdb.Exists(context.TODO(), key).Result()
+	// HGETALL on a missing key returns an empty map, so a single pass tells us
+	// both which states exist and what they contain.
+	pipe := cr.rdb.Pipeline()
+	hashCmds := make([]*redis.MapStringStringCmd, len(keys))
+	for i, key := range keys {
+		hashCmds[i] = pipe.HGetAll(ctx, key)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, fmt.Errorf("failed to read container states: %v", err)
+	}
+
+	missing := make([]string, 0)
+	for i, key := range keys {
+		res, err := hashCmds[i].Result()
 		if err != nil {
 			continue
 		}
-		if exists == 0 {
-			containerId := strings.Split(key, ":")[len(strings.Split(key, ":"))-1]
-			exitCodeKey := common.RedisKeys.SchedulerContainerExitCode(containerId)
-
-			exitCodeKeyExists, err := cr.rdb.Exists(context.TODO(), exitCodeKey).Result()
-			if err != nil {
-				continue
-			}
-
-			if exitCodeKeyExists > 0 {
-				continue
-			}
-
-			// We don't have an exit code, or a state key, remove key from set
-			cr.rdb.SRem(context.TODO(), indexKey, key)
-			continue
-		}
-
-		res, err := cr.rdb.HGetAll(context.TODO(), key).Result()
-		if err != nil {
+		if len(res) == 0 {
+			missing = append(missing, key)
 			continue
 		}
 
@@ -344,15 +965,128 @@ func (cr *ContainerRedisRepository) listContainerStateByIndex(indexKey string, k
 		if err = common.ToStruct(res, &state); err != nil {
 			continue
 		}
-
 		if state.ContainerId == "" {
 			continue
 		}
-
 		containerStates = append(containerStates, state)
 	}
 
+	if len(missing) == 0 {
+		return containerStates, nil
+	}
+
+	// A state hash that is gone but whose exit code is still around belongs to
+	// a container that just finished; leave the index entry for the reaper.
+	// Anything else is a dangling index member and gets pruned.
+	exitPipe := cr.rdb.Pipeline()
+	exitCmds := make([]*redis.IntCmd, len(missing))
+	for i, key := range missing {
+		parts := strings.Split(key, ":")
+		exitCmds[i] = exitPipe.Exists(ctx, common.RedisKeys.SchedulerContainerExitCode(parts[len(parts)-1]))
+	}
+	if _, err := exitPipe.Exec(ctx); err != nil && err != redis.Nil {
+		return containerStates, nil
+	}
+
+	stale := make([]interface{}, 0, len(missing))
+	for i, key := range missing {
+		if exists, err := exitCmds[i].Result(); err == nil && exists == 0 {
+			stale = append(stale, key)
+		}
+	}
+	if len(stale) > 0 {
+		cr.rdb.SRem(ctx, indexKey, stale...)
+	}
+
 	return containerStates, nil
+}
+
+// Sandbox activity is kept as one hash per app keyed by hour epoch. Buckets
+// older than the retention window are trimmed on write, so the hash stays at
+// most ~25 fields and reads are a single HGETALL per app.
+const sandboxActivityRetention = 26 * time.Hour
+
+func (cr *ContainerRedisRepository) RecordSandboxCreated(workspaceId, appId string, at time.Time) error {
+	if workspaceId == "" || appId == "" {
+		return nil
+	}
+	ctx := context.TODO()
+	key := common.RedisKeys.SchedulerAppSandboxActivity(workspaceId, appId)
+	hour := at.UTC().Truncate(time.Hour).Unix()
+
+	pipe := cr.rdb.Pipeline()
+	pipe.HIncrBy(ctx, key, strconv.FormatInt(hour, 10), 1)
+	pipe.Expire(ctx, key, sandboxActivityRetention)
+	fields := pipe.HKeys(ctx, key)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+
+	// Trim relative to the newest bucket present, not this write's timestamp,
+	// so a late/out-of-order write can never resurrect old buckets.
+	epochs := make(map[string]int64, len(fields.Val()))
+	newest := hour
+	for _, field := range fields.Val() {
+		epoch, err := strconv.ParseInt(field, 10, 64)
+		if err != nil {
+			continue
+		}
+		epochs[field] = epoch
+		if epoch > newest {
+			newest = epoch
+		}
+	}
+	cutoff := newest - int64(sandboxActivityRetention/time.Second)
+	stale := make([]string, 0)
+	for field, epoch := range epochs {
+		if epoch < cutoff {
+			stale = append(stale, field)
+		}
+	}
+	if len(stale) > 0 {
+		cr.rdb.HDel(ctx, key, stale...)
+	}
+	return nil
+}
+
+func (cr *ContainerRedisRepository) GetSandboxActivity(workspaceId string, appIds []string, since time.Time) (map[string][]types.AppActivityBucket, error) {
+	result := make(map[string][]types.AppActivityBucket, len(appIds))
+	if workspaceId == "" || len(appIds) == 0 {
+		return result, nil
+	}
+	ctx := context.TODO()
+
+	pipe := cr.rdb.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(appIds))
+	for i, appId := range appIds {
+		cmds[i] = pipe.HGetAll(ctx, common.RedisKeys.SchedulerAppSandboxActivity(workspaceId, appId))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	cutoff := since.UTC().Truncate(time.Hour).Unix()
+	for i, appId := range appIds {
+		fields, err := cmds[i].Result()
+		if err != nil || len(fields) == 0 {
+			continue
+		}
+		buckets := make([]types.AppActivityBucket, 0, len(fields))
+		for field, raw := range fields {
+			epoch, err := strconv.ParseInt(field, 10, 64)
+			if err != nil || epoch < cutoff {
+				continue
+			}
+			count, err := strconv.Atoi(raw)
+			if err != nil || count == 0 {
+				continue
+			}
+			buckets = append(buckets, types.AppActivityBucket{Time: time.Unix(epoch, 0).UTC(), Total: count})
+		}
+		sort.Slice(buckets, func(a, b int) bool { return buckets[a].Time.Before(buckets[b].Time) })
+		result[appId] = buckets
+	}
+	return result, nil
 }
 
 func (cr *ContainerRedisRepository) GetActiveContainersByStubId(stubId string) ([]types.ContainerState, error) {
@@ -416,69 +1150,488 @@ func (cr *ContainerRedisRepository) GetFailedContainersByStubId(stubId string) (
 	return failedContainerIds, nil
 }
 
-func (c *ContainerRedisRepository) SetContainerStateWithConcurrencyLimit(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error {
-	// Acquire the concurrency limit lock for the workspace to prevent
-	// simultaneous requests from exceeding the quota
-	context := context.TODO()
-	retryStrategy := redislock.LimitRetry(redislock.LinearBackoff(100*time.Millisecond), 10)
-	lock, err := redislock.Obtain(context, c.rdb, common.RedisKeys.WorkspaceConcurrencyLimitLock(request.WorkspaceId), time.Duration(10)*time.Second, &redislock.Options{
-		RetryStrategy: retryStrategy,
-	})
-	if err != nil && err != redislock.ErrNotObtained {
+// ReserveContainerConcurrencyForPending applies workspace quota accounting to an
+// already-created PENDING container without changing its state or TTL. Initial
+// admissions, including serverless, use CreateContainerStateWithConcurrencyLimit;
+// this transition is for a quota-exempt request rerouted to accounted capacity.
+func (c *ContainerRedisRepository) ReserveContainerConcurrencyForPending(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error {
+	if request == nil || request.ContainerId == "" {
+		return errors.New("container request is required")
+	}
+
+	if quota == nil {
+		_, err := c.tryReserveContainerConcurrencyForPending(nil, request)
 		return err
 	}
 
-	defer lock.Release(context)
+	return c.reserveContainerConcurrencyWithAttempt(quota, request, func() (string, error) {
+		return c.tryReserveContainerConcurrencyForPending(quota, request)
+	})
+}
 
-	if quota != nil { // If a quota is set, check if the request exceeds it
-		containers, err := c.GetActiveContainersByWorkspaceId(request.WorkspaceId)
-		if err != nil {
-			return err
-		}
+func (c *ContainerRedisRepository) tryReserveContainerConcurrencyForPending(quota *types.ConcurrencyLimit, request *types.ContainerRequest) (string, error) {
+	lockKey := common.RedisKeys.SchedulerContainerLock(request.ContainerId)
+	if err := c.lock.Acquire(context.TODO(), lockKey, containerStateLockOptions); err != nil {
+		return "", err
+	}
+	defer c.lock.Release(lockKey)
 
-		totalGpuCount := 0
-		totalCpu := 0
-		totalMemory := int64(0)
-		for _, container := range containers {
-			if container.Status == types.ContainerStatusStopping {
-				continue
-			}
-
-			totalGpuCount += int(container.GpuCount)
-			totalCpu += int(container.Cpu)
-			totalMemory += container.Memory
-		}
-
-		if totalGpuCount+int(request.GpuCount) > int(quota.GPULimit) {
-			return &types.ThrottledByConcurrencyLimitError{
-				Reason: "gpu quota exceeded",
-			}
-		}
-
-		if totalCpu+int(request.Cpu) > int(quota.CPUMillicoreLimit) {
-			return &types.ThrottledByConcurrencyLimitError{
-				Reason: "cpu quota exceeded",
-			}
-		}
+	ctx := context.TODO()
+	storedStatus, err := c.rdb.HGet(ctx, common.RedisKeys.SchedulerContainerState(request.ContainerId), "status").Result()
+	if err == redis.Nil {
+		return "", &types.ErrContainerStateNotFound{ContainerId: request.ContainerId}
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get container status: %w", err)
+	}
+	if types.ContainerStatus(storedStatus) != types.ContainerStatusPending {
+		return "", fmt.Errorf("container <%s> is no longer pending (stored status: %s)", request.ContainerId, storedStatus)
+	}
+	if quota == nil {
+		return "", nil
 	}
 
-	err = c.SetContainerState(request.ContainerId, &types.ContainerState{
+	return c.tryReserveContainerConcurrencyWithContext(ctx, quota, request)
+}
+
+func (c *ContainerRedisRepository) CreateContainerStateWithConcurrencyLimit(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error {
+	return c.createContainerState(quota, request)
+}
+
+func (c *ContainerRedisRepository) createContainerState(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error {
+	lockKey := common.RedisKeys.SchedulerContainerLock(request.ContainerId)
+	if err := c.lock.Acquire(context.TODO(), lockKey, containerStateLockOptions); err != nil {
+		return err
+	}
+	defer c.lock.Release(lockKey)
+	status, err := c.rdb.HGet(context.TODO(), common.RedisKeys.SchedulerContainerState(request.ContainerId), "status").Result()
+	if err != nil && err != redis.Nil {
+		return fmt.Errorf("failed to get container status: %w", err)
+	}
+	if status == string(types.ContainerStatusPending) ||
+		status == string(types.ContainerStatusRunning) ||
+		status == string(types.ContainerStatusStopping) {
+		return &types.ContainerAlreadyScheduledError{Msg: "a container with this id is still active"}
+	}
+	if quota != nil {
+		if err := c.reserveContainerConcurrency(quota, request); err != nil {
+			return err
+		}
+	}
+	err = c.setContainerState(request.ContainerId, &types.ContainerState{
 		ContainerId: request.ContainerId,
 		StubId:      request.StubId,
-		Status:      types.ContainerStatusPending,
 		WorkspaceId: request.WorkspaceId,
+		Status:      types.ContainerStatusPending,
 		ScheduledAt: time.Now().Unix(),
-		StartedAt:   0,
 		Gpu:         request.Gpu,
 		GpuCount:    request.GpuCount,
 		Cpu:         request.Cpu,
 		Memory:      request.Memory,
+		MachineId:   request.MachineId,
 	})
+	if err == nil {
+		return nil
+	}
+	if quota != nil {
+		if releaseErr := c.releaseContainerConcurrencyReservation(context.TODO(), request.WorkspaceId, request.ContainerId); releaseErr != nil {
+			return errors.Join(err, fmt.Errorf("failed to release concurrency reservation after container state error: %w", releaseErr))
+		}
+	}
+	return err
+}
+
+func (c *ContainerRedisRepository) CheckContainerConcurrencyLimit(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error {
+	if quota == nil {
+		return nil
+	}
+
+	if err := c.ensureWorkspaceConcurrencyCounter(request.WorkspaceId); err != nil {
+		return err
+	}
+
+	reason, err := c.checkContainerConcurrencyLimit(quota, request)
+	if errors.Is(err, errConcurrencyCounterRepairing) {
+		if err := c.ensureWorkspaceConcurrencyCounter(request.WorkspaceId); err != nil {
+			return err
+		}
+		reason, err = c.checkContainerConcurrencyLimit(quota, request)
+	}
+	if err == nil {
+		return nil
+	}
+
+	var throttled *types.ThrottledByConcurrencyLimitError
+	if !errors.As(err, &throttled) {
+		return err
+	}
+
+	repaired, repairErr := c.repairWorkspaceConcurrencyCounterAfterThrottle(request.WorkspaceId)
+	if repairErr != nil {
+		return repairErr
+	}
+	if repaired {
+		reason, err = c.checkContainerConcurrencyLimit(quota, request)
+	}
+	if err != nil && reason != "" {
+		var finalThrottle *types.ThrottledByConcurrencyLimitError
+		if !errors.As(err, &finalThrottle) {
+			return err
+		}
+		metrics.RecordConcurrencyLimitThrottle(reason, request)
+	}
+
+	return err
+}
+
+func (c *ContainerRedisRepository) reserveContainerConcurrency(quota *types.ConcurrencyLimit, request *types.ContainerRequest) error {
+	return c.reserveContainerConcurrencyWithAttempt(quota, request, func() (string, error) {
+		return c.tryReserveContainerConcurrency(quota, request)
+	})
+}
+
+func (c *ContainerRedisRepository) reserveContainerConcurrencyWithAttempt(
+	quota *types.ConcurrencyLimit,
+	request *types.ContainerRequest,
+	tryReserve func() (string, error),
+) error {
+	if err := c.ensureWorkspaceConcurrencyCounter(request.WorkspaceId); err != nil {
+		return err
+	}
+
+	reason, err := tryReserve()
+	if errors.Is(err, errConcurrencyCounterRepairing) {
+		if err := c.ensureWorkspaceConcurrencyCounter(request.WorkspaceId); err != nil {
+			return err
+		}
+		reason, err = tryReserve()
+	}
+	if err == nil {
+		return nil
+	}
+
+	var throttled *types.ThrottledByConcurrencyLimitError
+	if !errors.As(err, &throttled) {
+		return err
+	}
+
+	repaired, repairErr := c.repairWorkspaceConcurrencyCounterAfterThrottle(request.WorkspaceId)
+	if repairErr != nil {
+		return repairErr
+	}
+	if !repaired {
+		if reason != "" {
+			metrics.RecordConcurrencyLimitThrottle(reason, request)
+		}
+		return err
+	}
+
+	reason, err = tryReserve()
+	if err != nil && reason != "" {
+		metrics.RecordConcurrencyLimitThrottle(reason, request)
+	}
+
+	return err
+}
+
+func (c *ContainerRedisRepository) checkContainerConcurrencyLimit(quota *types.ConcurrencyLimit, request *types.ContainerRequest) (string, error) {
+	ctx := context.TODO()
+	usageKey := common.RedisKeys.WorkspaceConcurrencyLimitUsage(request.WorkspaceId)
+
+	initialized, err := c.rdb.HGet(ctx, usageKey, "initialized").Result()
+	if err != nil && err != redis.Nil {
+		return "", err
+	}
+	if err == redis.Nil || initialized != concurrencyCounterInitialized {
+		return "repairing", errConcurrencyCounterRepairing
+	}
+
+	usedGpuCount, err := c.workspaceConcurrencyUsageValue(ctx, usageKey, "gpu_count")
+	if err != nil {
+		return "", err
+	}
+
+	usedCpu, err := c.workspaceConcurrencyUsageValue(ctx, usageKey, "cpu")
+	if err != nil {
+		return "", err
+	}
+
+	if usedGpuCount+int64(request.GpuCount) > int64(quota.GPULimit) {
+		return "gpu", &types.ThrottledByConcurrencyLimitError{Reason: "gpu quota exceeded"}
+	}
+
+	if usedCpu+request.Cpu > int64(quota.CPUMillicoreLimit) {
+		return "cpu", &types.ThrottledByConcurrencyLimitError{Reason: "cpu quota exceeded"}
+	}
+
+	return "", nil
+}
+
+func (c *ContainerRedisRepository) workspaceConcurrencyUsageValue(ctx context.Context, usageKey, field string) (int64, error) {
+	value, err := c.rdb.HGet(ctx, usageKey, field).Int64()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	return value, err
+}
+
+func (c *ContainerRedisRepository) ensureWorkspaceConcurrencyCounter(workspaceId string) error {
+	ctx := context.TODO()
+	usageKey := common.RedisKeys.WorkspaceConcurrencyLimitUsage(workspaceId)
+
+	initialized, err := c.rdb.HGet(ctx, usageKey, "initialized").Result()
+	if err == nil && initialized == concurrencyCounterInitialized {
+		return nil
+	}
+	if err != nil && err != redis.Nil {
+		return err
+	}
+
+	lock, err := redislock.Obtain(ctx, c.rdb, common.RedisKeys.WorkspaceConcurrencyLimitLock(workspaceId), concurrencyCounterInitTimeout, nil)
+	if err != nil && err != redislock.ErrNotObtained {
+		return err
+	}
+	if err == redislock.ErrNotObtained {
+		return c.waitForWorkspaceConcurrencyCounter(ctx, usageKey, workspaceId)
+	}
+	defer lock.Release(ctx)
+
+	initialized, err = c.rdb.HGet(ctx, usageKey, "initialized").Result()
+	if err == nil && initialized == concurrencyCounterInitialized {
+		return nil
+	}
+	if err != nil && err != redis.Nil {
+		return err
+	}
+
+	return c.rebuildWorkspaceConcurrencyCounter(ctx, workspaceId)
+}
+
+func (c *ContainerRedisRepository) waitForWorkspaceConcurrencyCounter(ctx context.Context, usageKey, workspaceId string) error {
+	deadline := time.After(concurrencyCounterInitTimeout)
+	ticker := time.NewTicker(concurrencyCounterInitPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			return fmt.Errorf("concurrency limit usage initialization timed out for workspace %s", workspaceId)
+		case <-ticker.C:
+			initialized, err := c.rdb.HGet(ctx, usageKey, "initialized").Result()
+			if err == nil && initialized == concurrencyCounterInitialized {
+				return nil
+			}
+			if err != nil && err != redis.Nil {
+				return err
+			}
+		}
+	}
+}
+
+func (c *ContainerRedisRepository) rebuildWorkspaceConcurrencyCounter(ctx context.Context, workspaceId string) error {
+	nowTime := time.Now()
+	now := nowTime.Unix()
+	usageKey := common.RedisKeys.WorkspaceConcurrencyLimitUsage(workspaceId)
+	reservationIndexKey := common.RedisKeys.WorkspaceConcurrencyLimitReservationIndex(workspaceId)
+	// Make repairs visible to lock-free reserve/release scripts before taking
+	// the snapshot so they cannot race the final aggregate write.
+	if err := c.rdb.HSet(ctx, usageKey,
+		"initialized", concurrencyCounterRepairing,
+		"repair_started_at", now,
+	).Err(); err != nil {
+		return err
+	}
+
+	containers, err := c.GetActiveContainersByWorkspaceId(workspaceId)
 	if err != nil {
 		return err
 	}
 
-	return nil
+	totalGpuCount := int64(0)
+	totalCpu := int64(0)
+	statesByContainerId := map[string]types.ContainerState{}
+
+	pipe := c.rdb.TxPipeline()
+	for _, container := range containers {
+		statesByContainerId[container.ContainerId] = container
+		if container.Status == types.ContainerStatusStopping {
+			continue
+		}
+
+		totalGpuCount += int64(container.GpuCount)
+		totalCpu += container.Cpu
+		pipe.HSet(ctx, common.RedisKeys.WorkspaceConcurrencyLimitReservation(workspaceId, container.ContainerId),
+			"workspace_id", workspaceId,
+			"container_id", container.ContainerId,
+			"gpu_count", container.GpuCount,
+			"cpu", container.Cpu,
+			"created_at", now,
+		)
+		pipe.SAdd(ctx, reservationIndexKey, container.ContainerId)
+	}
+
+	reservationIds, err := c.rdb.SMembers(ctx, reservationIndexKey).Result()
+	if err != nil {
+		return err
+	}
+
+	for _, reservationId := range reservationIds {
+		if reservationId == "" {
+			pipe.SRem(ctx, reservationIndexKey, reservationId)
+			continue
+		}
+		reservationKey := common.RedisKeys.WorkspaceConcurrencyLimitReservation(workspaceId, reservationId)
+		res, err := c.rdb.HGetAll(ctx, reservationKey).Result()
+		if err != nil {
+			return err
+		}
+		if len(res) == 0 {
+			pipe.SRem(ctx, reservationIndexKey, reservationId)
+			continue
+		}
+
+		var reservation concurrencyReservation
+		if err := common.ToStruct(res, &reservation); err != nil {
+			pipe.Del(ctx, reservationKey)
+			pipe.SRem(ctx, reservationIndexKey, reservationId)
+			continue
+		}
+		if reservation.ContainerId == "" {
+			reservation.ContainerId = reservationId
+		}
+
+		state, stateExists := statesByContainerId[reservation.ContainerId]
+		if stateExists {
+			if state.Status == types.ContainerStatusStopping {
+				pipe.Del(ctx, reservationKey)
+				pipe.SRem(ctx, reservationIndexKey, reservation.ContainerId)
+			}
+			continue
+		}
+
+		if reservation.CreatedAt <= 0 || nowTime.Sub(time.Unix(reservation.CreatedAt, 0)) > concurrencyReservationInFlightTTL {
+			pipe.Del(ctx, reservationKey)
+			pipe.SRem(ctx, reservationIndexKey, reservation.ContainerId)
+			continue
+		}
+
+		totalGpuCount += reservation.GpuCount
+		totalCpu += reservation.Cpu
+	}
+
+	pipe.HSet(ctx, usageKey,
+		"gpu_count", totalGpuCount,
+		"cpu", totalCpu,
+		"initialized", concurrencyCounterInitialized,
+		"updated_at", now,
+		"repaired_at", now,
+	)
+
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func (c *ContainerRedisRepository) repairWorkspaceConcurrencyCounterAfterThrottle(workspaceId string) (bool, error) {
+	ctx := context.TODO()
+	usageKey := common.RedisKeys.WorkspaceConcurrencyLimitUsage(workspaceId)
+
+	needsRepair, err := c.workspaceConcurrencyCounterNeedsRepair(ctx, usageKey)
+	if err != nil {
+		return false, err
+	}
+	if !needsRepair {
+		return false, nil
+	}
+
+	lock, err := redislock.Obtain(ctx, c.rdb, common.RedisKeys.WorkspaceConcurrencyLimitLock(workspaceId), concurrencyCounterInitTimeout, nil)
+	if err != nil && err != redislock.ErrNotObtained {
+		return false, err
+	}
+	if err == redislock.ErrNotObtained {
+		return false, nil
+	}
+	defer lock.Release(ctx)
+
+	needsRepair, err = c.workspaceConcurrencyCounterNeedsRepair(ctx, usageKey)
+	if err != nil {
+		return false, err
+	}
+	if !needsRepair {
+		return false, nil
+	}
+
+	return true, c.rebuildWorkspaceConcurrencyCounter(ctx, workspaceId)
+}
+
+func (c *ContainerRedisRepository) workspaceConcurrencyCounterNeedsRepair(ctx context.Context, usageKey string) (bool, error) {
+	repairedAt, err := c.rdb.HGet(ctx, usageKey, "repaired_at").Int64()
+	if err == redis.Nil {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return time.Since(time.Unix(repairedAt, 0)) >= concurrencyCounterRepairInterval, nil
+}
+
+func (c *ContainerRedisRepository) tryReserveContainerConcurrency(quota *types.ConcurrencyLimit, request *types.ContainerRequest) (string, error) {
+	return c.tryReserveContainerConcurrencyWithContext(context.TODO(), quota, request)
+}
+
+func (c *ContainerRedisRepository) tryReserveContainerConcurrencyWithContext(ctx context.Context, quota *types.ConcurrencyLimit, request *types.ContainerRequest) (string, error) {
+	result, err := reserveConcurrencyReservationScript.Run(ctx, c.rdb, []string{
+		common.RedisKeys.WorkspaceConcurrencyLimitUsage(request.WorkspaceId),
+		common.RedisKeys.WorkspaceConcurrencyLimitReservation(request.WorkspaceId, request.ContainerId),
+		common.RedisKeys.WorkspaceConcurrencyLimitReservationIndex(request.WorkspaceId),
+	},
+		int64(quota.GPULimit),
+		int64(quota.CPUMillicoreLimit),
+		int64(request.GpuCount),
+		request.Cpu,
+		request.WorkspaceId,
+		request.ContainerId,
+		time.Now().Unix(),
+	).Text()
+	if err != nil {
+		return "", err
+	}
+
+	switch result {
+	case concurrencyReservationOK:
+		return "", nil
+	case concurrencyReservationRepairing:
+		return "repairing", errConcurrencyCounterRepairing
+	case concurrencyReservationGPUExceeded:
+		return "gpu", &types.ThrottledByConcurrencyLimitError{Reason: "gpu quota exceeded"}
+	case concurrencyReservationCPUExceeded:
+		return "cpu", &types.ThrottledByConcurrencyLimitError{Reason: "cpu quota exceeded"}
+	default:
+		return "", fmt.Errorf("unexpected concurrency reservation result: %s", result)
+	}
+}
+
+func (c *ContainerRedisRepository) releaseContainerConcurrencyReservation(ctx context.Context, workspaceId, containerId string) error {
+	if workspaceId == "" || containerId == "" {
+		return nil
+	}
+
+	for {
+		result, err := releaseConcurrencyReservationScript.Run(ctx, c.rdb, []string{
+			common.RedisKeys.WorkspaceConcurrencyLimitUsage(workspaceId),
+			common.RedisKeys.WorkspaceConcurrencyLimitReservation(workspaceId, containerId),
+			common.RedisKeys.WorkspaceConcurrencyLimitReservationIndex(workspaceId),
+		}, time.Now().Unix(), containerId).Result()
+		if err != nil {
+			return err
+		}
+		if result != concurrencyReservationRepairing {
+			return nil
+		}
+		if err := c.ensureWorkspaceConcurrencyCounter(workspaceId); err != nil {
+			return err
+		}
+	}
 }
 
 func (cr *ContainerRedisRepository) GetStubState(stubId string) (string, error) {
@@ -507,7 +1660,7 @@ func (cr *ContainerRedisRepository) DeleteStubState(stubId string) error {
 }
 
 func (cr *ContainerRedisRepository) SetContainerRequestStatus(containerId string, status types.ContainerRequestStatus) error {
-	return cr.rdb.Set(context.TODO(), common.RedisKeys.SchedulerContainerRequestStatus(containerId), status, types.ContainerRequestStatusTTL).Err()
+	return cr.rdb.Set(context.TODO(), common.RedisKeys.SchedulerContainerRequestStatus(containerId), string(status), types.ContainerRequestStatusTTL).Err()
 }
 
 func (cr *ContainerRedisRepository) GetContainerRequestStatus(containerId string) (types.ContainerRequestStatus, error) {
@@ -523,6 +1676,51 @@ func (cr *ContainerRedisRepository) SetBuildContainerTTL(containerId string, ttl
 	return cr.rdb.Set(context.TODO(), common.RedisKeys.ImageBuildContainerTTL(containerId), "1", ttl).Err()
 }
 
-func (cr *ContainerRedisRepository) HasBuildContainerTTL(containerId string) bool {
-	return cr.rdb.Exists(context.TODO(), common.RedisKeys.ImageBuildContainerTTL(containerId)).Val() != 0
+func (cr *ContainerRedisRepository) RefreshBuildContainerTTL(containerId string, ttl time.Duration) (bool, error) {
+	return cr.rdb.ExpireXX(context.TODO(), common.RedisKeys.ImageBuildContainerTTL(containerId), ttl).Result()
+}
+
+func (c *ContainerRedisRepository) SetPodKeepWarmLock(ctx context.Context, workspaceName, stubId, containerId string, keepWarmSeconds int) error {
+	return c.setKeepWarmLock(ctx, podKeepWarmLockKey(workspaceName, stubId, containerId), keepWarmSeconds)
+}
+
+func (c *ContainerRedisRepository) PodKeepWarmLockExists(ctx context.Context, workspaceName, stubId, containerId string) (bool, error) {
+	return c.keepWarmLockExists(ctx, podKeepWarmLockKey(workspaceName, stubId, containerId))
+}
+
+func (c *ContainerRedisRepository) setKeepWarmLock(ctx context.Context, key string, keepWarmSeconds int) error {
+	if key == "" {
+		return nil
+	}
+
+	switch {
+	case keepWarmSeconds < 0:
+		return c.rdb.Set(ctx, key, 1, 0).Err()
+	case keepWarmSeconds == 0:
+		return c.rdb.Del(ctx, key).Err()
+	default:
+		return c.rdb.SetEx(ctx, key, 1, time.Duration(keepWarmSeconds)*time.Second).Err()
+	}
+}
+
+func (c *ContainerRedisRepository) keepWarmLockExists(ctx context.Context, key string) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+
+	keepWarm, err := c.rdb.Get(ctx, key).Int()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return keepWarm > 0, nil
+}
+
+func podKeepWarmLockKey(workspaceName, stubId, containerId string) string {
+	if workspaceName == "" || stubId == "" || containerId == "" {
+		return ""
+	}
+	return common.RedisKeys.PodKeepWarmLock(workspaceName, stubId, containerId)
 }

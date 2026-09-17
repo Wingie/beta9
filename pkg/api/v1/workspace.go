@@ -2,7 +2,6 @@ package apiv1
 
 import (
 	"net/http"
-
 	"strings"
 
 	"github.com/beam-cloud/beta9/pkg/auth"
@@ -31,7 +30,9 @@ func NewWorkspaceGroup(g *echo.Group, backendRepo repository.BackendRepository, 
 		defaultStorageClient: defaultStorageClient,
 	}
 
-	g.POST("", group.CreateWorkspace)
+	// FlowState fork: unwrapped, a request with no token reached the handler as a
+	// plain echo.Context and nil-dereferenced cc.AuthInfo. See FLOWSTATE-FORK.md.
+	g.POST("", auth.WithClusterAdminAuth(group.CreateWorkspace))
 	g.GET("/current", auth.WithAuth(group.CurrentWorkspace))
 	g.GET("/:workspaceId/export", auth.WithStrictWorkspaceAuth(group.ExportWorkspaceConfig))
 	g.POST("/:workspaceId/set-external-storage", auth.WithStrictWorkspaceAuth(group.SetExternalWorkspaceStorage))
@@ -40,8 +41,7 @@ func NewWorkspaceGroup(g *echo.Group, backendRepo repository.BackendRepository, 
 	return group
 }
 
-type CreateWorkspaceRequest struct {
-}
+type CreateWorkspaceRequest struct{}
 
 func (g *WorkspaceGroup) CreateWorkspace(ctx echo.Context) error {
 	cc, _ := ctx.(*auth.HttpAuthContext)
@@ -53,7 +53,6 @@ func (g *WorkspaceGroup) CreateWorkspace(ctx echo.Context) error {
 	if err := ctx.Bind(&request); err != nil {
 		return HTTPBadRequest("Invalid payload")
 	}
-
 	workspace, err := g.backendRepo.CreateWorkspace(ctx.Request().Context())
 	if err != nil {
 		return HTTPInternalServerError("Unable to create workspace")

@@ -12,6 +12,7 @@ import (
 const (
 	WorkerLifecycleStatsKey                  string        = "beta9.worker.usage.spawner.lifecycle"
 	WorkerDurationStatsKey                   string        = "beta9.worker.usage.spawner.duration"
+	WorkerEventHeartbeatID                   string        = "__heartbeat__"
 	WorkerUserCodeVolume                     string        = "/mnt/code"
 	WorkerUserOutputVolume                   string        = "/outputs"
 	WorkerContainerVolumePath                string        = "/volumes"
@@ -42,20 +43,63 @@ type ContainerResourceUsage struct {
 	GpuType           string `json:"GpuType"`
 }
 
+type ContainerIpAssignment struct {
+	ContainerID string `json:"container_id"`
+	IPAddress   string `json:"ip_address"`
+}
+
 // @go2proto
 type Mount struct {
-	LocalPath        string            `json:"local_path"`
-	MountPath        string            `json:"mount_path"`
-	LinkPath         string            `json:"link_path"`
-	ReadOnly         bool              `json:"read_only"`
-	MountType        string            `json:"mount_type"`
-	MountPointConfig *MountPointConfig `json:"mountpoint_config"`
+	LocalPath        string                  `json:"local_path"`
+	MountPath        string                  `json:"mount_path"`
+	LinkPath         string                  `json:"link_path"`
+	ReadOnly         bool                    `json:"read_only"`
+	MountType        string                  `json:"mount_type"`
+	MountPointConfig *MountPointConfig       `json:"mountpoint_config"`
+	DurableDisk      *DurableDiskMountConfig `json:"durable_disk,omitempty"`
+}
+
+// @go2proto
+type DurableDiskMountConfig struct {
+	Name       string `json:"name"`
+	Size       string `json:"size"`
+	Filesystem string `json:"filesystem"`
+	Driver     string `json:"driver"`
+	// Snapshot used to seed a new disk.
+	SourceSnapshotId string `json:"source_snapshot_id,omitempty"`
+}
+
+func NewDurableDiskMountConfigFromProto(in *pb.DurableDisk) *DurableDiskMountConfig {
+	if in == nil {
+		return nil
+	}
+
+	config := &DurableDiskMountConfig{
+		Name:             in.Name,
+		Size:             in.Size,
+		Filesystem:       in.Filesystem,
+		Driver:           in.Driver,
+		SourceSnapshotId: in.SourceSnapshotId,
+	}
+
+	return config
 }
 
 func (m *Mount) ToProto() *pb.Mount {
 	var mountPointConfig *pb.MountPointConfig
 	if m.MountPointConfig != nil {
 		mountPointConfig = m.MountPointConfig.ToProto()
+	}
+
+	var durableDisk *pb.DurableDiskMountConfig
+	if m.DurableDisk != nil {
+		durableDisk = &pb.DurableDiskMountConfig{
+			Name:             m.DurableDisk.Name,
+			Size:             m.DurableDisk.Size,
+			Filesystem:       m.DurableDisk.Filesystem,
+			Driver:           m.DurableDisk.Driver,
+			SourceSnapshotId: m.DurableDisk.SourceSnapshotId,
+		}
 	}
 
 	return &pb.Mount{
@@ -65,6 +109,7 @@ func (m *Mount) ToProto() *pb.Mount {
 		ReadOnly:         m.ReadOnly,
 		MountType:        m.MountType,
 		MountPointConfig: mountPointConfig,
+		DurableDisk:      durableDisk,
 	}
 }
 
@@ -74,6 +119,17 @@ func NewMountFromProto(in *pb.Mount) *Mount {
 		mountPointConfig = NewMountPointConfigFromProto(in.MountPointConfig)
 	}
 
+	var durableDisk *DurableDiskMountConfig
+	if in.DurableDisk != nil {
+		durableDisk = &DurableDiskMountConfig{
+			Name:             in.DurableDisk.Name,
+			Size:             in.DurableDisk.Size,
+			Filesystem:       in.DurableDisk.Filesystem,
+			Driver:           in.DurableDisk.Driver,
+			SourceSnapshotId: in.DurableDisk.SourceSnapshotId,
+		}
+	}
+
 	return &Mount{
 		LocalPath:        in.LocalPath,
 		MountPath:        in.MountPath,
@@ -81,6 +137,7 @@ func NewMountFromProto(in *pb.Mount) *Mount {
 		ReadOnly:         in.ReadOnly,
 		MountType:        in.MountType,
 		MountPointConfig: mountPointConfig,
+		DurableDisk:      durableDisk,
 	}
 }
 
@@ -153,6 +210,15 @@ const (
 	RuncContainerStatusRunning string = "running"
 	RuncContainerStatusPaused  string = "paused"
 	RuncContainerStatusStopped string = "stopped"
+)
+
+type SandboxStatus string
+
+const (
+	SandboxStatusPending  SandboxStatus = "pending"
+	SandboxStatusRunning  SandboxStatus = "running"
+	SandboxStatusStopping SandboxStatus = "stopping"
+	SandboxStatusExited   SandboxStatus = "exited"
 )
 
 // @go2proto

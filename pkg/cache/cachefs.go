@@ -1,0 +1,310 @@
+package cache
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/moby/sys/mountinfo"
+)
+
+type StorageLayer interface {
+}
+
+const readAheadUpdateTimeout = 2 * time.Second
+
+// Generates a directory ID based on parent ID and name.
+func GenerateFsID(name string) string {
+	hash := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(hash[:])
+}
+
+// SHA1StringToUint64 converts the first 8 bytes of a SHA-1 hash string to a uint64
+func SHA1StringToUint64(hash string) (uint64, error) {
+	bytes, err := hex.DecodeString(hash[:16]) // first 8 bytes (16 hex characters)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint64(bytes), nil
+}
+
+type FSSystemOpts struct {
+	Verbose       bool
+	MetadataStore CacheMetadataStore
+	Config        ClientConfig
+	Client        *Client
+}
+
+type CacheFS struct {
+	ctx           context.Context
+	root          *FSNode
+	verbose       bool
+	MetadataStore CacheMetadataStore
+	Client        *Client
+	Config        ClientConfig
+}
+
+func Mount(ctx context.Context, opts FSSystemOpts) (func() error, <-chan error, *fuse.Server, error) {
+	mountPoint := opts.Config.CacheFS.MountPoint
+	Logger.Infof("Mounting to %s", mountPoint)
+
+	if _, err := os.Stat(mountPoint); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, nil, nil, fmt.Errorf("failed to stat mount point directory: %w", err)
+		}
+
+		err = os.MkdirAll(mountPoint, 0755)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to create mount point directory: %v", err)
+		}
+
+		Logger.Info("Mount point directory created.")
+	} else if isFuseMount(mountPoint) {
+		if err := forceUnmount(mountPoint); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to unmount existing FUSE mount: %v", err)
+		}
+	}
+
+	cachefs, err := NewFileSystem(ctx, opts)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("could not create filesystem: %v", err)
+	}
+
+	root, _ := cachefs.Root()
+	attrTimeout := time.Second * 5
+	entryTimeout := time.Second * 5
+	negativeTimeout := time.Second * 2 // Cache negative lookups to reduce FUSE chatter
+	fsOptions := &fs.Options{
+		AttrTimeout:     &attrTimeout,
+		EntryTimeout:    &entryTimeout,
+		NegativeTimeout: &negativeTimeout,
+	}
+
+	maxWriteKB := opts.Config.CacheFS.MaxWriteKB
+	if maxWriteKB <= 0 {
+		maxWriteKB = 1024
+	}
+	maxWrite := maxWriteKB * 1024
+	if limit := spliceSafeMaxWrite(); limit > 0 && maxWrite > limit {
+		// go-fuse sets max_read = MaxWrite and serves our fd-backed reads by
+		// splicing header+payload+one page through a pipe. If that doesn't
+		// fit in fs.pipe-max-size every read falls back to a copy and logs
+		// "trySplice: splice: want N bytes, max pipe size M" once per read.
+		Logger.Infof("cachefs: capping max read/write at %d bytes to fit fs.pipe-max-size (configured %d)", limit, maxWrite)
+		maxWrite = limit
+	}
+
+	maxReadAheadKB := opts.Config.CacheFS.MaxReadAheadKB
+	if maxReadAheadKB <= 0 {
+		maxReadAheadKB = 128
+	}
+
+	maxBackgroundTasks := opts.Config.CacheFS.MaxBackgroundTasks
+	if maxBackgroundTasks <= 0 {
+		maxBackgroundTasks = 512
+	}
+
+	// Note: CongestionThreshold would be set to 75% of MaxBackground if supported
+	// This is a recommended optimization but may not be available in all go-fuse versions
+
+	options := []string{}
+	options = append(options, opts.Config.CacheFS.Options...)
+
+	server, err := fuse.NewServer(fs.NewNodeFS(root, fsOptions), mountPoint, &fuse.MountOptions{
+		MaxBackground:        maxBackgroundTasks,
+		DisableXAttrs:        true,
+		EnableSymlinkCaching: true,
+		SyncRead:             false,
+		RememberInodes:       true,
+		MaxReadAhead:         maxReadAheadKB * 1024,
+		MaxWrite:             maxWrite,
+		Options:              options,
+		DirectMount:          opts.Config.CacheFS.DirectMount,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("could not create server: %v", err)
+	}
+
+	serverError := make(chan error, 1)
+	startServer := func() error {
+		go func() {
+			go server.Serve()
+
+			if err := server.WaitMount(); err != nil {
+				serverError <- err
+				return
+			}
+
+			server.Wait()
+			close(serverError)
+		}()
+
+		return nil
+	}
+
+	return startServer, serverError, server, nil
+}
+
+func updateReadAheadKB(mountPoint string, valueKB int) error {
+	mounts, err := mountinfo.GetMounts(nil)
+	if err != nil {
+		return fmt.Errorf("failed to get mount info: %w", err)
+	}
+
+	var deviceID string
+	for _, mount := range mounts {
+		if mount.Mountpoint == mountPoint {
+			deviceID = fmt.Sprintf("%d:%d", mount.Major, mount.Minor)
+			break
+		}
+	}
+
+	if deviceID == "" {
+		return fmt.Errorf("mount point %s not found", mountPoint)
+	}
+
+	readAheadPath := fmt.Sprintf("/sys/class/bdi/%s/read_ahead_kb", deviceID)
+	return writeReadAheadKB(readAheadPath, valueKB, readAheadUpdateTimeout)
+}
+
+func writeReadAheadKB(path string, valueKB int, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = readAheadUpdateTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.Command("sh", "-c", "cat > \"$1\"", "sh", path)
+	cmd.Stdin = strings.NewReader(strconv.Itoa(valueKB))
+	done := make(chan error, 1)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to update read_ahead_kb: %w read_ahead_path: %s", err, path)
+	}
+
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("failed to update read_ahead_kb: %w read_ahead_path: %s", err, path)
+		}
+		return nil
+	case <-ctx.Done():
+		_ = cmd.Process.Kill()
+		go func() { <-done }()
+		return fmt.Errorf("timed out updating read_ahead_kb read_ahead_path: %s", path)
+	}
+}
+
+// NewFileSystem initializes a new CacheFS with root metadata.
+func NewFileSystem(ctx context.Context, opts FSSystemOpts) (*CacheFS, error) {
+	metadataStore := opts.MetadataStore
+
+	bfs := &CacheFS{
+		ctx:           ctx,
+		verbose:       opts.Verbose,
+		Config:        opts.Config,
+		Client:        opts.Client,
+		MetadataStore: opts.MetadataStore,
+	}
+
+	rootID := GenerateFsID("/")
+	rootPID := "" // Root node has no parent
+	rootPath := "/"
+
+	dirMeta, err := metadataStore.GetFsNode(bfs.ctx, rootID)
+	if err != nil || dirMeta == nil {
+		Logger.Infof("Root node metadata not found, creating it now...")
+
+		dirMeta = &FSMetadata{PID: rootPID, ID: rootID, Path: rootPath, Ino: 1, Mode: fuse.S_IFDIR | 0755}
+
+		err := metadataStore.SetFsNode(bfs.ctx, rootID, dirMeta)
+		if err != nil {
+			Logger.Errorf("Unable to create cachefs root node dir metdata: %+v", err)
+			return nil, err
+		}
+	}
+
+	// Create the actual root filesystem node required by FUSE
+	attr := fuse.Attr{
+		Ino:  1,
+		Mode: dirMeta.Mode,
+	}
+
+	rootNode := &FSNode{
+		filesystem: bfs,
+		attr:       attr,
+
+		bfsNode: &CacheFSNode{
+			Path: dirMeta.Path,
+			ID:   dirMeta.ID,
+			PID:  dirMeta.PID,
+			Attr: attr,
+		},
+	}
+
+	bfs.root = rootNode
+	return bfs, nil
+}
+
+func (bfs *CacheFS) Root() (fs.InodeEmbedder, error) {
+	if bfs.root == nil {
+		return nil, fmt.Errorf("root not initialized")
+	}
+	return bfs.root, nil
+}
+
+func isFuseMount(mountPoint string) bool {
+	cmd := exec.Command("findmnt", "-n", "-o", "FSTYPE", mountPoint)
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), "fuse")
+}
+
+func forceUnmount(mountPoint string) error {
+	cmd := exec.Command("fusermount", "-uz", mountPoint)
+	if _, err := cmd.CombinedOutput(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// spliceSafeMaxWrite returns the largest page-aligned FUSE read/write size for
+// which go-fuse's zero-copy splice path (header + payload + one extra page)
+// fits in the kernel's maximum pipe size. Returns 0 if the limit is unknown.
+func spliceSafeMaxWrite() int {
+	content, err := os.ReadFile("/proc/sys/fs/pipe-max-size")
+	if err != nil {
+		return 0
+	}
+	pipeMax, err := strconv.Atoi(strings.TrimSpace(string(content)))
+	if err != nil || pipeMax <= 0 {
+		return 0
+	}
+	return spliceSafeMaxWriteFor(pipeMax, os.Getpagesize())
+}
+
+func spliceSafeMaxWriteFor(pipeMax, pageSize int) int {
+	if pageSize <= 0 || pipeMax <= 2*pageSize {
+		return 0
+	}
+	// The FUSE out header is 16 bytes; go-fuse grows the pipe to
+	// header + payload + pageSize, so the payload gets whatever whole pages
+	// remain once two pages are reserved (one for the extra page, one to hold
+	// the header without pushing the payload past a page boundary).
+	limit := pipeMax - 2*pageSize
+	return limit - limit%pageSize
+}

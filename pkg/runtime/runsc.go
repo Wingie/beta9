@@ -9,23 +9,43 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	types "github.com/beam-cloud/beta9/pkg/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
+const (
+	runscRestoreStateTimeout      = 30 * time.Second
+	runscRestoreStatePollInterval = 25 * time.Millisecond
+	runscDeleteTimeout            = 5 * time.Second
+	runscGPUAnnotation            = "com.beam.gvisor.nvproxy"
+	runscAllowUnsupportedDriver   = "--nvproxy-allow-unsupported-driver"
+	cudaCheckpointContainerPath   = "/usr/local/bin/cuda-checkpoint"
+)
+
 // Runsc implements Runtime using the gVisor runsc runtime
 //
-// CUDA Checkpoint/Restore:
-// For GPU workloads, cuda-checkpoint is bind-mounted from the host and executed
-// inside the container via runsc exec to freeze/unfreeze GPU state before/after
-// checkpoint/restore operations.
+// CUDA Checkpoint/Restore is delegated to runsc. GPU bundles include the
+// cuda-checkpoint helper and are marked so each runtime operation can select
+// nvproxy without sharing mutable state across containers.
 type Runsc struct {
-	cfg            Config
-	nvproxyEnabled bool
+	cfg                   Config
+	dockerPacketWriteFlag string
+}
+
+type runscState struct {
+	ID     string `json:"id"`
+	Pid    int    `json:"pid"`
+	Status string `json:"status"`
+	Bundle string `json:"bundle"`
+}
+
+type runscCommandResult struct {
+	exitCode int
+	err      error
 }
 
 // NewRunsc creates a new runsc (gVisor) runtime
@@ -35,6 +55,9 @@ func NewRunsc(cfg Config) (*Runsc, error) {
 	}
 	if cfg.RunscRoot == "" {
 		cfg.RunscRoot = "/run/gvisor"
+	}
+	if !hasRunscFlag(cfg.RunscExtraArgs, runscAllowUnsupportedDriver) {
+		cfg.RunscExtraArgs = append(append([]string(nil), cfg.RunscExtraArgs...), runscAllowUnsupportedDriver)
 	}
 
 	// Check if runsc is available
@@ -46,8 +69,18 @@ func NewRunsc(cfg Config) (*Runsc, error) {
 	}
 
 	return &Runsc{
-		cfg: cfg,
+		cfg:                   cfg,
+		dockerPacketWriteFlag: selectDockerPacketWriteFlag(runscFlags(cfg.RunscPath)),
 	}, nil
+}
+
+func hasRunscFlag(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runsc) Name() string {
@@ -71,10 +104,14 @@ func (r *Runsc) Prepare(ctx context.Context, spec *specs.Spec) error {
 	}
 
 	spec.Linux.Seccomp = nil
-	r.nvproxyEnabled = r.hasGPUDevices(spec)
-
-	if r.nvproxyEnabled {
+	if r.hasGPUDevices(spec) {
+		if spec.Annotations == nil {
+			spec.Annotations = make(map[string]string)
+		}
+		spec.Annotations[runscGPUAnnotation] = "true"
 		r.mountCudaCheckpoint(spec)
+	} else if spec.Annotations != nil {
+		delete(spec.Annotations, runscGPUAnnotation)
 	}
 
 	// gVisor does not use spec.Linux.Devices for device passthrough.
@@ -94,7 +131,7 @@ func (r *Runsc) mountCudaCheckpoint(spec *specs.Spec) {
 	}
 
 	spec.Mounts = append(spec.Mounts, specs.Mount{
-		Destination: "/usr/local/bin/cuda-checkpoint",
+		Destination: cudaCheckpointContainerPath,
 		Type:        "bind",
 		Source:      cudaCheckpointPath,
 		Options:     []string{"bind", "ro"},
@@ -103,7 +140,7 @@ func (r *Runsc) mountCudaCheckpoint(spec *specs.Spec) {
 
 // hasGPUDevices checks if the spec contains GPU device configurations
 func (r *Runsc) hasGPUDevices(spec *specs.Spec) bool {
-	if spec.Linux == nil {
+	if spec == nil || spec.Linux == nil {
 		return false
 	}
 
@@ -124,15 +161,17 @@ func (r *Runsc) hasGPUDevices(spec *specs.Spec) bool {
 
 func (r *Runsc) Run(ctx context.Context, containerID, bundlePath string, opts *RunOpts) (int, error) {
 	dockerEnabled := opts != nil && opts.DockerEnabled
+	nvproxyEnabled, err := r.bundleUsesGPU(bundlePath)
+	if err != nil {
+		return -1, err
+	}
 
 	defer func() {
-		deleteArgs := r.baseArgs(dockerEnabled)
-		deleteArgs = append(deleteArgs, "delete", "--force", containerID)
-		_ = exec.Command(r.cfg.RunscPath, deleteArgs...).Run()
+		r.forceDelete(containerID, dockerEnabled)
 	}()
 
 	args := r.baseArgs(dockerEnabled)
-	if r.nvproxyEnabled {
+	if nvproxyEnabled {
 		args = append(args, "--nvproxy=true")
 	}
 	args = append(args, "run", "--bundle", bundlePath, containerID)
@@ -162,7 +201,7 @@ func (r *Runsc) Run(ctx context.Context, containerID, bundlePath string, opts *R
 	}()
 
 	// Wait for exit
-	err := cmd.Wait()
+	err = cmd.Wait()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok {
@@ -221,6 +260,32 @@ func (r *Runsc) Exec(ctx context.Context, containerID string, proc specs.Process
 	return cmd.Wait()
 }
 
+func (r *Runsc) UpdateResources(ctx context.Context, containerID string, resources *specs.LinuxResources) error {
+	if resources == nil {
+		return fmt.Errorf("resources cannot be nil")
+	}
+
+	file, err := os.CreateTemp("", "runsc-resources-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+
+	if err := json.NewEncoder(file).Encode(resources); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+
+	args := append(r.baseArgs(false), "update", "--resources", file.Name(), containerID)
+	if output, err := exec.CommandContext(ctx, r.cfg.RunscPath, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to update container resources: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
 func (r *Runsc) Kill(ctx context.Context, containerID string, sig syscall.Signal, opts *KillOpts) error {
 	args := r.baseArgs(false)
 	args = append(args, "kill")
@@ -250,37 +315,49 @@ func (r *Runsc) Delete(ctx context.Context, containerID string, opts *DeleteOpts
 }
 
 func (r *Runsc) State(ctx context.Context, containerID string) (State, error) {
+	state, err := r.loadState(ctx, containerID)
+	if err != nil {
+		return State{}, err
+	}
+
+	return State{
+		ID:     state.ID,
+		Pid:    state.Pid,
+		Status: state.Status,
+	}, nil
+}
+
+func (r *Runsc) loadState(ctx context.Context, containerID string) (runscState, error) {
 	args := r.baseArgs(false)
 	args = append(args, "state", containerID)
 
 	cmd := exec.CommandContext(ctx, r.cfg.RunscPath, args...)
 
 	var stdout bytes.Buffer
+	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return State{}, ErrContainerNotFound{ContainerID: containerID}
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			// Newer runsc releases return 128 when the container bundle has
+			// already disappeared; older releases returned 1 for this case.
+			if exitErr.ExitCode() == 1 ||
+				(exitErr.ExitCode() == 128 && strings.Contains(strings.ToLower(stderr.String()), "loading container: file does not exist")) {
+				return runscState{}, ErrContainerNotFound{ContainerID: containerID}
+			}
 		}
-		return State{}, fmt.Errorf("failed to get state: %w", err)
+		if output := strings.TrimSpace(stderr.String()); output != "" {
+			return runscState{}, fmt.Errorf("failed to get state: %w (stderr: %s)", err, output)
+		}
+		return runscState{}, fmt.Errorf("failed to get state: %w", err)
 	}
 
-	// Parse the JSON output from runsc state
-	var stateJSON struct {
-		ID     string `json:"id"`
-		Pid    int    `json:"pid"`
-		Status string `json:"status"`
+	var state runscState
+	if err := json.Unmarshal(stdout.Bytes(), &state); err != nil {
+		return runscState{}, fmt.Errorf("failed to parse state output: %w", err)
 	}
-
-	if err := json.Unmarshal(stdout.Bytes(), &stateJSON); err != nil {
-		return State{}, fmt.Errorf("failed to parse state output: %w", err)
-	}
-
-	return State{
-		ID:     stateJSON.ID,
-		Pid:    stateJSON.Pid,
-		Status: stateJSON.Status,
-	}, nil
+	return state, nil
 }
 
 func (r *Runsc) Events(ctx context.Context, containerID string) (<-chan Event, error) {
@@ -297,14 +374,9 @@ func (r *Runsc) Checkpoint(ctx context.Context, containerID string, opts *Checkp
 		return fmt.Errorf("checkpoint options cannot be nil")
 	}
 
-	// Freeze CUDA processes before checkpointing (non-fatal)
-	if r.nvproxyEnabled {
-		if err := r.cudaCheckpointProcesses(ctx, containerID, "checkpoint", opts.OutputWriter); err != nil {
-			// Log but don't fail - CUDA checkpoint is optional
-			if opts.OutputWriter != nil {
-				fmt.Fprintf(opts.OutputWriter, "Warning: CUDA checkpoint failed: %v\n", err)
-			}
-		}
+	nvproxyEnabled, err := r.containerUsesGPU(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect container bundle: %w", err)
 	}
 
 	// Ensure directories exist
@@ -321,6 +393,9 @@ func (r *Runsc) Checkpoint(ctx context.Context, containerID string, opts *Checkp
 
 	args := r.baseArgs(false)
 	args = append(args, "checkpoint")
+	if nvproxyEnabled {
+		args = append(args, "--cuda-checkpoint-path", cudaCheckpointContainerPath)
+	}
 	if opts.ImagePath != "" {
 		args = append(args, "--image-path", opts.ImagePath)
 	}
@@ -366,11 +441,10 @@ func (r *Runsc) Restore(ctx context.Context, containerID string, opts *RestoreOp
 		return -1, fmt.Errorf("restore options cannot be nil")
 	}
 
-	defer func() {
-		deleteArgs := r.baseArgs(false)
-		deleteArgs = append(deleteArgs, "delete", "--force", containerID)
-		_ = exec.Command(r.cfg.RunscPath, deleteArgs...).Run()
-	}()
+	nvproxyEnabled, err := r.bundleUsesGPU(opts.BundlePath)
+	if err != nil {
+		return -1, err
+	}
 
 	// Ensure directories exist
 	if opts.WorkDir != "" {
@@ -380,10 +454,10 @@ func (r *Runsc) Restore(ctx context.Context, containerID string, opts *RestoreOp
 	}
 
 	args := r.baseArgs(false)
-	if r.nvproxyEnabled {
+	if nvproxyEnabled {
 		args = append(args, "--nvproxy=true")
 	}
-	args = append(args, "restore")
+	args = append(args, "restore", "--background", "--direct")
 	if opts.ImagePath != "" {
 		args = append(args, "--image-path", opts.ImagePath)
 	}
@@ -398,6 +472,15 @@ func (r *Runsc) Restore(ctx context.Context, containerID string, opts *RestoreOp
 
 	cmd := exec.CommandContext(ctx, r.cfg.RunscPath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cleanupOnFailure := true
+	defer func() {
+		if cleanupOnFailure {
+			r.forceDelete(containerID, false)
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		}
+	}()
 
 	// Capture stderr for better error reporting
 	var stderr bytes.Buffer
@@ -416,98 +499,143 @@ func (r *Runsc) Restore(ctx context.Context, containerID string, opts *RestoreOp
 		return -1, err
 	}
 
-	if opts.Started != nil {
-		opts.Started <- cmd.Process.Pid
-	}
-
 	go func() {
 		<-ctx.Done()
-		if pgid, _ := syscall.Getpgid(cmd.Process.Pid); pgid > 0 {
-			syscall.Kill(-pgid, syscall.SIGKILL)
-		}
+		r.forceDelete(containerID, false)
+		_ = cmd.Process.Kill()
 	}()
 
-	err := cmd.Wait()
+	restoreDone := make(chan runscCommandResult, 1)
+	go func() {
+		restoreDone <- runscWaitResult(cmd.Wait(), stderr.String(), "restore")
+	}()
+
+	pid, err := r.waitForRestoredContainerPID(ctx, containerID, restoreDone)
 	if err != nil {
-		stderrStr := stderr.String()
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				if stderrStr != "" {
-					return ws.ExitStatus(), fmt.Errorf("restore failed with exit code %d (stderr: %s)", ws.ExitStatus(), stderrStr)
-				}
-				return ws.ExitStatus(), nil
-			}
-		}
-		if stderrStr != "" {
-			return -1, fmt.Errorf("restore failed: %w (stderr: %s)", err, stderrStr)
-		}
 		return -1, err
 	}
 
-	// Unfreeze CUDA processes after restore (non-fatal)
-	if r.nvproxyEnabled {
-		if err := r.cudaCheckpointProcesses(ctx, containerID, "restore", opts.OutputWriter); err != nil {
-			// Log but don't fail - CUDA restore is optional
-			if opts.OutputWriter != nil {
-				fmt.Fprintf(opts.OutputWriter, "Warning: CUDA restore failed: %v\n", err)
-			}
+	if err := r.waitForRestore(ctx, containerID); err != nil {
+		return -1, err
+	}
+
+	if opts.Started != nil {
+		select {
+		case opts.Started <- pid:
+		case <-ctx.Done():
+			return -1, ctx.Err()
 		}
 	}
 
+	cleanupOnFailure = false
 	return 0, nil
 }
 
-// cudaCheckpointProcesses runs cuda-checkpoint on all CUDA processes inside the container
-// action should be "checkpoint" (freeze) or "restore" (unfreeze)
-func (r *Runsc) cudaCheckpointProcesses(ctx context.Context, containerID, action string, outputWriter OutputWriter) error {
-	pids, err := r.findCUDAProcesses(ctx, containerID)
-	if err != nil || len(pids) == 0 {
-		return nil // No CUDA processes, skip
+func (r *Runsc) forceDelete(containerID string, dockerEnabled bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), runscDeleteTimeout)
+	defer cancel()
+
+	args := append(r.baseArgs(dockerEnabled), "delete", "--force", containerID)
+	_ = exec.CommandContext(ctx, r.cfg.RunscPath, args...).Run()
+}
+
+func (r *Runsc) waitForRestore(ctx context.Context, containerID string) error {
+	args := append(r.baseArgs(false), "wait", "--restore", containerID)
+	if output, err := exec.CommandContext(ctx, r.cfg.RunscPath, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed waiting for restore completion: %w (output: %s)", err, strings.TrimSpace(string(output)))
 	}
-
-	for _, pid := range pids {
-		args := r.baseArgs(false)
-		args = append(args, "exec", containerID, "/usr/local/bin/cuda-checkpoint", action, strconv.Itoa(pid))
-
-		cmd := exec.CommandContext(ctx, r.cfg.RunscPath, args...)
-		if outputWriter != nil {
-			cmd.Stdout = outputWriter
-			cmd.Stderr = outputWriter
-		}
-
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("cuda-checkpoint %s failed for PID %d: %w", action, pid, err)
-		}
-	}
-
 	return nil
 }
 
-// findCUDAProcesses finds container PIDs with nvidia device file descriptors
-func (r *Runsc) findCUDAProcesses(ctx context.Context, containerID string) ([]int, error) {
-	args := r.baseArgs(false)
-	args = append(args, "exec", containerID, "sh", "-c",
-		"for pid in /proc/[0-9]*; do "+
-			"[ -d \"$pid/fd\" ] && ls -l $pid/fd 2>/dev/null | grep -q nvidia && basename $pid; "+
-			"done")
+func (r *Runsc) waitForRestoredContainerPID(ctx context.Context, containerID string, restoreDone <-chan runscCommandResult) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, runscRestoreStateTimeout)
+	defer cancel()
 
-	output, err := exec.CommandContext(ctx, r.cfg.RunscPath, args...).Output()
-	if err != nil {
-		return []int{1}, nil // Fallback to PID 1
+	ticker := time.NewTicker(runscRestoreStatePollInterval)
+	defer ticker.Stop()
+
+	var lastErr error
+	var restoreResult *runscCommandResult
+	for {
+		state, err := r.State(ctx, containerID)
+		if err == nil && state.Pid > 0 {
+			return state.Pid, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("restored container state has no pid")
+		}
+
+		select {
+		case <-ctx.Done():
+			if restoreResult != nil && restoreResult.err != nil {
+				return restoreResult.exitCode, restoreResult.err
+			}
+			return -1, fmt.Errorf("restore succeeded but restored container state was unavailable: %w", lastErr)
+		case result := <-restoreDone:
+			restoreResult = &result
+			restoreDone = nil
+			if result.err != nil {
+				return result.exitCode, result.err
+			}
+		case <-ticker.C:
+		}
+	}
+}
+
+func runscWaitResult(err error, stderr, operation string) runscCommandResult {
+	if err == nil {
+		return runscCommandResult{exitCode: 0}
 	}
 
-	var pids []int
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
-			pids = append(pids, pid)
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			exitCode := ws.ExitStatus()
+			if stderr != "" {
+				return runscCommandResult{
+					exitCode: exitCode,
+					err:      fmt.Errorf("%s failed with exit code %d (stderr: %s)", operation, exitCode, stderr),
+				}
+			}
+			return runscCommandResult{exitCode: exitCode, err: err}
 		}
 	}
 
-	if len(pids) == 0 {
-		return []int{1}, nil // Fallback to PID 1
+	if stderr != "" {
+		return runscCommandResult{
+			exitCode: -1,
+			err:      fmt.Errorf("%s failed: %w (stderr: %s)", operation, err, stderr),
+		}
 	}
 
-	return pids, nil
+	return runscCommandResult{exitCode: -1, err: err}
+}
+
+func (r *Runsc) containerUsesGPU(ctx context.Context, containerID string) (bool, error) {
+	state, err := r.loadState(ctx, containerID)
+	if err != nil {
+		return false, err
+	}
+	return r.bundleUsesGPU(state.Bundle)
+}
+
+func (r *Runsc) bundleUsesGPU(bundlePath string) (bool, error) {
+	if bundlePath == "" {
+		return false, fmt.Errorf("container bundle path is empty")
+	}
+
+	config, err := os.Open(filepath.Join(bundlePath, "config.json"))
+	if err != nil {
+		return false, fmt.Errorf("failed to open container bundle: %w", err)
+	}
+	defer config.Close()
+
+	var spec specs.Spec
+	if err := json.NewDecoder(config).Decode(&spec); err != nil {
+		return false, fmt.Errorf("failed to decode container bundle: %w", err)
+	}
+	return spec.Annotations[runscGPUAnnotation] == "true" || r.hasGPUDevices(&spec), nil
 }
 
 func (r *Runsc) Close() error {
@@ -528,57 +656,41 @@ func (r *Runsc) baseArgs(dockerEnabled bool) []string {
 		args = append(args, "--platform", r.cfg.RunscPlatform)
 	}
 
-	// flags for rootfs propagation and external modification detection
-	args = append(args, "--overlay2=none", "--file-access=shared")
+	args = append(args, r.cfg.RunscExtraArgs...)
 
-	// Add --net-raw flag if Docker-in-Docker is enabled
-	// This is required for Docker to function properly inside gVisor
+	// Add flags required for Docker to function properly inside gVisor.
 	if dockerEnabled {
 		args = append(args, "--net-raw")
+		if r.dockerPacketWriteFlag != "" {
+			args = append(args, r.dockerPacketWriteFlag)
+		}
 	}
 
 	return args
 }
 
+func runscFlags(runscPath string) string {
+	out, err := exec.Command(runscPath, "flags").Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+func selectDockerPacketWriteFlag(flags string) string {
+	switch {
+	case strings.Contains(flags, "-allow-packet-socket-write"):
+		return "--allow-packet-socket-write"
+	case strings.Contains(flags, "-TESTONLY-allow-packet-endpoint-write"):
+		return "--TESTONLY-allow-packet-endpoint-write"
+	default:
+		return ""
+	}
+}
+
 // AddDockerInDockerCapabilities adds the capabilities required for running Docker inside gVisor.
-// According to gVisor documentation, Docker requires: audit_write, chown, dac_override, fowner,
-// fsetid, kill, mknod, net_bind_service, net_admin, net_raw, setfcap, setgid, setpcap, setuid,
-// sys_admin, sys_chroot, sys_ptrace
 func (r *Runsc) AddDockerInDockerCapabilities(spec *specs.Spec) {
-	if spec.Process == nil {
-		spec.Process = &specs.Process{}
-	}
-
-	if spec.Process.Capabilities == nil {
-		spec.Process.Capabilities = &specs.LinuxCapabilities{}
-	}
-
-	// Capabilities required for Docker-in-Docker according to gVisor documentation
-	dockerCaps := []string{
-		"CAP_AUDIT_WRITE",
-		"CAP_CHOWN",
-		"CAP_DAC_OVERRIDE",
-		"CAP_FOWNER",
-		"CAP_FSETID",
-		"CAP_KILL",
-		"CAP_MKNOD",
-		"CAP_NET_BIND_SERVICE",
-		"CAP_NET_ADMIN",
-		"CAP_NET_RAW",
-		"CAP_SETFCAP",
-		"CAP_SETGID",
-		"CAP_SETPCAP",
-		"CAP_SETUID",
-		"CAP_SYS_ADMIN",
-		"CAP_SYS_CHROOT",
-		"CAP_SYS_PTRACE",
-	}
-
-	// Add capabilities to all capability sets
-	spec.Process.Capabilities.Bounding = mergeCapabilities(spec.Process.Capabilities.Bounding, dockerCaps)
-	spec.Process.Capabilities.Effective = mergeCapabilities(spec.Process.Capabilities.Effective, dockerCaps)
-	spec.Process.Capabilities.Permitted = mergeCapabilities(spec.Process.Capabilities.Permitted, dockerCaps)
-	spec.Process.Capabilities.Inheritable = mergeCapabilities(spec.Process.Capabilities.Inheritable, dockerCaps)
+	AddDockerInDockerCapabilities(spec)
 }
 
 // mergeCapabilities merges two capability lists, avoiding duplicates

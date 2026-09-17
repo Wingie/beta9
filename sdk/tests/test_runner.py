@@ -1,10 +1,29 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from inspect import signature
+from time import sleep
+from unittest.mock import MagicMock
 
+from beta9.abstractions.base import runner as runner_module
 from beta9.abstractions.base.runner import RunnerAbstraction
+from beta9.abstractions.endpoint import ASGI, Endpoint, RealtimeASGI
+from beta9.abstractions.experimental.bot.bot import Bot
+from beta9.abstractions.function import Function, Schedule
+from beta9.abstractions.image import ImageBuildResult
+from beta9.abstractions.integrations.fastmcp import MCPServer
+from beta9.abstractions.integrations.vllm import VLLM
+from beta9.abstractions.pod import Pod
+from beta9.abstractions.sandbox import Sandbox
+from beta9.abstractions.taskqueue import TaskQueue
+from beta9.clients.gateway import GetOrCreateStubResponse
+from beta9.clients.pod import CreatePodResponse
+from beta9.sync import FileSyncResult
+from beta9.type import DurableDisk
 
 
 class TestRunner(unittest.TestCase):
     def setUp(self):
+        runner_module._stub_created_for_workspace = False
         self.runner = RunnerAbstraction()
 
     def test_cpu_parsing_float_input_within_range(self):
@@ -49,3 +68,101 @@ class TestRunner(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             self.runner.parse_cpu({})  # type:ignore[reportArgumentType]
+
+    def test_prepare_runtime_is_single_flight(self):
+        def slow_image_build():
+            sleep(0.01)
+            return ImageBuildResult(success=True, image_id="image-id", python_version="python3.12")
+
+        def slow_file_sync(ignore_patterns=None):
+            sleep(0.01)
+            return FileSyncResult(success=True, object_id="object-id")
+
+        def slow_stub_create(request):
+            sleep(0.01)
+            return GetOrCreateStubResponse(ok=True, stub_id="stub-id")
+
+        self.runner.image.build = MagicMock(side_effect=slow_image_build)
+        self.runner.syncer.sync = MagicMock(side_effect=slow_file_sync)
+        self.runner.gateway_stub.get_or_create_stub = MagicMock(side_effect=slow_stub_create)
+
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            results = list(
+                executor.map(
+                    lambda _: self.runner.prepare_runtime(
+                        stub_type="sandbox",
+                        force_create_stub=True,
+                    ),
+                    range(16),
+                )
+            )
+
+        self.assertTrue(all(results))
+        self.assertEqual(self.runner.image.build.call_count, 1)
+        self.assertEqual(self.runner.syncer.sync.call_count, 1)
+        self.assertEqual(self.runner.gateway_stub.get_or_create_stub.call_count, 1)
+
+    def test_stub_creation_flag_is_not_reset_on_read(self):
+        runner_module._mark_stub_created_for_workspace()
+
+        self.assertTrue(runner_module._stub_created_for_current_workspace())
+        self.assertTrue(runner_module._stub_created_for_current_workspace())
+
+    def test_stub_request_exports_durable_disks(self):
+        self.runner.disks = [
+            DurableDisk(name="cache", size="10Gi", mount_path="/cache", read_only=True)
+        ]
+
+        request = self.runner._stub_request(
+            stub_type="function",
+            stub_name="function/test:handler",
+            force_create_stub=True,
+            autoscaler_type="queue_depth",
+            inputs=None,
+            outputs=None,
+        )
+
+        self.assertEqual(len(request.disks), 1)
+        self.assertEqual(request.disks[0].name, "cache")
+        self.assertEqual(request.disks[0].size, "10Gi")
+        self.assertEqual(request.disks[0].mount_path, "/cache")
+        self.assertTrue(request.disks[0].read_only)
+
+    def test_public_runtime_abstractions_accept_durable_disks(self):
+        for cls in (
+            Function,
+            Schedule,
+            Endpoint,
+            ASGI,
+            RealtimeASGI,
+            TaskQueue,
+            Sandbox,
+            Bot,
+            MCPServer,
+            VLLM,
+        ):
+            self.assertIn("disks", signature(cls.__init__).parameters, cls.__name__)
+
+    def test_pod_create_passes_machine_and_returns_ids(self):
+        # management_url was dropped from CreatePodResponse; the server
+        # returns task_id/app_id and the SDK builds any dashboard URL itself.
+        pod = Pod(entrypoint=["echo", "hello"])
+        pod.prepare_runtime = MagicMock(return_value=True)
+        pod.stub = MagicMock()
+        pod.stub.create_pod.return_value = CreatePodResponse(
+            ok=True,
+            container_id="pod-1",
+            stub_id="stub-1",
+            task_id="task-1",
+            app_id="app-1",
+        )
+        pod.stub_id = "stub-1"
+        pod.print_invocation_snippet = MagicMock(return_value=MagicMock(url=""))
+
+        result = pod.create(machine_id="machine-1")
+
+        request = pod.stub.create_pod.call_args.args[0]
+        self.assertEqual(request.machine_id, "machine-1")
+        self.assertEqual(result.container_id, "pod-1")
+        self.assertEqual(result.task_id, "task-1")
+        self.assertEqual(result.app_id, "app-1")

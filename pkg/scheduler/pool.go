@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,20 +26,29 @@ const (
 	PrometheusPortKey           string  = "prometheus.io/port"
 	PrometheusScrapeKey         string  = "prometheus.io/scrape"
 	tmpVolumeName               string  = "beta9-tmp"
-	logVolumeName               string  = "beta9-logs"
 	imagesVolumeName            string  = "beta9-images"
 	storageVolumeName           string  = "beta9-storage"
-	checkpointVolumeName        string  = "beta9-checkpoints"
+	cacheVolumeName             string  = "beta9-cache"
+	durableDiskVolumeName       string  = "beta9-durable-disks"
+	kernelModulesVolumeName     string  = "host-kernel-modules"
+	devicePluginVolumeName      string  = "kubelet-device-plugins"
+	defaultDevicePluginPath     string  = "/var/lib/kubelet/device-plugins"
 	defaultContainerName        string  = "worker"
+	defaultWorkerInit           string  = "/usr/bin/tini"
 	defaultWorkerEntrypoint     string  = "/usr/local/bin/worker"
-	defaultWorkerLogPath        string  = "/var/log/worker"
 	defaultImagesPath           string  = "/images"
-	defaultCheckpointPath       string  = "/checkpoints"
 	defaultStoragePath          string  = "/storage"
+	defaultCachePath            string  = "/var/lib/beta9/cache"
 	defaultSharedMemoryPct      float32 = 0.5
+	defaultWorkerStopGraceS     int64   = 30
+	minWorkerPodGraceS          int64   = 120
 	poolMonitoringInterval              = 1 * time.Second
 	poolHealthCheckInterval             = 10 * time.Second
 )
+
+func workerPodCommand() []string {
+	return []string{defaultWorkerInit, "-g", "--", defaultWorkerEntrypoint}
+}
 
 type WorkerPoolController interface {
 	AddWorker(cpu int64, memory int64, gpuCount uint32) (*types.Worker, error)
@@ -68,29 +78,98 @@ type WorkerPoolCapacity struct {
 }
 
 type WorkerPoolControllerOptions struct {
-	Name           string
-	Context        context.Context
-	Config         types.AppConfig
-	BackendRepo    repository.BackendRepository
-	WorkerRepo     repository.WorkerRepository
-	WorkerPoolRepo repository.WorkerPoolRepository
-	ContainerRepo  repository.ContainerRepository
-	ProviderName   *types.MachineProvider
-	ProviderRepo   repository.ProviderRepository
-	EventRepo      repository.EventRepository
-	Tailscale      *network.Tailscale
+	Name            string
+	Context         context.Context
+	Config          types.AppConfig
+	BackendRepo     repository.BackendRepository
+	WorkerRepo      repository.WorkerRepository
+	WorkerPoolRepo  repository.WorkerPoolRepository
+	ContainerRepo   repository.ContainerRepository
+	ProviderName    *types.MachineProvider
+	ProviderRepo    repository.ProviderRepository
+	EventRepo       repository.EventRepository
+	PushPoolMetrics func(types.EventComputeSchema)
+	Tailscale       *network.Tailscale
 }
 
 func GenerateWorkerId() string {
 	return uuid.New().String()[:8]
 }
 
+func workerCacheEnabled(config types.AppConfig, poolConfig types.WorkerPoolConfig) bool {
+	if !config.Cache.Enabled || !config.Worker.CacheEnabled {
+		return false
+	}
+	if poolConfig.Cache.Enabled != nil && !*poolConfig.Cache.Enabled {
+		return false
+	}
+	if poolConfig.Cache.Disk.Enabled != nil {
+		return *poolConfig.Cache.Disk.Enabled
+	}
+	return config.Cache.Disk.Enabled
+}
+
+// workerImagesHostPath returns the host path backing the worker's /images
+// volume (clip decompressed-layer disk cache, layer index artifacts, and
+// image mounts). Pools can override it to place the cache on a different
+// host disk; the in-pod mount path stays /images.
+func workerImagesHostPath(poolConfig types.WorkerPoolConfig) string {
+	if poolConfig.ImagesPath != "" {
+		return poolConfig.ImagesPath
+	}
+	return defaultImagesPath
+}
+
+func workerDurableDisksHostPath(poolConfig types.WorkerPoolConfig) string {
+	if poolConfig.DurableDisksPath != "" {
+		return poolConfig.DurableDisksPath
+	}
+	if poolConfig.StoragePath != "" {
+		return filepath.Join(poolConfig.StoragePath, "durable-disks")
+	}
+	return types.DefaultDurableDisksPath
+}
+
+func workerCacheHostPath(config types.AppConfig, poolConfig types.WorkerPoolConfig) string {
+	if poolConfig.Cache.Disk.HostPath != "" {
+		return poolConfig.Cache.Disk.HostPath
+	}
+	if config.Cache.Disk.HostPath != "" {
+		return config.Cache.Disk.HostPath
+	}
+	return defaultCachePath
+}
+
+func workerCacheMountPath(config types.AppConfig, poolConfig types.WorkerPoolConfig) string {
+	if poolConfig.Cache.Disk.MountPath != "" {
+		return poolConfig.Cache.Disk.MountPath
+	}
+	if config.Cache.Disk.MountPath != "" {
+		return config.Cache.Disk.MountPath
+	}
+	return defaultCachePath
+}
+
+func workerPodTerminationGracePeriod(workerStopGraceS int64) int64 {
+	if workerStopGraceS <= 0 {
+		workerStopGraceS = defaultWorkerStopGraceS
+	}
+
+	// Covers task drain, forced nested-container stop, and FUSE unmounts.
+	grace := workerStopGraceS*2 + 60
+	if grace < minWorkerPodGraceS {
+		return minWorkerPodGraceS
+	}
+	return grace
+}
+
 func MonitorPoolSize(wpc WorkerPoolController,
+	config types.AppConfig,
 	workerPoolConfig *types.WorkerPoolConfig,
 	workerRepo repository.WorkerRepository,
 	workerPoolRepo repository.WorkerPoolRepository,
 	providerRepo repository.ProviderRepository) error {
-	poolSizer, err := NewWorkerPoolSizer(wpc, workerPoolConfig, workerRepo, workerPoolRepo, providerRepo)
+	poolSizer, err := NewWorkerPoolSizer(wpc, config, workerPoolConfig, workerRepo, workerPoolRepo, providerRepo)
 	if err != nil {
 		return err
 	}
@@ -100,24 +179,13 @@ func MonitorPoolSize(wpc WorkerPoolController,
 }
 
 func MonitorPoolHealth(opts PoolHealthMonitorOptions) error {
-	poolHealthMonitor := NewPoolHealthMonitor(PoolHealthMonitorOptions{
-		Controller:       opts.Controller,
-		WorkerPoolConfig: opts.WorkerPoolConfig,
-		WorkerConfig:     opts.WorkerConfig,
-		WorkerRepo:       opts.WorkerRepo,
-		ProviderRepo:     opts.ProviderRepo,
-		WorkerPoolRepo:   opts.WorkerPoolRepo,
-		ContainerRepo:    opts.ContainerRepo,
-		EventRepo:        opts.EventRepo,
-	})
-
+	poolHealthMonitor := NewPoolHealthMonitor(opts)
 	go poolHealthMonitor.Start()
-
 	return nil
 }
 
-func freePoolCapacity(workerRepo repository.WorkerRepository, wpc WorkerPoolController) (*WorkerPoolCapacity, error) {
-	workers, err := workerRepo.GetAllWorkersInPool(wpc.Name())
+func freePoolCapacity(workerRepo repository.WorkerRepository, poolName string) (*WorkerPoolCapacity, error) {
+	workers, err := workerRepo.GetAllWorkersInPool(poolName)
 	if err != nil {
 		return nil, err
 	}

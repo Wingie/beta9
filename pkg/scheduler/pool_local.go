@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/beam-cloud/beta9/pkg/common"
 	"github.com/beam-cloud/beta9/pkg/repository"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/rs/zerolog/log"
@@ -63,7 +65,7 @@ func NewLocalKubernetesWorkerPoolController(opts WorkerPoolControllerOptions) (W
 	}
 
 	// Start monitoring worker pool size
-	err = MonitorPoolSize(wpc, &workerPoolConfig, wpc.workerRepo, wpc.workerPoolRepo, opts.ProviderRepo)
+	err = MonitorPoolSize(wpc, opts.Config, &workerPoolConfig, wpc.workerRepo, wpc.workerPoolRepo, opts.ProviderRepo)
 	if err != nil {
 		log.Error().Str("pool_name", wpc.name).Err(err).Msg("unable to monitor pool size")
 	}
@@ -72,12 +74,12 @@ func NewLocalKubernetesWorkerPoolController(opts WorkerPoolControllerOptions) (W
 	err = MonitorPoolHealth(PoolHealthMonitorOptions{
 		Controller:       wpc,
 		WorkerPoolConfig: workerPoolConfig,
-		WorkerConfig:     wpc.config.Worker,
+		FailoverHealth:   wpc.config.Scheduling.Failover.Health,
 		WorkerRepo:       wpc.workerRepo,
 		ProviderRepo:     opts.ProviderRepo,
 		WorkerPoolRepo:   wpc.workerPoolRepo,
 		ContainerRepo:    wpc.containerRepo,
-		EventRepo:        opts.EventRepo,
+		PushMetrics:      opts.PushPoolMetrics,
 	})
 	if err != nil {
 		log.Error().Str("pool_name", wpc.name).Err(err).Msg("unable to monitor pool health")
@@ -109,7 +111,7 @@ func (wpc *LocalKubernetesWorkerPoolController) RequiresPoolSelector() bool {
 }
 
 func (wpc *LocalKubernetesWorkerPoolController) FreeCapacity() (*WorkerPoolCapacity, error) {
-	return freePoolCapacity(wpc.workerRepo, wpc)
+	return freePoolCapacity(wpc.workerRepo, wpc.name)
 }
 
 func (wpc *LocalKubernetesWorkerPoolController) State() (*types.WorkerPoolState, error) {
@@ -157,7 +159,7 @@ func (wpc *LocalKubernetesWorkerPoolController) addWorkerWithId(workerId string,
 
 	// Add the worker state
 	if err := wpc.workerRepo.AddWorker(worker); err != nil {
-		log.Error().Err(err).Msg("unable to create worker")
+		workerLog(log.Error(), worker).Err(err).Msg("unable to create worker")
 		return nil, err
 	}
 
@@ -166,13 +168,18 @@ func (wpc *LocalKubernetesWorkerPoolController) addWorkerWithId(workerId string,
 
 func (wpc *LocalKubernetesWorkerPoolController) createWorkerJob(workerId string, cpu int64, memory int64, gpuType string, gpuCount uint32, token string) (*batchv1.Job, *types.Worker) {
 	jobName := fmt.Sprintf("%s-%s-%s", Beta9WorkerJobPrefix, wpc.name, workerId)
+	workerConfig := wpc.workerPodConfig()
+	prometheusScrapeEnabled := workerConfig.Monitoring.MetricsCollector == string(types.MetricsCollectorPrometheus) &&
+		workerConfig.Monitoring.Prometheus.ScrapeWorkers
 	labels := map[string]string{
 		"app":                       Beta9WorkerLabelValue,
 		Beta9WorkerLabelKey:         Beta9WorkerLabelValue,
 		Beta9WorkerLabelPoolNameKey: wpc.name,
 		Beta9WorkerLabelIDKey:       workerId,
-		PrometheusPortKey:           fmt.Sprintf("%d", wpc.config.Monitoring.Prometheus.Port),
-		PrometheusScrapeKey:         strconv.FormatBool(wpc.config.Monitoring.Prometheus.ScrapeWorkers),
+		PrometheusScrapeKey:         strconv.FormatBool(prometheusScrapeEnabled),
+	}
+	if prometheusScrapeEnabled {
+		labels[PrometheusPortKey] = fmt.Sprintf("%d", workerConfig.Monitoring.Prometheus.Port)
 	}
 
 	workerCpu := cpu
@@ -211,28 +218,21 @@ func (wpc *LocalKubernetesWorkerPoolController) createWorkerJob(workerId string,
 
 	resources := corev1.ResourceRequirements{}
 	if wpc.config.Worker.JobResourcesEnforced {
-		resources.Requests = resourceRequests
-		resources.Limits = resourceRequests
+		podResources := applyJobResourceOverhead(resourceRequests, wpc.config.Worker.JobResourceOverhead)
+		resources.Requests = podResources
+		resources.Limits = podResources
 	}
 
 	containers := []corev1.Container{
 		{
-			Name:  defaultContainerName,
-			Image: workerImage,
-			Command: []string{
-				defaultWorkerEntrypoint,
-			},
+			Name:      defaultContainerName,
+			Image:     workerImage,
+			Command:   workerPodCommand(),
 			Resources: resources,
 			SecurityContext: &corev1.SecurityContext{
 				Privileged: ptr.To(true),
 			},
-			Ports: []corev1.ContainerPort{
-				{
-					Name:          "metrics",
-					ContainerPort: int32(wpc.config.Monitoring.Prometheus.Port),
-				},
-			},
-			Env:          wpc.getWorkerEnvironment(workerId, workerCpu, workerMemory, workerGpuType, workerGpuCount, token),
+			Env:          wpc.getWorkerEnvironment(workerId, workerCpu, workerMemory, workerGpuType, workerGpuCount, token, workerConfig),
 			VolumeMounts: wpc.getWorkerVolumeMounts(),
 		},
 	}
@@ -248,15 +248,16 @@ func (wpc *LocalKubernetesWorkerPoolController) createWorkerJob(workerId string,
 			Labels: labels,
 		},
 		Spec: corev1.PodSpec{
-			ServiceAccountName:           wpc.config.Worker.ServiceAccountName,
-			AutomountServiceAccountToken: ptr.To(true),
-			HostNetwork:                  wpc.config.Worker.HostNetwork,
-			ImagePullSecrets:             imagePullSecrets,
-			RestartPolicy:                corev1.RestartPolicyOnFailure,
-			NodeSelector:                 wpc.workerPoolConfig.JobSpec.NodeSelector,
-			Containers:                   containers,
-			Volumes:                      wpc.getWorkerVolumes(workerMemory),
-			EnableServiceLinks:           ptr.To(false),
+			ServiceAccountName:            wpc.config.Worker.ServiceAccountName,
+			AutomountServiceAccountToken:  ptr.To(true),
+			HostNetwork:                   wpc.config.Worker.HostNetwork,
+			ImagePullSecrets:              imagePullSecrets,
+			RestartPolicy:                 corev1.RestartPolicyOnFailure,
+			NodeSelector:                  wpc.workerPoolConfig.JobSpec.NodeSelector,
+			Containers:                    containers,
+			Volumes:                       wpc.getWorkerVolumes(workerMemory),
+			EnableServiceLinks:            ptr.To(false),
+			TerminationGracePeriodSeconds: ptr.To(workerPodTerminationGracePeriod(wpc.config.Worker.TerminationGracePeriod)),
 		},
 	}
 
@@ -298,6 +299,23 @@ func (wpc *LocalKubernetesWorkerPoolController) createWorkerJob(workerId string,
 	}
 }
 
+func (wpc *LocalKubernetesWorkerPoolController) workerPodConfig() types.AppConfig {
+	config := wpc.config
+	if config.Worker.UseGatewayServiceHostname {
+		config.GatewayService.GRPC.ExternalHost = config.GatewayService.Host
+		config.GatewayService.GRPC.ExternalPort = config.GatewayService.GRPC.Port
+		config.GatewayService.GRPC.TLS = false
+		config.GatewayService.HTTP.ExternalHost = config.GatewayService.Host
+		config.GatewayService.HTTP.ExternalPort = config.GatewayService.HTTP.Port
+		config.GatewayService.HTTP.TLS = false
+	}
+	if config.Worker.HostNetwork && config.Monitoring.MetricsCollector == string(types.MetricsCollectorPrometheus) {
+		config.Monitoring.MetricsCollector = string(types.MetricsCollectorNone)
+		config.Monitoring.Prometheus.ScrapeWorkers = false
+	}
+	return config
+}
+
 func (wpc *LocalKubernetesWorkerPoolController) createJobInCluster(job *batchv1.Job) error {
 	_, err := wpc.kubeClient.BatchV1().Jobs(wpc.config.Worker.Namespace).Create(context.Background(), job, metav1.CreateOptions{})
 	return err
@@ -309,15 +327,6 @@ func (wpc *LocalKubernetesWorkerPoolController) getWorkerVolumes(workerMemory in
 	tmpSizeLimit := parseTmpSizeLimit(wpc.workerPoolConfig.TmpSizeLimit, wpc.config.Worker.TmpSizeLimit)
 
 	volumes := []corev1.Volume{
-		{
-			Name: logVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{
-					Path: defaultWorkerLogPath,
-					Type: &hostPathType,
-				},
-			},
-		},
 		{
 			Name: "dshm",
 			VolumeSource: corev1.VolumeSource{
@@ -354,27 +363,56 @@ func (wpc *LocalKubernetesWorkerPoolController) getWorkerVolumes(workerMemory in
 		}
 	} else {
 		volumeSource.HostPath = &corev1.HostPathVolumeSource{
-			Path: defaultImagesPath,
+			Path: workerImagesHostPath(wpc.workerPoolConfig),
 			Type: &hostPathType,
 		}
 	}
 
-	if wpc.workerPoolConfig.CRIUEnabled && wpc.config.Worker.CRIU.Storage.Mode == string(types.CheckpointStorageModeLocal) {
-		path := defaultCheckpointPath
-		if wpc.workerPoolConfig.CheckpointPath != "" {
-			path = wpc.workerPoolConfig.CheckpointPath
-		}
-
+	if workerCacheEnabled(wpc.config, wpc.workerPoolConfig) {
 		volumes = append(volumes, corev1.Volume{
-			Name: checkpointVolumeName,
+			Name: cacheVolumeName,
 			VolumeSource: corev1.VolumeSource{
 				HostPath: &corev1.HostPathVolumeSource{
-					Path: path,
+					Path: workerCacheHostPath(wpc.config, wpc.workerPoolConfig),
 					Type: &hostPathType,
 				},
 			},
 		})
 	}
+
+	volumes = append(volumes, corev1.Volume{
+		Name: durableDiskVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: workerDurableDisksHostPath(wpc.workerPoolConfig),
+				Type: &hostPathType,
+			},
+		},
+	})
+
+	// Host kernel modules let the worker modprobe nbd for qcow durable disks.
+	// DirectoryOrCreate keeps scheduling working on hosts without the path;
+	// the qcow attach then fails with a clear module error instead.
+	volumes = append(volumes, corev1.Volume{
+		Name: kernelModulesVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: types.HostKernelModulesPath,
+				Type: &hostPathType,
+			},
+		},
+	})
+
+	hostPathDir := corev1.HostPathDirectory
+	volumes = append(volumes, corev1.Volume{
+		Name: devicePluginVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: defaultDevicePluginPath,
+				Type: &hostPathDir,
+			},
+		},
+	})
 
 	return append(volumes,
 		corev1.Volume{
@@ -397,35 +435,48 @@ func (wpc *LocalKubernetesWorkerPoolController) getWorkerVolumeMounts() []corev1
 			ReadOnly:  false,
 		},
 		{
-			Name:      logVolumeName,
-			MountPath: defaultWorkerLogPath,
-			ReadOnly:  false,
-		},
-		{
 			MountPath: "/dev/shm",
 			Name:      "dshm",
 		},
 	}
 
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      devicePluginVolumeName,
+		MountPath: defaultDevicePluginPath,
+		ReadOnly:  true,
+	})
+
 	if len(wpc.workerPoolConfig.JobSpec.VolumeMounts) > 0 {
 		volumeMounts = append(volumeMounts, wpc.workerPoolConfig.JobSpec.VolumeMounts...)
 	}
 
-	if wpc.workerPoolConfig.CRIUEnabled && wpc.config.Worker.CRIU.Storage.Mode == string(types.CheckpointStorageModeLocal) {
+	if workerCacheEnabled(wpc.config, wpc.workerPoolConfig) {
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      checkpointVolumeName,
-			MountPath: defaultCheckpointPath,
+			Name:      cacheVolumeName,
+			MountPath: workerCacheMountPath(wpc.config, wpc.workerPoolConfig),
 			ReadOnly:  false,
 		})
 	}
 
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      durableDiskVolumeName,
+		MountPath: types.DefaultDurableDisksPath,
+		ReadOnly:  false,
+	})
+
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      kernelModulesVolumeName,
+		MountPath: types.HostKernelModulesPath,
+		ReadOnly:  true,
+	})
+
 	return volumeMounts
 }
 
-func (wpc *LocalKubernetesWorkerPoolController) getWorkerEnvironment(workerId string, cpu int64, memory int64, gpuType string, gpuCount uint32, token string) []corev1.EnvVar {
+func (wpc *LocalKubernetesWorkerPoolController) getWorkerEnvironment(workerId string, cpu int64, memory int64, gpuType string, gpuCount uint32, token string, workerConfig types.AppConfig) []corev1.EnvVar {
 	locality := wpc.workerPoolConfig.ConfigGroup
 	if locality == "" {
-		locality = wpc.config.BlobCache.Global.DefaultLocality
+		locality = wpc.config.Cache.Global.DefaultLocality
 	}
 
 	envVars := []corev1.EnvVar{
@@ -438,8 +489,16 @@ func (wpc *LocalKubernetesWorkerPoolController) getWorkerEnvironment(workerId st
 			Value: wpc.name,
 		},
 		{
-			Name:  "BLOBCACHE_LOCALITY",
-			Value: wpc.workerPoolConfig.ConfigGroup,
+			Name: types.WorkerMachineEnv,
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "spec.nodeName",
+				},
+			},
+		},
+		{
+			Name:  "CACHE_LOCALITY",
+			Value: locality,
 		},
 		{
 			Name:  "WORKER_TOKEN",
@@ -462,6 +521,14 @@ func (wpc *LocalKubernetesWorkerPoolController) getWorkerEnvironment(workerId st
 			Value: strconv.FormatInt(int64(gpuCount), 10),
 		},
 		{
+			Name: "POD_UID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.uid",
+				},
+			},
+		},
+		{
 			Name: "POD_IP",
 			ValueFrom: &corev1.EnvVarSource{
 				FieldRef: &corev1.ObjectFieldSelector{
@@ -474,12 +541,28 @@ func (wpc *LocalKubernetesWorkerPoolController) getWorkerEnvironment(workerId st
 			Value: wpc.config.Worker.Namespace,
 		},
 		{
-			Name: "NETWORK_PREFIX",
+			Name: "NETWORK_NODE_NAME",
 			ValueFrom: &corev1.EnvVarSource{
 				FieldRef: &corev1.ObjectFieldSelector{
 					FieldPath: "spec.nodeName",
 				},
 			},
+		},
+		{
+			Name:  "NETWORK_PREFIX",
+			Value: common.WorkerNetworkPrefix(wpc.config.ClusterName, "$(NETWORK_NODE_NAME)"),
+		},
+		{
+			Name: "CACHE_NODE_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "spec.nodeName",
+				},
+			},
+		},
+		{
+			Name:  "CACHE_HOST_NETWORK",
+			Value: strconv.FormatBool(wpc.config.Worker.HostNetwork),
 		},
 		{
 			Name:  "PREEMPTABLE",
@@ -531,12 +614,11 @@ func (wpc *LocalKubernetesWorkerPoolController) getWorkerEnvironment(workerId st
 		envVars = append(envVars, wpc.workerPoolConfig.JobSpec.Env...)
 	}
 
-	// Serialize the AppConfig struct to JSON
-	configJson, err := json.MarshalIndent(wpc.config, "", "  ")
+	configJSON, err := json.MarshalIndent(workerConfig, "", "  ")
 	if err == nil {
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "CONFIG_JSON",
-			Value: string(configJson),
+			Value: string(configJSON),
 		})
 	}
 
@@ -568,4 +650,52 @@ func (wpc *LocalKubernetesWorkerPoolController) monitorAndCleanupWorkers() {
 			wpc.workerPoolRepo.RemoveWorkerCleanerLock(wpc.name)
 		}
 	}
+}
+
+// applyJobResourceOverhead returns a copy of the container-schedulable
+// resources with the configured worker-process overhead added to CPU and
+// memory. Invalid quantities are logged and ignored so a config typo can't
+// stop workers from being provisioned.
+func applyJobResourceOverhead(schedulable corev1.ResourceList, overhead types.JobResourceOverheadConfig) corev1.ResourceList {
+	out := schedulable.DeepCopy()
+	add := func(name corev1.ResourceName, raw string) {
+		if strings.TrimSpace(raw) == "" {
+			return
+		}
+		q, err := resource.ParseQuantity(raw)
+		if err == nil {
+			err = validateJobResourceOverheadQuantity(name, q)
+		}
+		if err != nil {
+			log.Warn().Str("resource", string(name)).Str("value", raw).Err(err).Msg("ignoring invalid worker jobResourceOverhead")
+			return
+		}
+		if q.Sign() <= 0 {
+			return
+		}
+		base := out[name]
+		base.Add(q)
+		out[name] = base
+	}
+	add(corev1.ResourceCPU, overhead.CPU)
+	add(corev1.ResourceMemory, overhead.Memory)
+	return out
+}
+
+// validateJobResourceOverheadQuantity rejects quantities that parse but belong
+// to the other resource family: a CPU overhead in bytes ("512Mi") would make
+// every worker pod unschedulable, and a memory overhead in fractional bytes
+// ("500m") is refused by the API server ("must be an integer").
+func validateJobResourceOverheadQuantity(name corev1.ResourceName, q resource.Quantity) error {
+	switch name {
+	case corev1.ResourceCPU:
+		if q.Format == resource.BinarySI {
+			return fmt.Errorf("cpu overhead %s uses a memory unit", q.String())
+		}
+	case corev1.ResourceMemory:
+		if q.MilliValue()%1000 != 0 {
+			return fmt.Errorf("memory overhead %s is not a whole number of bytes", q.String())
+		}
+	}
+	return nil
 }

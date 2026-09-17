@@ -17,6 +17,7 @@ func TestAddWorkerIfNeeded(t *testing.T) {
 	s, err := miniredis.Run()
 	assert.NotNil(t, s)
 	assert.Nil(t, err)
+	t.Cleanup(s.Close)
 
 	redisClient, err := common.NewRedisClient(types.RedisConfig{Addrs: []string{s.Addr()}, Mode: types.RedisModeSingle})
 	assert.NotNil(t, redisClient)
@@ -127,6 +128,44 @@ func TestAddWorkerIfNeeded(t *testing.T) {
 	}
 }
 
+func TestAddWorkerIfNeededSkipsGenericExternalProvisioning(t *testing.T) {
+	s, err := miniredis.Run()
+	assert.NotNil(t, s)
+	assert.Nil(t, err)
+	t.Cleanup(s.Close)
+
+	redisClient, err := common.NewRedisClient(types.RedisConfig{Addrs: []string{s.Addr()}, Mode: types.RedisModeSingle})
+	assert.NotNil(t, redisClient)
+	assert.Nil(t, err)
+
+	workerRepo := repo.NewWorkerRedisRepositoryForTest(redisClient)
+	workerPoolRepo := repo.NewWorkerPoolRedisRepositoryForTest(redisClient)
+	controller := &LocalWorkerPoolControllerForTest{
+		name:       "generic-pool",
+		workerRepo: workerRepo,
+	}
+	sizer := &WorkerPoolSizer{
+		controller:     controller,
+		workerPoolRepo: workerPoolRepo,
+		workerPoolConfig: &types.WorkerPoolConfig{
+			Mode:     types.PoolModeExternal,
+			Provider: &types.ProviderGeneric,
+		},
+		workerPoolSizingConfig: &types.WorkerPoolSizingConfig{
+			MinFreeGpu:            1,
+			DefaultWorkerCpu:      2000,
+			DefaultWorkerMemory:   500,
+			DefaultWorkerGpuCount: 1,
+			DefaultWorkerGpuType:  "A10G",
+		},
+	}
+
+	newWorker, err := sizer.addWorkerIfNeeded(&WorkerPoolCapacity{})
+	assert.NoError(t, err)
+	assert.Nil(t, newWorker)
+	assert.Equal(t, 0, controller.AddWorkerCallCount())
+}
+
 func TestParsePoolSizingConfig(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -229,10 +268,49 @@ func TestParsePoolSizingConfig(t *testing.T) {
 	}
 }
 
+func TestApplyBuildPoolSizingMinimums(t *testing.T) {
+	config := types.AppConfig{}
+	config.ImageService.BuildContainerPoolSelector = "build"
+	config.ImageService.BuildContainerCpu = 14000
+	config.ImageService.BuildContainerMemory = 54000
+
+	sizing := &types.WorkerPoolSizingConfig{
+		MinFreeCpu:          14000,
+		MinFreeMemory:       55296,
+		DefaultWorkerCpu:    1000,
+		DefaultWorkerMemory: 55296,
+	}
+
+	applyBuildPoolSizingMinimums("build", config, sizing)
+
+	assert.Equal(t, int64(14000), sizing.DefaultWorkerCpu)
+	assert.Equal(t, int64(67500), sizing.DefaultWorkerMemory)
+	assert.Equal(t, int64(14000), sizing.MinFreeCpu)
+	assert.Equal(t, int64(55296), sizing.MinFreeMemory)
+}
+
+func TestApplyBuildPoolSizingMinimumsOnlyAppliesToBuildPool(t *testing.T) {
+	config := types.AppConfig{}
+	config.ImageService.BuildContainerPoolSelector = "build"
+	config.ImageService.BuildContainerCpu = 14000
+	config.ImageService.BuildContainerMemory = 54000
+
+	sizing := &types.WorkerPoolSizingConfig{
+		DefaultWorkerCpu:    1000,
+		DefaultWorkerMemory: 1024,
+	}
+
+	applyBuildPoolSizingMinimums("default", config, sizing)
+
+	assert.Equal(t, int64(1000), sizing.DefaultWorkerCpu)
+	assert.Equal(t, int64(1024), sizing.DefaultWorkerMemory)
+}
+
 func TestOccupyAvailableMachines(t *testing.T) {
 	s, err := miniredis.Run()
 	assert.NotNil(t, s)
 	assert.Nil(t, err)
+	t.Cleanup(s.Close)
 
 	redisClient, err := common.NewRedisClient(types.RedisConfig{Addrs: []string{s.Addr()}, Mode: types.RedisModeSingle})
 	assert.NotNil(t, redisClient)
@@ -371,6 +449,7 @@ func TestOccupyAvailableMachinesConcurrency(t *testing.T) {
 	s, err := miniredis.Run()
 	assert.NotNil(t, s)
 	assert.Nil(t, err)
+	t.Cleanup(s.Close)
 
 	redisClient, err := common.NewRedisClient(types.RedisConfig{Addrs: []string{s.Addr()}, Mode: types.RedisModeSingle})
 	assert.NotNil(t, redisClient)

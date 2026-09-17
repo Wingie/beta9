@@ -2,29 +2,44 @@ package common
 
 import (
 	"fmt"
+	"time"
 )
 
 var (
-	schedulerPrefix                  string = "scheduler:"
-	schedulerContainerRequests       string = "scheduler:container_requests"
-	schedulerWorkerLock              string = "scheduler:worker:lock:%s"
-	schedulerWorkerRequests          string = "scheduler:worker:requests:%s"
-	schedulerWorkerIndex             string = "scheduler:worker:worker_index"
-	schedulerWorkerState             string = "scheduler:worker:state:%s"
-	schedulerContainerConfig         string = "scheduler:container:config:%s"
-	schedulerContainerState          string = "scheduler:container:state:%s"
-	schedulerContainerAddress        string = "scheduler:container:container_addr:%s"
-	schedulerContainerAddressMap     string = "scheduler:container:container_addr_map:%s"
-	schedulerContainerRequestStatus  string = "scheduler:container:request_status:%s"
-	schedulerContainerIndex          string = "scheduler:container:index:%s"
-	schedulerContainerWorkerIndex    string = "scheduler:container:worker:index:%s"
-	schedulerContainerWorkspaceIndex string = "scheduler:container:workspace:index:%s"
-	schedulerWorkerAddress           string = "scheduler:container:worker_addr:%s"
-	schedulerContainerLock           string = "scheduler:container:lock:%s"
-	schedulerContainerExitCode       string = "scheduler:container:exit_code:%s"
-	schedulerCheckpointState         string = "scheduler:checkpoint_state:%s:%s"
-	schedulerServeLock               string = "scheduler:serve:lock:%s:%s"
-	schedulerStubState               string = "scheduler:stub:state:%s"
+	schedulerPrefix                   string = "scheduler:"
+	schedulerContainerRequests        string = "scheduler:container_requests"
+	schedulerWorkerLock               string = "scheduler:worker:lock:%s"
+	schedulerWorkerRequests           string = "scheduler:worker:requests:%s"
+	schedulerWorkerRequestChannel     string = "scheduler:worker:requests"
+	schedulerWorkerPendingRequests    string = "scheduler:worker:requests:pending:%s"
+	schedulerWorkerIndex              string = "scheduler:worker:worker_index"
+	schedulerWorkerPoolIndex          string = "scheduler:worker:pool_index:%s"
+	schedulerWorkerMachineIndex       string = "scheduler:worker:machine_index:%s"
+	schedulerWorkerState              string = "scheduler:worker:state:%s"
+	schedulerContainerConfig          string = "scheduler:container:config:%s"
+	schedulerContainerState           string = "scheduler:container:state:%s"
+	schedulerContainerStateIndex      string = "scheduler:container:state_index"
+	schedulerContainerAddress         string = "scheduler:container:container_addr:%s"
+	schedulerContainerAddressMap      string = "scheduler:container:container_addr_map:%s"
+	schedulerBackendRoute             string = "scheduler:route:%s"
+	schedulerBackendRouteIndex        string = "scheduler:route:index:%s"
+	schedulerBackendRouteMachine      string = "scheduler:route:machine:{%s}:%s:%s"
+	schedulerBackendRouteMachineRev   string = "scheduler:route:machine:{%s}:%s:%s:rev"
+	schedulerBackendRouteMachineID    string = "scheduler:route:machine_id:{%s}"
+	schedulerBackendRouteMachineIDRev string = "scheduler:route:machine_id:{%s}:rev"
+	schedulerContainerRequestStatus   string = "scheduler:container:request_status:%s"
+	schedulerContainerIndex           string = "scheduler:container:index:%s"
+	schedulerContainerWorkerIndex     string = "scheduler:container:worker:index:%s"
+	schedulerContainerWorkspaceIndex  string = "scheduler:container:workspace:index:%s"
+	schedulerWorkerAddress            string = "scheduler:container:worker_addr:%s"
+	schedulerContainerLock            string = "scheduler:container:lock:%s"
+	schedulerContainerExitCode        string = "scheduler:container:exit_code:%s"
+	schedulerCheckpointState          string = "scheduler:checkpoint_state:%s:%s"
+	schedulerServeLock                string = "scheduler:serve:lock:%s:%s"
+	schedulerStubState                string = "scheduler:stub:state:%s"
+	// Hash of hour-epoch -> sandboxes created, per app. Cheap source for the
+	// dashboard's 24h activity strip; bumped on every sandbox creation.
+	schedulerAppSandboxActivity string = "scheduler:app:sandbox_activity:%s:%s"
 )
 
 var (
@@ -32,6 +47,7 @@ var (
 	gatewayDefaultDeployment           string = "gateway:default_deployment:%s"
 	gatewayDeploymentMinContainerCount string = "gateway:min_containers:%s"
 	gatewayAuthKey                     string = "gateway:auth:%s:%s"
+	gatewayPreparedStub                string = "gateway:prepared_stub:%s:%s"
 )
 
 var (
@@ -40,6 +56,8 @@ var (
 	workerContainerResourceUsage string = "worker:%s:container:%s:resource_usage"
 	workerNetworkLock            string = "worker:network:%s:lock"
 	workerNetworkIpIndex         string = "worker:network:%s:ip_index"
+	workerNetworkIpRefCounts     string = "worker:network:%s:ip_ref_counts"
+	workerNetworkIpOwner         string = "worker:network:%s:ip_owner:%s"
 	workerNetworkContainerIp     string = "worker:network:%s:container_ip:%s"
 )
 
@@ -60,15 +78,36 @@ var (
 	taskClaim       string = "task:%s:%s:%s:claim"
 	taskCancel      string = "task:%s:%s:%s:cancel"
 	taskRetryLock   string = "task:%s:%s:%s:retry_lock"
+	taskMonitorLock string = "task:monitor_lock"
+	taskPhase       string = "task:%s:%s:phase:%s"
+	taskPhaseLabels string = "task:%s:%s:phase_labels"
+)
+
+var (
+	endpointPrefix           string = "endpoint"
+	endpointKeepWarmLock     string = "endpoint:%s:%s:keep_warm_lock:%s"
+	endpointInstanceLock     string = "endpoint:%s:%s:instance_lock"
+	endpointRequestTokens    string = "endpoint:%s:%s:request_tokens:%s"
+	endpointRequestHeartbeat string = "endpoint:%s:%s:request_heartbeat:%s:%s"
+	endpointRequestRelease   string = "endpoint:%s:%s:request_release:%s:%s"
+)
+
+var (
+	podKeepWarmLock string = "pod:%s:%s:keep_warm_lock:%s"
 )
 
 var (
 	workspacePrefix string = "workspace"
 
-	workspaceVolumePathDownloadToken string = "workspace:volume_path_download_token:%s"
-	workspaceConcurrencyLimit        string = "workspace:concurrency_limit:%s"
-	workspaceConcurrencyLimitLock    string = "workspace:concurrency_limit:lock:%s"
-	workspaceAuthorizedToken         string = "workspace:authorization:token:%s"
+	workspaceVolumePathDownloadToken          string = "workspace:volume_path_download_token:%s"
+	workspaceConcurrencyLimit                 string = "workspace:concurrency_limit:%s"
+	workspaceConcurrencyLimitLock             string = "workspace:concurrency_limit:lock:%s"
+	workspaceConcurrencyLimitUsage            string = "workspace:{%s}:concurrency_limit:usage"
+	workspaceConcurrencyLimitReservation      string = "workspace:{%s}:concurrency_limit:reservation:%s"
+	workspaceConcurrencyLimitReservationIndex string = "workspace:{%s}:concurrency_limit:reservation_index"
+	workspaceAuthorizedToken                  string = "workspace:authorization:token:%s"
+	workspaceCreditGate                       string = "workspace:credit_gate:%s"
+	workspaceCreditGateEnforceLock            string = "workspace:credit_gate:enforce_lock"
 )
 
 var (
@@ -80,8 +119,50 @@ var (
 )
 
 var (
-	tailscalePrefix          string = "tailscale"
-	tailscaleServiceHostname string = "tailscale:%s:%s"
+	tailscalePrefix               string = "tailscale"
+	tailscaleServiceHostname      string = "tailscale:%s:%s"
+	tailscaleServiceHostnameIndex string = "tailscale:%s:index"
+)
+
+var (
+	computePoolState                     string = "compute:{%s}:pool:%s"
+	computePoolStateLock                 string = "compute:{%s}:pool:%s:lock"
+	computePoolIndex                     string = "compute:{%s}:pools"
+	computePoolWorkspaceIndex            string = "compute:workspaces"
+	computeManagedPoolState              string = "compute:managed:{%s}:pool:%s:state"
+	computeManagedPoolStateLock          string = "compute:managed:{%s}:pool:%s:lock"
+	computeManagedPoolIndex              string = "compute:managed:{%s}:pools"
+	computeManagedPoolUpdates            string = "compute:managed_pools:updates"
+	computeJoinToken                     string = "compute:join:%s"
+	computeAgentToken                    string = "compute:agent:token:%s"
+	computeAgentMachine                  string = "compute:{%s}:pool:%s:machine:%s"
+	computeAgentMachinePool              string = "compute:{%s}:machine:%s:pool"
+	computeAgentMachineIndex             string = "compute:{%s}:pool:%s:machines"
+	computeMachineSSHState               string = "compute:{%s}:pool:%s:machine:%s:ssh"
+	computeMachineSSHStateLock           string = "compute:{%s}:pool:%s:machine:%s:ssh:lock"
+	computeAgentSlot                     string = "compute:{%s}:pool:%s:machine:%s:worker:%s"
+	computeAgentSlotIndex                string = "compute:{%s}:pool:%s:machine:%s:workers"
+	computeMarketplaceListing            string = "compute:marketplace:{%s}:listing:%s"
+	computeMarketplaceIndex              string = "compute:marketplace:{%s}:listings"
+	computeMarketplaceGlobal             string = "compute:marketplace:listings"
+	computeMarketplaceRental             string = "compute:marketplace:rental:{%s}:%s"
+	computeMarketplaceRentalIndex        string = "compute:marketplace:rental:{%s}:index"
+	computeMarketplaceRentalMachineIndex string = "compute:marketplace:rental:machine:%s"
+	computeMarketplaceRentalMachineLock  string = "compute:marketplace:rental:machine:%s:lock"
+	computeMarketplaceRentalGlobal       string = "compute:marketplace:rentals"
+	computeFailoverDemand                string = "compute:failover:demand:%s"
+	computeFailoverDemandIndex           string = "compute:failover:demand"
+	computeOnDemandSpend                 string = "compute:ondemand:spend:%s"
+)
+
+var (
+	thunderClientEnrollment      string = "thunder:{client_enrollments}:client:%s"
+	thunderClientEnrollmentIndex string = "thunder:{client_enrollments}:clients"
+	thunderNodeEnrollment        string = "thunder:{%s}:pool:%s:machine:%s:node"
+	thunderNodeEnrollmentIndex   string = "thunder:{%s}:pool:%s:nodes"
+	thunderZone                  string = "thunder:{%s}:pool:%s:zone"
+	thunderZoneIndex             string = "thunder:{%s}:zones"
+	thunderPoolLock              string = "thunder:{%s}:pool:%s:lock"
 )
 
 var (
@@ -90,9 +171,15 @@ var (
 
 var (
 	imageBuildContainerTTL string = "image:build_container_ttl:%s"
+	imageBaseDigest        string = "image:base_digest:%s"
 )
 
 var RedisKeys = &redisKeys{}
+
+const (
+	PreparedStubCacheMetadata = "preparation-cache-key"
+	PreparedStubCacheTTL      = 5 * time.Minute
+)
 
 type redisKeys struct{}
 
@@ -105,6 +192,14 @@ func (rk *redisKeys) SchedulerWorkerIndex() string {
 	return schedulerWorkerIndex
 }
 
+func (rk *redisKeys) SchedulerWorkerPoolIndex(poolName string) string {
+	return fmt.Sprintf(schedulerWorkerPoolIndex, poolName)
+}
+
+func (rk *redisKeys) SchedulerWorkerMachineIndex(machineId string) string {
+	return fmt.Sprintf(schedulerWorkerMachineIndex, machineId)
+}
+
 func (rk *redisKeys) SchedulerContainerRequests() string {
 	return schedulerContainerRequests
 }
@@ -115,6 +210,14 @@ func (rk *redisKeys) SchedulerWorkerLock(workerId string) string {
 
 func (rk *redisKeys) SchedulerWorkerRequests(workerId string) string {
 	return fmt.Sprintf(schedulerWorkerRequests, workerId)
+}
+
+func (rk *redisKeys) SchedulerWorkerRequestChannel() string {
+	return schedulerWorkerRequestChannel
+}
+
+func (rk *redisKeys) SchedulerWorkerPendingRequests(workerId string) string {
+	return fmt.Sprintf(schedulerWorkerPendingRequests, workerId)
 }
 
 func (rk *redisKeys) SchedulerWorkerState(workerId string) string {
@@ -133,6 +236,10 @@ func (rk *redisKeys) SchedulerContainerState(containerId string) string {
 	return fmt.Sprintf(schedulerContainerState, containerId)
 }
 
+func (rk *redisKeys) SchedulerContainerStateIndex() string {
+	return schedulerContainerStateIndex
+}
+
 func (rk *redisKeys) SchedulerContainerConfig(containerId string) string {
 	return fmt.Sprintf(schedulerContainerConfig, containerId)
 }
@@ -149,12 +256,40 @@ func (rk *redisKeys) SchedulerContainerWorkspaceIndex(workspaceId string) string
 	return fmt.Sprintf(schedulerContainerWorkspaceIndex, workspaceId)
 }
 
+func (rk *redisKeys) SchedulerAppSandboxActivity(workspaceId, appId string) string {
+	return fmt.Sprintf(schedulerAppSandboxActivity, workspaceId, appId)
+}
+
 func (rk *redisKeys) SchedulerContainerAddress(containerId string) string {
 	return fmt.Sprintf(schedulerContainerAddress, containerId)
 }
 
 func (rk *redisKeys) SchedulerContainerAddressMap(containerId string) string {
 	return fmt.Sprintf(schedulerContainerAddressMap, containerId)
+}
+
+func (rk *redisKeys) SchedulerBackendRoute(routeId string) string {
+	return fmt.Sprintf(schedulerBackendRoute, routeId)
+}
+
+func (rk *redisKeys) SchedulerBackendRouteIndex(containerId string) string {
+	return fmt.Sprintf(schedulerBackendRouteIndex, containerId)
+}
+
+func (rk *redisKeys) SchedulerBackendRouteMachineIndex(workspaceID, poolName, machineID string) string {
+	return fmt.Sprintf(schedulerBackendRouteMachine, workspaceID, poolName, machineID)
+}
+
+func (rk *redisKeys) SchedulerBackendRouteMachineRevision(workspaceID, poolName, machineID string) string {
+	return fmt.Sprintf(schedulerBackendRouteMachineRev, workspaceID, poolName, machineID)
+}
+
+func (rk *redisKeys) SchedulerBackendRouteMachineIDIndex(machineID string) string {
+	return fmt.Sprintf(schedulerBackendRouteMachineID, machineID)
+}
+
+func (rk *redisKeys) SchedulerBackendRouteMachineIDRevision(machineID string) string {
+	return fmt.Sprintf(schedulerBackendRouteMachineIDRev, machineID)
 }
 
 func (rk *redisKeys) SchedulerContainerRequestStatus(containerId string) string {
@@ -194,6 +329,10 @@ func (rk *redisKeys) GatewayDeploymentMinContainerCount(appId string) string {
 	return fmt.Sprintf(gatewayDeploymentMinContainerCount, appId)
 }
 
+func (rk *redisKeys) GatewayPreparedStub(workspaceId, cacheKey string) string {
+	return fmt.Sprintf(gatewayPreparedStub, workspaceId, cacheKey)
+}
+
 // Worker keys
 func (rk *redisKeys) WorkerPrefix() string {
 	return workerPrefix
@@ -207,6 +346,10 @@ func (rk *redisKeys) WorkerImageLock(workerId string, imageId string) string {
 	return fmt.Sprintf(workerImageLock, workerId, imageId)
 }
 
+func (rk *redisKeys) ImageBaseDigest(sourceImage string) string {
+	return fmt.Sprintf(imageBaseDigest, sourceImage)
+}
+
 func (rk *redisKeys) WorkerNetworkLock(networkPrefix string) string {
 	return fmt.Sprintf(workerNetworkLock, networkPrefix)
 }
@@ -215,8 +358,24 @@ func (rk *redisKeys) WorkerNetworkIpIndex(networkPrefix string) string {
 	return fmt.Sprintf(workerNetworkIpIndex, networkPrefix)
 }
 
+func (rk *redisKeys) WorkerNetworkIpRefCounts(networkPrefix string) string {
+	return fmt.Sprintf(workerNetworkIpRefCounts, networkPrefix)
+}
+
+func (rk *redisKeys) WorkerNetworkIpOwner(networkPrefix, ip string) string {
+	return fmt.Sprintf(workerNetworkIpOwner, networkPrefix, ip)
+}
+
+func (rk *redisKeys) WorkerNetworkIpOwnerPrefix(networkPrefix string) string {
+	return fmt.Sprintf(workerNetworkIpOwner, networkPrefix, "")
+}
+
 func (rk *redisKeys) WorkerNetworkContainerIp(networkPrefix, containerId string) string {
 	return fmt.Sprintf(workerNetworkContainerIp, networkPrefix, containerId)
+}
+
+func (rk *redisKeys) WorkerNetworkContainerIpPrefix(networkPrefix string) string {
+	return fmt.Sprintf(workerNetworkContainerIp, networkPrefix, "")
 }
 
 // Worker Pool keys
@@ -238,6 +397,121 @@ func (rk *redisKeys) WorkerPoolSizerLock(poolName string) string {
 
 func (rk *redisKeys) WorkerPoolCleanerLock(poolName string) string {
 	return fmt.Sprintf(workerPoolCleanerLock, poolName)
+}
+
+// Compute keys
+func (rk *redisKeys) ComputePoolState(workspaceID, poolName string) string {
+	return fmt.Sprintf(computePoolState, workspaceID, poolName)
+}
+
+func (rk *redisKeys) ComputePoolStateLock(workspaceID, poolName string) string {
+	return fmt.Sprintf(computePoolStateLock, workspaceID, poolName)
+}
+
+func (rk *redisKeys) ComputePoolIndex(workspaceID string) string {
+	return fmt.Sprintf(computePoolIndex, workspaceID)
+}
+
+func (rk *redisKeys) ComputePoolWorkspaceIndex() string {
+	return computePoolWorkspaceIndex
+}
+
+func (rk *redisKeys) ComputeManagedPoolState(workspaceID, name string) string {
+	return fmt.Sprintf(computeManagedPoolState, workspaceID, name)
+}
+
+func (rk *redisKeys) ComputeManagedPoolStateLock(workspaceID, name string) string {
+	return fmt.Sprintf(computeManagedPoolStateLock, workspaceID, name)
+}
+
+func (rk *redisKeys) ComputeManagedPoolIndex(workspaceID string) string {
+	return fmt.Sprintf(computeManagedPoolIndex, workspaceID)
+}
+
+func (rk *redisKeys) ComputeManagedPoolUpdates() string {
+	return computeManagedPoolUpdates
+}
+
+func (rk *redisKeys) ComputeJoinToken(tokenHash string) string {
+	return fmt.Sprintf(computeJoinToken, tokenHash)
+}
+
+func (rk *redisKeys) ComputeAgentToken(tokenHash string) string {
+	return fmt.Sprintf(computeAgentToken, tokenHash)
+}
+
+func (rk *redisKeys) ComputeAgentMachine(workspaceID, poolName, machineID string) string {
+	return fmt.Sprintf(computeAgentMachine, workspaceID, poolName, machineID)
+}
+
+func (rk *redisKeys) ComputeAgentMachinePool(workspaceID, machineID string) string {
+	return fmt.Sprintf(computeAgentMachinePool, workspaceID, machineID)
+}
+
+func (rk *redisKeys) ComputeAgentMachineIndex(workspaceID, poolName string) string {
+	return fmt.Sprintf(computeAgentMachineIndex, workspaceID, poolName)
+}
+
+func (rk *redisKeys) ComputeMachineSSHState(workspaceID, poolName, machineID string) string {
+	return fmt.Sprintf(computeMachineSSHState, workspaceID, poolName, machineID)
+}
+
+func (rk *redisKeys) ComputeMachineSSHStateLock(workspaceID, poolName, machineID string) string {
+	return fmt.Sprintf(computeMachineSSHStateLock, workspaceID, poolName, machineID)
+}
+
+func (rk *redisKeys) ComputeAgentSlot(workspaceID, poolName, machineID, workerID string) string {
+	return fmt.Sprintf(computeAgentSlot, workspaceID, poolName, machineID, workerID)
+}
+
+func (rk *redisKeys) ComputeAgentSlotIndex(workspaceID, poolName, machineID string) string {
+	return fmt.Sprintf(computeAgentSlotIndex, workspaceID, poolName, machineID)
+}
+
+func (rk *redisKeys) ComputeMarketplaceListing(workspaceID, listingID string) string {
+	return fmt.Sprintf(computeMarketplaceListing, workspaceID, listingID)
+}
+
+func (rk *redisKeys) ComputeMarketplaceIndex(workspaceID string) string {
+	return fmt.Sprintf(computeMarketplaceIndex, workspaceID)
+}
+
+func (rk *redisKeys) ComputeMarketplaceGlobalIndex() string {
+	return computeMarketplaceGlobal
+}
+
+func (rk *redisKeys) ComputeMarketplaceRental(buyerWorkspaceID, rentalID string) string {
+	return fmt.Sprintf(computeMarketplaceRental, buyerWorkspaceID, rentalID)
+}
+
+func (rk *redisKeys) ComputeMarketplaceRentalIndex(buyerWorkspaceID string) string {
+	return fmt.Sprintf(computeMarketplaceRentalIndex, buyerWorkspaceID)
+}
+
+func (rk *redisKeys) ComputeMarketplaceRentalMachineIndex(machineID string) string {
+	return fmt.Sprintf(computeMarketplaceRentalMachineIndex, machineID)
+}
+
+func (rk *redisKeys) ComputeMarketplaceRentalMachineLock(machineID string) string {
+	return fmt.Sprintf(computeMarketplaceRentalMachineLock, machineID)
+}
+
+func (rk *redisKeys) ComputeMarketplaceRentalGlobalIndex() string {
+	return computeMarketplaceRentalGlobal
+}
+
+func (rk *redisKeys) ComputeFailoverDemand(gpu string) string {
+	return fmt.Sprintf(computeFailoverDemand, gpu)
+}
+
+func (rk *redisKeys) ComputeFailoverDemandIndex() string {
+	return computeFailoverDemandIndex
+}
+
+// ComputeOnDemandSpend buckets platform spend on failover hardware by hour
+// (bucket format "2006010215"), so a rolling window is a small key scan.
+func (rk *redisKeys) ComputeOnDemandSpend(hourBucket string) string {
+	return fmt.Sprintf(computeOnDemandSpend, hourBucket)
 }
 
 // Task keys
@@ -265,12 +539,54 @@ func (rk *redisKeys) TaskEntry(workspaceName, stubId, taskId string) string {
 	return fmt.Sprintf(taskEntry, workspaceName, stubId, taskId)
 }
 
+func (rk *redisKeys) TaskMonitorLock() string {
+	return taskMonitorLock
+}
+
 func (rk *redisKeys) TaskClaim(workspaceName, stubId, taskId string) string {
 	return fmt.Sprintf(taskClaim, workspaceName, stubId, taskId)
 }
 
 func (rk *redisKeys) TaskRetryLock(workspaceName, stubId, taskId string) string {
 	return fmt.Sprintf(taskRetryLock, workspaceName, stubId, taskId)
+}
+
+func (rk *redisKeys) TaskPhase(workspaceName, taskId, phase string) string {
+	return fmt.Sprintf(taskPhase, workspaceName, taskId, phase)
+}
+
+func (rk *redisKeys) TaskPhaseLabels(workspaceName, taskId string) string {
+	return fmt.Sprintf(taskPhaseLabels, workspaceName, taskId)
+}
+
+// Endpoint keys
+func (rk *redisKeys) EndpointPrefix() string {
+	return endpointPrefix
+}
+
+func (rk *redisKeys) EndpointKeepWarmLock(workspaceName, stubId, containerId string) string {
+	return fmt.Sprintf(endpointKeepWarmLock, workspaceName, stubId, containerId)
+}
+
+func (rk *redisKeys) EndpointInstanceLock(workspaceName, stubId string) string {
+	return fmt.Sprintf(endpointInstanceLock, workspaceName, stubId)
+}
+
+func (rk *redisKeys) EndpointRequestTokens(workspaceName, stubId, containerId string) string {
+	return fmt.Sprintf(endpointRequestTokens, workspaceName, stubId, containerId)
+}
+
+func (rk *redisKeys) EndpointRequestHeartbeat(workspaceName, stubId, taskId, containerId string) string {
+	return fmt.Sprintf(endpointRequestHeartbeat, workspaceName, stubId, taskId, containerId)
+}
+
+func (rk *redisKeys) EndpointRequestRelease(workspaceName, stubId, taskId, containerId string) string {
+	return fmt.Sprintf(endpointRequestRelease, workspaceName, stubId, taskId, containerId)
+}
+
+// Pod keys
+func (rk *redisKeys) PodKeepWarmLock(workspaceName, stubId, containerId string) string {
+	return fmt.Sprintf(podKeepWarmLock, workspaceName, stubId, containerId)
 }
 
 // Workspace keys
@@ -284,6 +600,26 @@ func (rk *redisKeys) WorkspaceConcurrencyLimit(workspaceId string) string {
 
 func (rk *redisKeys) WorkspaceConcurrencyLimitLock(workspaceId string) string {
 	return fmt.Sprintf(workspaceConcurrencyLimitLock, workspaceId)
+}
+
+func (rk *redisKeys) WorkspaceConcurrencyLimitUsage(workspaceId string) string {
+	return fmt.Sprintf(workspaceConcurrencyLimitUsage, workspaceId)
+}
+
+func (rk *redisKeys) WorkspaceConcurrencyLimitReservation(workspaceId, containerId string) string {
+	return fmt.Sprintf(workspaceConcurrencyLimitReservation, workspaceId, containerId)
+}
+
+func (rk *redisKeys) WorkspaceConcurrencyLimitReservationIndex(workspaceId string) string {
+	return fmt.Sprintf(workspaceConcurrencyLimitReservationIndex, workspaceId)
+}
+
+func (rk *redisKeys) WorkspaceCreditGate(workspaceId string) string {
+	return fmt.Sprintf(workspaceCreditGate, workspaceId)
+}
+
+func (rk *redisKeys) WorkspaceCreditGateEnforceLock() string {
+	return workspaceCreditGateEnforceLock
 }
 
 func (rk *redisKeys) WorkspaceVolumePathDownloadToken(token string) string {
@@ -301,6 +637,10 @@ func (rk *redisKeys) TailscalePrefix() string {
 
 func (rk *redisKeys) TailscaleServiceHostname(serviceName, hostName string) string {
 	return fmt.Sprintf(tailscaleServiceHostname, serviceName, hostName)
+}
+
+func (rk *redisKeys) TailscaleServiceHostnameIndex(serviceName string) string {
+	return fmt.Sprintf(tailscaleServiceHostnameIndex, serviceName)
 }
 
 // Provider keys
@@ -322,6 +662,35 @@ func (rk *redisKeys) ProviderMachineIndex(providerName, poolName string) string 
 
 func (rk *redisKeys) ProviderMachineLock(providerName, poolName, machineId string) string {
 	return fmt.Sprintf(providerMachineLock, providerName, poolName, machineId)
+}
+
+// Thunder keys
+func (rk *redisKeys) ThunderClientEnrollment(containerID string) string {
+	return fmt.Sprintf(thunderClientEnrollment, containerID)
+}
+
+func (rk *redisKeys) ThunderClientEnrollmentIndex() string {
+	return thunderClientEnrollmentIndex
+}
+
+func (rk *redisKeys) ThunderNodeEnrollment(workspaceID, poolName, machineID string) string {
+	return fmt.Sprintf(thunderNodeEnrollment, workspaceID, poolName, machineID)
+}
+
+func (rk *redisKeys) ThunderNodeEnrollmentIndex(workspaceID, poolName string) string {
+	return fmt.Sprintf(thunderNodeEnrollmentIndex, workspaceID, poolName)
+}
+
+func (rk *redisKeys) ThunderZone(workspaceID, poolName string) string {
+	return fmt.Sprintf(thunderZone, workspaceID, poolName)
+}
+
+func (rk *redisKeys) ThunderZoneIndex(workspaceID string) string {
+	return fmt.Sprintf(thunderZoneIndex, workspaceID)
+}
+
+func (rk *redisKeys) ThunderPoolLock(workspaceID, poolName string) string {
+	return fmt.Sprintf(thunderPoolLock, workspaceID, poolName)
 }
 
 func (rk *redisKeys) ContainerName(prefix string, stubId string, containerId string) string {

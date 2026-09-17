@@ -9,14 +9,10 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import wraps
-from multiprocessing import Value
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import cloudpickle
-import requests
-from starlette.responses import Response
 
 from ..clients.gateway import (
     EndTaskRequest,
@@ -27,12 +23,18 @@ from ..clients.gateway import (
 )
 from ..env import is_remote
 from ..exceptions import RunnerException
-from ..schema import Schema, ValidationError
 
 USER_CODE_DIR = "/mnt/code"
 USER_VOLUMES_DIR = "/volumes"
 USER_OUTPUTS_DIR = "/outputs"
 USER_CACHE_DIR = "/cache"
+LIFECYCLE_RPC_TIMEOUT_SECONDS = 5
+END_TASK_MAX_ATTEMPTS = 3
+END_TASK_RETRY_DELAY_SECONDS = 1
+CALLBACK_HTTP_CONNECT_TIMEOUT_SECONDS = 10
+CALLBACK_HTTP_READ_TIMEOUT_SECONDS = 30
+CALLBACK_MAX_ATTEMPTS = 3
+CALLBACK_RETRY_INITIAL_DELAY_SECONDS = 0.5
 
 PICKLE_SUFFIX = ".pkl"
 
@@ -173,11 +175,6 @@ class FunctionContext:
         )
 
 
-workers_ready = None
-if is_remote():
-    workers_ready = Value("i", 0)
-
-
 class FunctionHandler:
     """
     Helper class for loading user entry point functions
@@ -188,8 +185,9 @@ class FunctionHandler:
         self.handler_path: Optional[str] = handler_path
         self.handler: Optional[Callable] = None
         self.is_async: bool = False
-        self.inputs: Optional[Schema] = None
-        self.outputs: Optional[Schema] = None
+        self.inputs: Optional[Any] = None
+        self.outputs: Optional[Any] = None
+        self.validation_error = ()
         self._load()
 
     @contextmanager
@@ -216,6 +214,11 @@ class FunctionHandler:
     def _load(self):
         if sys.path[0] != USER_CODE_DIR:
             sys.path.insert(0, USER_CODE_DIR)
+
+        if config.inputs or config.outputs:
+            from ..schema import Schema, ValidationError
+
+            self.validation_error = ValidationError
 
         if config.inputs:
             self.inputs = Schema.from_dict(config.inputs)
@@ -286,7 +289,7 @@ class FunctionHandler:
 
             try:
                 parsed_outputs = self.outputs.new(result)
-            except ValidationError as e:
+            except self.validation_error as e:
                 print(f"Output validation error: {e}")
                 return e.to_dict()
 
@@ -297,7 +300,7 @@ class FunctionHandler:
     def __call__(self, context: FunctionContext, *args: Any, **kwargs: Any) -> Any:
         try:
             handler_args, handler_kwargs = self._prepare_handler_call(context, *args, **kwargs)
-        except ValidationError as e:
+        except self.validation_error as e:
             print(f"Input validation error: {e}")
             return e.to_dict()
 
@@ -307,7 +310,7 @@ class FunctionHandler:
     async def __acall__(self, context: FunctionContext, *args: Any, **kwargs: Any) -> Any:
         try:
             handler_args, handler_kwargs = self._prepare_handler_call(context, *args, **kwargs)
-        except ValidationError as e:
+        except self.validation_error as e:
             print(f"Input validation error: {e}")
             return e.to_dict()
 
@@ -377,41 +380,60 @@ async def execute_lifecycle_method_async(name: str) -> Union[Any, None]:
         raise RunnerException()
 
 
-# TODO: add retry behavior directly in dynamically generated GRPC stubs
-def retry_grpc_call(
-    *, exception_to_check: Exception, tries: int = 4, delay: int = 5, backoff: int = 2
-) -> Any:
-    def _retry_decorator(f):
-        @wraps(f)
-        def f_to_retry(*args, **kwargs):
-            mtries, mdelay = tries, delay
-
-            while mtries > 1:
-                try:
-                    return f(*args, **kwargs)
-                except exception_to_check:
-                    print(f"Unexpected GRPC error, retrying in {mdelay} seconds...")
-                    time.sleep(mdelay)
-                    mtries -= 1
-                    mdelay *= backoff
-
-            return f(*args, **kwargs)
-
-        return f_to_retry
-
-    return _retry_decorator
+def _call_gateway_unary(
+    gateway_stub: GatewayServiceStub,
+    route: str,
+    request_type,
+    response_type,
+    request,
+    fallback,
+):
+    unary_unary = getattr(gateway_stub, "_unary_unary", None)
+    if not callable(unary_unary):
+        return fallback(request)
+    return unary_unary(route, request_type, response_type)(
+        request, timeout=LIFECYCLE_RPC_TIMEOUT_SECONDS
+    )
 
 
-@retry_grpc_call(exception_to_check=BaseException, tries=4, delay=5, backoff=2)
-def end_task_and_send_callback(
+def _end_task(gateway_stub: GatewayServiceStub, request: EndTaskRequest) -> EndTaskResponse:
+    last_error: Optional[Exception] = None
+    for attempt in range(END_TASK_MAX_ATTEMPTS):
+        try:
+            response = _call_gateway_unary(
+                gateway_stub,
+                "/gateway.GatewayService/EndTask",
+                EndTaskRequest,
+                EndTaskResponse,
+                request,
+                gateway_stub.end_task,
+            )
+            if response.ok:
+                return response
+            last_error = RuntimeError("Gateway rejected task completion")
+        except Exception as exc:
+            last_error = exc
+
+        if attempt < END_TASK_MAX_ATTEMPTS - 1:
+            delay = END_TASK_RETRY_DELAY_SECONDS * (2**attempt)
+            print(f"Failed to finalize task <{request.task_id}>; retrying in {delay}s")
+            time.sleep(delay)
+
+    assert last_error is not None
+    raise last_error
+
+
+def end_task(gateway_stub: GatewayServiceStub, request: EndTaskRequest) -> EndTaskResponse:
+    return _end_task(gateway_stub, request)
+
+
+def send_task_callback(
     *,
     gateway_stub: GatewayServiceStub,
     payload: Any,
     end_task_request: EndTaskRequest,
     override_callback_url: Optional[str] = None,
-) -> EndTaskResponse:
-    resp = gateway_stub.end_task(end_task_request)
-
+) -> None:
     send_callback(
         gateway_stub=gateway_stub,
         context=FunctionContext.new(
@@ -424,6 +446,34 @@ def end_task_and_send_callback(
         override_callback_url=override_callback_url,
     )
 
+
+def end_task_and_send_callback(
+    *,
+    gateway_stub: GatewayServiceStub,
+    payload: Any,
+    end_task_request: EndTaskRequest,
+    override_callback_url: Optional[str] = None,
+) -> EndTaskResponse:
+    end_task_error: Optional[Exception] = None
+    try:
+        resp = end_task(gateway_stub, end_task_request)
+    except Exception as exc:
+        # Callback delivery is independent of gateway task finalization. User
+        # code has already completed, so an ambiguous or transient EndTask
+        # failure must not silently suppress its callback.
+        end_task_error = exc
+        resp = None
+
+    send_task_callback(
+        gateway_stub=gateway_stub,
+        payload=payload,
+        end_task_request=end_task_request,
+        override_callback_url=override_callback_url,
+    )
+
+    if end_task_error is not None:
+        raise end_task_error
+    assert resp is not None
     return resp
 
 
@@ -443,6 +493,9 @@ def send_callback(
     if not callback_url:
         return
 
+    import requests
+    from starlette.responses import Response
+
     body = {}
     headers = {}
 
@@ -454,30 +507,71 @@ def send_callback(
         headers = payload.headers
         use_json = False
 
-    # Sign callback payload
-    sign_payload_resp: SignPayloadResponse = gateway_stub.sign_payload(
-        SignPayloadRequest(payload=bytes(json.dumps(body), "utf-8"))
-    )
-
-    print(f"Sending data to callback: {callback_url}")
-    headers = {}
-    headers = {
-        **headers,
-        "X-Task-ID": str(context.task_id),
-        "X-Task-Status": str(task_status),
-        "X-Task-Signature": sign_payload_resp.signature,
-        "X-Task-Timestamp": str(sign_payload_resp.timestamp),
-    }
-
     try:
-        start = time.time()
-        if use_json:
-            requests.post(callback_url, json=body, headers=headers)
-        else:
-            requests.post(callback_url, data=body, headers=headers)
+        sign_request = SignPayloadRequest(payload=bytes(json.dumps(body), "utf-8"))
+        sign_payload_resp: SignPayloadResponse = _call_gateway_unary(
+            gateway_stub,
+            "/gateway.GatewayService/SignPayload",
+            SignPayloadRequest,
+            SignPayloadResponse,
+            sign_request,
+            gateway_stub.sign_payload,
+        )
 
-        print(f"Callback request took {time.time() - start} seconds")
-    except BaseException:
+        print(f"Sending data to callback: {callback_url}")
+        headers = {
+            **headers,
+            "X-Task-ID": str(context.task_id),
+            "X-Task-Status": str(task_status),
+            "X-Task-Signature": sign_payload_resp.signature,
+            "X-Task-Timestamp": str(sign_payload_resp.timestamp),
+        }
+        request_body = {"json": body} if use_json else {"data": body}
+
+        for attempt in range(1, CALLBACK_MAX_ATTEMPTS + 1):
+            start = time.time()
+            response = None
+            try:
+                response = requests.post(
+                    callback_url,
+                    **request_body,
+                    headers=headers,
+                    timeout=(
+                        CALLBACK_HTTP_CONNECT_TIMEOUT_SECONDS,
+                        CALLBACK_HTTP_READ_TIMEOUT_SECONDS,
+                    ),
+                )
+                response.raise_for_status()
+                print(
+                    f"Callback request attempt {attempt}/{CALLBACK_MAX_ATTEMPTS} "
+                    f"took {time.time() - start} seconds"
+                )
+                return
+            except requests.ReadTimeout:
+                # A read timeout is ambiguous: the receiver may have committed
+                # the callback while its response was lost. Do not duplicate it.
+                print(
+                    f"Callback delivery status unknown for task <{context.task_id}> after "
+                    "read timeout; not retrying to avoid duplicates"
+                )
+                return
+            except requests.RequestException as exc:
+                status_code = response.status_code if response is not None else None
+                retryable = (
+                    isinstance(exc, requests.ConnectionError)
+                    or status_code in (408, 425, 429)
+                    or (status_code is not None and status_code >= 500)
+                )
+                if not retryable or attempt == CALLBACK_MAX_ATTEMPTS:
+                    raise
+
+                delay = CALLBACK_RETRY_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1))
+                print(
+                    f"Callback request attempt {attempt}/{CALLBACK_MAX_ATTEMPTS} failed; "
+                    f"retrying in {delay:g}s: {exc}"
+                )
+                time.sleep(delay)
+    except Exception:
         print(f"Unable to send callback: {traceback.format_exc()}")
 
 
@@ -525,9 +619,66 @@ CHECKPOINT_SIGNAL_FILE = "/criu/READY_FOR_CHECKPOINT"
 CHECKPOINT_COMPLETE_FILE = "/criu/CHECKPOINT_COMPLETE"
 CHECKPOINT_CONTAINER_ID_FILE = "/criu/CONTAINER_ID"
 CHECKPOINT_CONTAINER_HOSTNAME_FILE = "/criu/CONTAINER_HOSTNAME"
+CHECKPOINT_HEARTBEAT_MAX_SECONDS = 11 * 60
 
 
-def wait_for_checkpoint(workers_ready: Optional[Value] = None):
+def _reset_checkpointed_gunicorn_heartbeats(
+    arbiter: Any,
+    complete_path: Union[str, Path] = CHECKPOINT_COMPLETE_FILE,
+    ready_path: Union[str, Path] = CHECKPOINT_SIGNAL_FILE,
+) -> bool:
+    """Keep Gunicorn clocks live through checkpoint creation and resume."""
+    if getattr(arbiter, "_beta9_checkpoint_heartbeats_reset", False):
+        return False
+    checkpoint_complete = Path(complete_path).exists()
+    checkpoint_ready = Path(ready_path).exists()
+    if not checkpoint_complete and not checkpoint_ready:
+        if hasattr(arbiter, "_beta9_checkpoint_heartbeat_started_at"):
+            del arbiter._beta9_checkpoint_heartbeat_started_at
+        return False
+
+    if checkpoint_ready and not checkpoint_complete:
+        now = time.monotonic()
+        started_at = getattr(arbiter, "_beta9_checkpoint_heartbeat_started_at", None)
+        if started_at is None:
+            arbiter._beta9_checkpoint_heartbeat_started_at = now
+        elif now - started_at >= CHECKPOINT_HEARTBEAT_MAX_SECONDS:
+            return False
+
+    reset = False
+    for worker in list(getattr(arbiter, "WORKERS", {}).values()):
+        try:
+            worker.tmp.notify()
+            reset = True
+        except (OSError, ValueError):
+            continue
+
+    # READY can remain set while a large checkpoint is archived and uploaded;
+    # refresh repeatedly in that window. COMPLETE is the one-shot resume edge.
+    if reset and checkpoint_complete:
+        arbiter._beta9_checkpoint_heartbeats_reset = True
+    return reset
+
+
+def _install_checkpointed_gunicorn_timeout_guard() -> None:
+    try:
+        from gunicorn.arbiter import Arbiter
+    except ImportError:
+        return
+
+    original = Arbiter.murder_workers
+    if getattr(original, "_beta9_checkpoint_guard", False):
+        return
+
+    def murder_workers(arbiter):
+        _reset_checkpointed_gunicorn_heartbeats(arbiter)
+        return original(arbiter)
+
+    murder_workers._beta9_checkpoint_guard = True
+    Arbiter.murder_workers = murder_workers
+
+
+def wait_for_checkpoint(workers_ready: Any):
     def _reload_config():
         # Once we have set the checkpoint signal file, wait for checkpoint to be complete before reloading the config
         while not Path(CHECKPOINT_COMPLETE_FILE).exists():
@@ -537,22 +688,22 @@ def wait_for_checkpoint(workers_ready: Optional[Value] = None):
         config.container_id = Path(CHECKPOINT_CONTAINER_ID_FILE).read_text()
         config.container_hostname = Path(CHECKPOINT_CONTAINER_HOSTNAME_FILE).read_text()
 
-    ready_counter = workers_ready if workers_ready is not None else globals().get("workers_ready")
-    if not ready_counter:
-        return
+    with workers_ready.get_lock():
+        workers_ready.value += 1
 
-    with ready_counter.get_lock():
-        ready_counter.value += 1
-
-    if ready_counter.value == config.workers:
+    if workers_ready.value == config.workers:
         Path(CHECKPOINT_SIGNAL_FILE).touch(exist_ok=True)
         return _reload_config()
 
     while True:
-        with ready_counter.get_lock():
-            if ready_counter.value == config.workers:
+        with workers_ready.get_lock():
+            if workers_ready.value == config.workers:
                 break
 
         time.sleep(1)
 
     return _reload_config()
+
+
+if config is not None and config.checkpoint_enabled:
+    _install_checkpointed_gunicorn_timeout_guard()

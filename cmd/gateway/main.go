@@ -3,38 +3,30 @@ package main
 import (
 	"os"
 
-	"time"
-
+	"github.com/beam-cloud/beta9/cmd/internal/fsentry"
 	"github.com/beam-cloud/beta9/pkg/common"
 	"github.com/beam-cloud/beta9/pkg/gateway"
 	"github.com/beam-cloud/beta9/pkg/metrics"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-
-	"github.com/getsentry/sentry-go"
 )
 
 func main() {
-	// Initialize Sentry
-	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
-		err := sentry.Init(sentry.ClientOptions{
-			Dsn: dsn,
-		})
-		if err != nil {
-			log.Error().Err(err).Msg("sentry.Init failed")
-		} else {
-			defer sentry.Flush(2 * time.Second)
-		}
-	}
+	defer fsentry.Init()()
+
 	// Initialize logging
 	configManager, err := common.NewConfigManager[types.AppConfig]()
 	if err != nil {
 		log.Fatal().Err(err).Msg("error creating config manager")
 	}
 	config := configManager.GetConfig()
+	if config.DebugMode {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	} else {
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	}
 	if config.PrettyLogs {
-		log.Logger = log.Logger.Level(zerolog.DebugLevel)
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
 	}
 	metrics.InitializeMetricsRepository(config.Monitoring.VictoriaMetrics)
@@ -44,6 +36,8 @@ func main() {
 		log.Fatal().Err(err).Msg("error creating gateway service")
 	}
 
-	gw.Start()
+	if err := gw.Start(); err != nil {
+		log.Fatal().Err(err).Msg("gateway stopped unexpectedly")
+	}
 	log.Info().Msg("Gateway stopped")
 }

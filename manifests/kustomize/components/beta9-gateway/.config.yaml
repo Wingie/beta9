@@ -1,6 +1,7 @@
 worker:
   pools:
     default:
+      containerStartConcurrency: 128
       jobSpec:
         env:
         - name: CONFIG_PATH
@@ -12,7 +13,15 @@ worker:
         volumeMounts:
         - mountPath: /etc/beta9
           name: config
-monitoring:
-  fluentbit:
-    events:
-      endpoint: http://fluent-bit.monitoring:9880
+managedCompute:
+  billing:
+    mode: noop
+    endpoint: ""
+    authToken: ""
+    required: false
+    timeout: 5s
+    reconcileInterval: 1m
+    minimumCreditCents: 2500
+cache:
+  server:
+    pageSizeBytes: 4194304

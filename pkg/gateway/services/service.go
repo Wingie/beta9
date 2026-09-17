@@ -2,9 +2,12 @@ package gatewayservices
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/beam-cloud/beta9/pkg/common"
+	computesvc "github.com/beam-cloud/beta9/pkg/gateway/services/compute"
+	thundersvc "github.com/beam-cloud/beta9/pkg/gateway/services/thunder"
 	"github.com/beam-cloud/beta9/pkg/network"
 	"github.com/beam-cloud/beta9/pkg/repository"
 	"github.com/beam-cloud/beta9/pkg/scheduler"
@@ -17,6 +20,7 @@ type GatewayService struct {
 	ctx              context.Context
 	appConfig        types.AppConfig
 	backendRepo      repository.BackendRepository
+	workspaceRepo    repository.WorkspaceRepository
 	containerRepo    repository.ContainerRepository
 	providerRepo     repository.ProviderRepository
 	scheduler        *scheduler.Scheduler
@@ -25,6 +29,9 @@ type GatewayService struct {
 	eventRepo        repository.EventRepository
 	workerRepo       repository.WorkerRepository
 	workerPoolRepo   repository.WorkerPoolRepository
+	computeRepo      repository.ComputeRepository
+	computeService   *computesvc.Service
+	thunderService   *thundersvc.Service
 	usageMetricsRepo repository.UsageMetricsRepository
 	tailscale        *network.Tailscale
 	keyEventManager  *common.KeyEventManager
@@ -36,6 +43,7 @@ type GatewayServiceOpts struct {
 	Ctx              context.Context
 	Config           types.AppConfig
 	BackendRepo      repository.BackendRepository
+	WorkspaceRepo    repository.WorkspaceRepository
 	ContainerRepo    repository.ContainerRepository
 	ProviderRepo     repository.ProviderRepository
 	Scheduler        *scheduler.Scheduler
@@ -44,21 +52,52 @@ type GatewayServiceOpts struct {
 	EventRepo        repository.EventRepository
 	WorkerRepo       repository.WorkerRepository
 	WorkerPoolRepo   repository.WorkerPoolRepository
+	ComputeRepo      repository.ComputeRepository
+	ComputeService   *computesvc.Service
+	ThunderService   *thundersvc.Service
 	UsageMetricsRepo repository.UsageMetricsRepository
 	Tailscale        *network.Tailscale
 	KeyEventManager  *common.KeyEventManager
 }
 
 func NewGatewayService(opts *GatewayServiceOpts) (*GatewayService, error) {
-	keyEventManager, err := common.NewKeyEventManager(opts.RedisClient)
-	if err != nil {
-		return nil, err
+	keyEventManager := common.NewKeyEventManager(opts.RedisClient)
+	computeRepo := opts.ComputeRepo
+	if computeRepo == nil {
+		if opts.RedisClient == nil {
+			return nil, fmt.Errorf("compute repository requires redis client")
+		}
+		computeRepo = repository.NewComputeRedisRepository(opts.RedisClient)
+	}
+	computeService := opts.ComputeService
+	if computeService == nil {
+		var managedPoolRepo repository.ManagedPoolRepository
+		if opts.RedisClient != nil {
+			managedPoolRepo = repository.NewManagedPoolRedisRepository(opts.RedisClient)
+		}
+		computeService = computesvc.New(computesvc.Options{
+			Config:           opts.Config,
+			BackendRepo:      opts.BackendRepo,
+			ContainerRepo:    opts.ContainerRepo,
+			Scheduler:        opts.Scheduler,
+			EventRepo:        opts.EventRepo,
+			WorkerRepo:       opts.WorkerRepo,
+			WorkerPoolRepo:   opts.WorkerPoolRepo,
+			UsageMetricsRepo: opts.UsageMetricsRepo,
+			ComputeRepo:      computeRepo,
+			ManagedPoolRepo:  managedPoolRepo,
+			KeyEventManager:  keyEventManager,
+			RedisClient:      opts.RedisClient,
+			Tailscale:        opts.Tailscale,
+		})
+		computeService.Start(opts.Ctx)
 	}
 
 	return &GatewayService{
 		ctx:              opts.Ctx,
 		appConfig:        opts.Config,
 		backendRepo:      opts.BackendRepo,
+		workspaceRepo:    opts.WorkspaceRepo,
 		containerRepo:    opts.ContainerRepo,
 		providerRepo:     opts.ProviderRepo,
 		scheduler:        opts.Scheduler,
@@ -67,6 +106,9 @@ func NewGatewayService(opts *GatewayServiceOpts) (*GatewayService, error) {
 		eventRepo:        opts.EventRepo,
 		workerRepo:       opts.WorkerRepo,
 		workerPoolRepo:   opts.WorkerPoolRepo,
+		computeRepo:      computeRepo,
+		computeService:   computeService,
+		thunderService:   opts.ThunderService,
 		usageMetricsRepo: opts.UsageMetricsRepo,
 		tailscale:        opts.Tailscale,
 		keyEventManager:  keyEventManager,

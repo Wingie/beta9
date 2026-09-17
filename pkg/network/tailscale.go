@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/beam-cloud/beta9/pkg/repository"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/rs/zerolog/log"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -46,12 +48,23 @@ type TailscaleConfig struct {
 	Debug      bool
 }
 
+var (
+	tailnetPeerPollInterval    = 500 * time.Millisecond
+	tailnetPeerAdvisoryTimeout = time.Second
+)
+
 type Tailscale struct {
-	server        *tsnet.Server
+	mu          sync.Mutex // guards server and initialized
+	server      *tsnet.Server
+	initialized bool // server has been brought up
+
+	cfg           TailscaleConfig
 	debug         bool
-	initialized   bool
-	mu            sync.Mutex
 	tailscaleRepo repository.TailscaleRepository
+
+	// statusFunc and dialFunc override tailnet operations in tests.
+	statusFunc func(ctx context.Context) (*ipnstate.Status, error)
+	dialFunc   func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 func (t *Tailscale) logF(format string, v ...interface{}) {
@@ -62,76 +75,72 @@ func (t *Tailscale) logF(format string, v ...interface{}) {
 
 // NewTailscale creates a new Tailscale instance using tsnet
 func newTailscale(cfg TailscaleConfig, tailscaleRepo repository.TailscaleRepository) *Tailscale {
-	ts := &Tailscale{
+	t := &Tailscale{
+		cfg:           cfg,
 		debug:         cfg.Debug,
-		initialized:   false,
-		mu:            sync.Mutex{},
 		tailscaleRepo: tailscaleRepo,
 	}
-
-	ts.server = &tsnet.Server{
-		Dir:        cfg.Dir,
-		Hostname:   cfg.Hostname,
-		AuthKey:    cfg.AuthKey,
-		ControlURL: cfg.ControlURL,
-		Ephemeral:  cfg.Ephemeral,
-		UserLogf:   ts.logF,
-		Logf:       ts.logF,
-	}
-
-	return ts
+	t.server = t.buildServer()
+	return t
 }
 
-// Start connects to the tailnet without serving any local service.
-// This is needed for the gateway to resolve services on the tailnet.
-func (t *Tailscale) Start(ctx context.Context) error {
+func (t *Tailscale) buildServer() *tsnet.Server {
+	return &tsnet.Server{
+		Dir:        t.cfg.Dir,
+		Hostname:   t.cfg.Hostname,
+		AuthKey:    t.cfg.AuthKey,
+		ControlURL: t.cfg.ControlURL,
+		Ephemeral:  t.cfg.Ephemeral,
+		UserLogf:   t.logF,
+		Logf:       t.logF,
+	}
+}
+
+func (t *Tailscale) currentServer() *tsnet.Server {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.server
+}
 
+func (t *Tailscale) ensureUp(ctx context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if t.initialized {
 		return nil
 	}
-
-	log.Info().
-		Str("url", t.server.ControlURL).
-		Str("hostname", t.server.Hostname).
-		Msg("starting tailscale connection")
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	status, err := t.server.Up(timeoutCtx)
-	if err != nil {
-		return fmt.Errorf("failed to start tailscale: %w", err)
+	if _, err := t.server.Up(ctx); err != nil {
+		return err
 	}
-
 	t.initialized = true
-	log.Info().
-		Str("hostname", t.server.Hostname).
-		Str("tailscale_ip", status.TailscaleIPs[0].String()).
-		Int("peer_count", len(status.Peer)).
-		Msg("tailscale connected successfully")
-
 	return nil
+}
+
+func (t *Tailscale) Start(ctx context.Context) error {
+	return t.ensureUp(ctx)
 }
 
 // Serve connects to a tailnet and serves a local service
 func (t *Tailscale) Serve(ctx context.Context, service types.InternalService) (net.Listener, error) {
-	log.Info().Str("url", t.server.ControlURL).Msg("connecting to tailnet")
+	server := t.currentServer()
+	log.Info().Str("url", server.ControlURL).Msg("connecting to tailnet")
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	addr := fmt.Sprintf(":%d", service.LocalPort)
-	listener, err := t.server.Listen("tcp", addr)
+	listener, err := server.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = t.server.Up(timeoutCtx)
+	_, err = server.Up(timeoutCtx)
 	if err != nil {
 		return nil, err
 	}
+
+	t.mu.Lock()
+	t.initialized = true
+	t.mu.Unlock()
 
 	log.Info().Str("addr", addr).Msg("connected to tailnet")
 	return listener, nil
@@ -139,20 +148,14 @@ func (t *Tailscale) Serve(ctx context.Context, service types.InternalService) (n
 
 // Dial attempts to establish a TCP connection to a tailscale service
 func (t *Tailscale) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	if !t.initialized {
-		t.mu.Lock()
-
-		_, err := t.server.Up(ctx)
-		if err != nil {
-			t.mu.Unlock()
-			return nil, err
-		}
-
-		t.initialized = true
-		t.mu.Unlock()
+	if t.dialFunc != nil {
+		return t.dialFunc(ctx, network, addr)
+	}
+	if err := t.ensureUp(ctx); err != nil {
+		return nil, err
 	}
 
-	conn, err := t.server.Dial(ctx, network, addr)
+	conn, err := t.currentServer().Dial(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -160,11 +163,125 @@ func (t *Tailscale) Dial(ctx context.Context, network, addr string) (net.Conn, e
 	return conn, nil
 }
 
-// DialTimeout attempts to establish a TCP connection to a tailscale service with the specified timeout duration
-func (t *Tailscale) DialTimeout(network, addr string, timeout time.Duration) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// WaitForPeer blocks until host is visible in this node's tailnet netmap, or
+// the timeout elapses. Dialing a MagicDNS name for a peer that is missing from
+// the netmap silently falls back to the system resolver and surfaces as a
+// confusing NXDOMAIN ("no such host"); callers should use this to fail with a
+// clear error instead. This lookup is deliberately advisory: request-path
+// failures must never close or replace the shared gateway tsnet server because
+// doing so tears down healthy traffic to every other peer.
+func (t *Tailscale) WaitForPeer(ctx context.Context, host string, timeout time.Duration) error {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if host == "" {
+		return nil
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		// IP targets don't go through MagicDNS; tsnet dials them directly
+		// from the netmap and fails fast on its own.
+		return nil
+	}
+
+	deadline := time.Now().Add(timeout)
+	probeCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		probeCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
 
+	var lastErr error
+
+poll:
+	for {
+		found, err := t.peerInNetmap(probeCtx, host)
+		if err == nil && found {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		lastErr = err
+
+		if time.Now().Add(tailnetPeerPollInterval).After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-probeCtx.Done():
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			break poll
+		case <-time.After(tailnetPeerPollInterval):
+		}
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("tailnet netmap status unavailable while resolving peer %q: %w", host, lastErr)
+	}
+	return fmt.Errorf("tailnet peer %q is not visible in this node's netmap (peer is offline or has been removed)", host)
+}
+
+func (t *Tailscale) peerInNetmap(ctx context.Context, host string) (bool, error) {
+	status, err := t.netmapStatus(ctx)
+	if err != nil {
+		return false, err
+	}
+	if status == nil {
+		return false, nil
+	}
+	if status.Self != nil && tailnetPeerMatchesHost(status.Self.HostName, status.Self.DNSName, host) {
+		return true, nil
+	}
+	for _, peer := range status.Peer {
+		if peer == nil {
+			continue
+		}
+		if tailnetPeerMatchesHost(peer.HostName, peer.DNSName, host) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (t *Tailscale) netmapStatus(ctx context.Context) (*ipnstate.Status, error) {
+	if t.statusFunc != nil {
+		return t.statusFunc(ctx)
+	}
+	if err := t.ensureUp(ctx); err != nil {
+		return nil, err
+	}
+	client, err := t.currentServer().LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	return client.Status(statusCtx)
+}
+
+func tailnetPeerMatchesHost(hostName, dnsName, target string) bool {
+	target = strings.TrimSuffix(target, ".")
+	hostName = strings.TrimSuffix(hostName, ".")
+	dnsName = strings.TrimSuffix(dnsName, ".")
+	return target == hostName || target == dnsName || strings.HasPrefix(dnsName, target+".")
+}
+
+// DialTimeout attempts to establish a TCP connection to a tailscale service with the specified timeout duration
+func (t *Tailscale) DialTimeout(network, addr string, timeout time.Duration) (net.Conn, error) {
+	return t.DialContextTimeout(context.Background(), network, addr, timeout)
+}
+
+func (t *Tailscale) DialContextTimeout(ctx context.Context, network, addr string, timeout time.Duration) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	return t.Dial(ctx, network, addr)
 }
 
@@ -193,11 +310,11 @@ func (t *Tailscale) GetHostnameForService(serviceName string) (string, error) {
 }
 
 func (t *Tailscale) GetServer() *tsnet.Server {
-	return t.server
+	return t.currentServer()
 }
 
 func (t *Tailscale) ResolveService(serviceName string, timeout time.Duration) (string, error) {
-	client, err := t.server.LocalClient()
+	client, err := t.currentServer().LocalClient()
 	if err != nil {
 		return "", err
 	}
@@ -231,5 +348,5 @@ func (t *Tailscale) ResolveService(serviceName string, timeout time.Duration) (s
 
 // Stops the Tailscale server
 func (t *Tailscale) Close() error {
-	return t.server.Close()
+	return t.currentServer().Close()
 }

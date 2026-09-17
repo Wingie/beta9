@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 )
 
@@ -29,70 +31,136 @@ const (
 	KeyOperationExpired string = "expired"
 )
 
-func NewKeyEventManager(rdb *RedisClient) (*KeyEventManager, error) {
-	return &KeyEventManager{rdb: rdb}, nil
+func NewKeyEventManager(rdb *RedisClient) *KeyEventManager {
+	return &KeyEventManager{rdb: rdb}
 }
 
-func (kem *KeyEventManager) TrimKeyspacePrefix(key string) string {
-	return strings.TrimPrefix(key, keyspacePrefix)
+// ListenForPatternEvents watches future keyspace events without replaying
+// existing keys. Use it when only expiry/delete events are meaningful.
+func (kem *KeyEventManager) ListenForPatternEvents(ctx context.Context, patternPrefix string, keyEventChan chan KeyEvent) error {
+	return kem.listenForSubscriptionPattern(ctx, patternPrefix, keyspacePrefix+patternPrefix+"*", keyEventChan, nil)
 }
 
-func (kem *KeyEventManager) fetchExistingKeys(patternPrefix string) ([]string, error) {
-	pattern := fmt.Sprintf("%s*", patternPrefix)
-
-	keys, err := kem.rdb.Scan(context.Background(), pattern)
-	if err != nil {
-		return nil, err
-	}
-
-	trimmedKeys := make([]string, len(keys))
-	for i, key := range keys {
-		trimmedKeys[i] = strings.TrimPrefix(key, patternPrefix)
-	}
-
-	return trimmedKeys, nil
+// ListenForContainerPattern replays active container state from its explicit
+// index instead of scanning the entire Redis keyspace.
+func (kem *KeyEventManager) ListenForContainerPattern(ctx context.Context, containerPrefix string, keyEventChan chan KeyEvent) error {
+	patternPrefix := RedisKeys.SchedulerContainerState(containerPrefix)
+	return kem.listenForSubscriptionPattern(ctx, patternPrefix, keyspacePrefix+patternPrefix+"*", keyEventChan, func() ([]string, error) {
+		now := fmt.Sprint(time.Now().Unix())
+		pipe := kem.rdb.TxPipeline()
+		active := pipe.ZRangeByScore(ctx, RedisKeys.SchedulerContainerStateIndex(), &redis.ZRangeBy{
+			Min: now,
+			Max: "+inf",
+		})
+		pipe.ZRemRangeByScore(ctx, RedisKeys.SchedulerContainerStateIndex(), "-inf", now)
+		if _, err := pipe.Exec(ctx); err != nil {
+			return nil, err
+		}
+		keys := active.Val()
+		existing := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if strings.HasPrefix(key, patternPrefix) {
+				existing = append(existing, strings.TrimPrefix(key, patternPrefix))
+			}
+		}
+		return existing, nil
+	})
 }
 
-func (kem *KeyEventManager) ListenForPattern(ctx context.Context, patternPrefix string, keyEventChan chan KeyEvent) error {
-	pattern := fmt.Sprintf("%s%s*", keyspacePrefix, patternPrefix)
+func (kem *KeyEventManager) ListenForPublishedKey(ctx context.Context, key string, keyEventChan chan KeyEvent) error {
+	return kem.listenForSubscriptionPattern(ctx, key, key, keyEventChan, func() ([]string, error) {
+		exists, err := kem.rdb.Exists(ctx, key).Result()
+		if err != nil || exists == 0 {
+			return nil, err
+		}
+		return []string{""}, nil
+	})
+}
+
+// ListenForKey watches one exact key without scanning the database. Subscribing
+// before checking existence ensures a write cannot be missed between the two.
+func (kem *KeyEventManager) ListenForKey(ctx context.Context, key string, keyEventChan chan KeyEvent) error {
+	return kem.listenForSubscriptionPattern(ctx, key, keyspacePrefix+key, keyEventChan, func() ([]string, error) {
+		exists, err := kem.rdb.Exists(ctx, key).Result()
+		if err != nil || exists == 0 {
+			return nil, err
+		}
+		return []string{""}, nil
+	})
+}
+
+func (kem *KeyEventManager) listenForSubscriptionPattern(
+	ctx context.Context,
+	patternPrefix string,
+	pattern string,
+	keyEventChan chan KeyEvent,
+	existingKeys func() ([]string, error),
+) error {
 	messages, errs, close := kem.rdb.PSubscribe(ctx, pattern)
 
-	existingKeys, err := kem.fetchExistingKeys(patternPrefix)
-	if err != nil {
-		return err
-	}
-
-	for _, key := range existingKeys {
-		keyEventChan <- KeyEvent{
-			Key:       key,
-			Operation: KeyOperationSet,
+	if existingKeys != nil {
+		keys, err := existingKeys()
+		if err != nil {
+			close()
+			return err
+		}
+		for _, key := range keys {
+			select {
+			case keyEventChan <- KeyEvent{
+				Key:       key,
+				Operation: KeyOperationSet,
+			}:
+			case <-ctx.Done():
+				close()
+				return ctx.Err()
+			}
 		}
 	}
 
 	go func() {
 		defer close()
 
-	retry:
 		for {
 			select {
-			case m := <-messages:
-				key := strings.TrimPrefix(m.Channel, fmt.Sprintf("%s%s", keyspacePrefix, patternPrefix))
-				operation := string(m.Payload)
-
-				keyEventChan <- KeyEvent{
-					Key:       key,
-					Operation: operation,
+			case m, ok := <-messages:
+				if !ok || m == nil {
+					return
+				}
+				select {
+				case keyEventChan <- kem.messageToKeyEvent(patternPrefix, m.Channel, string(m.Payload)):
+				case <-ctx.Done():
+					return
 				}
 
 			case <-ctx.Done():
 				return
 
-			case err := <-errs:
-				log.Error().Err(err).Msg("error with key manager subscription")
-				break retry
+			case err, ok := <-errs:
+				if ok && err != nil {
+					log.Error().Err(err).Msg("error with key manager subscription")
+				}
+				return
 			}
 		}
 	}()
 
 	return nil
+}
+
+func (kem *KeyEventManager) messageToKeyEvent(patternPrefix, channel, payload string) KeyEvent {
+	if strings.HasPrefix(channel, keyspacePrefix) {
+		return KeyEvent{
+			Key:       strings.TrimPrefix(channel, fmt.Sprintf("%s%s", keyspacePrefix, patternPrefix)),
+			Operation: payload,
+		}
+	}
+
+	operation := payload
+	if operation == "" {
+		operation = KeyOperationSet
+	}
+	return KeyEvent{
+		Key:       strings.TrimPrefix(channel, patternPrefix),
+		Operation: operation,
+	}
 }

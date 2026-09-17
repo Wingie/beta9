@@ -70,14 +70,17 @@ func (i *taskQueueInstance) startContainers(containersToRun int) error {
 	}
 
 	for c := 0; c < containersToRun; c++ {
+		if err := i.CheckConcurrencyLimit(); err != nil {
+			return err
+		}
+
 		containerId := i.genContainerId()
 
 		mounts, err := abstractions.ConfigureContainerRequestMounts(
 			containerId,
-			i.Stub.Object.ExternalId,
+			i.Stub,
 			i.Workspace,
 			*i.StubConfig,
-			i.Stub.ExternalId,
 		)
 		if err != nil {
 			return err
@@ -99,6 +102,11 @@ func (i *taskQueueInstance) startContainers(containersToRun int) error {
 			Mounts:            mounts,
 			Stub:              *i.Stub,
 			CheckpointEnabled: checkpointEnabled,
+			CheckpointTrigger: i.StubConfig.CheckpointTrigger,
+			PoolSelector:      i.StubConfig.PoolSelector(),
+		}
+		if err := abstractions.ConfigureContainerRequestNetwork(runRequest, *i.StubConfig); err != nil {
+			return err
 		}
 
 		// Set initial keepwarm to prevent rapid spin-up/spin-down of containers
