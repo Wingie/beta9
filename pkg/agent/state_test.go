@@ -241,3 +241,19 @@ func TestJobStatusConstants(t *testing.T) {
 		t.Errorf("expected FAILED, got %s", JobStatusFailed)
 	}
 }
+
+func TestUpdateInferenceKeepsGPUType(t *testing.T) {
+	state := NewAgentState("m", "pool", "gw")
+	state.UpdateInferenceWithGPU("running", "100.64.0.1", DefaultOllamaPort, nil, "CUDA")
+
+	// What the control API does after /inference/start and /inference/pull.
+	state.UpdateInference("running", "100.64.0.1", DefaultOllamaPort, []string{"llama3"})
+
+	snap := state.GetSnapshot()
+	if snap.InferenceGPUType != "CUDA" {
+		t.Fatalf("InferenceGPUType = %q after UpdateInference, want CUDA", snap.InferenceGPUType)
+	}
+	if len(snap.InferenceModels) != 1 || snap.InferenceModels[0] != "llama3" {
+		t.Fatalf("InferenceModels = %v, want [llama3]", snap.InferenceModels)
+	}
+}

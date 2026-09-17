@@ -27,8 +27,8 @@ type Agent struct {
 	useTUI        bool
 	ctx           context.Context
 	cancel        context.CancelFunc
-	ollama        *OllamaManager  // Inference server manager
-	control       *ControlServer  // Control API server
+	ollama        *OllamaManager // Inference server manager
+	control       *ControlServer // Control API server
 }
 
 // New creates a new agent instance (legacy, no TUI)

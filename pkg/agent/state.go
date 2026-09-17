@@ -68,13 +68,13 @@ type AgentState struct {
 
 // AgentStateSnapshot is a copy-safe version of AgentState for TUI rendering
 type AgentStateSnapshot struct {
-	MachineID       string
-	PoolName        string
-	Gateway         string
-	Status          string
-	CPUPercent      float64
-	MemoryPercent   float64
-	GPUCount        int
+	MachineID        string
+	PoolName         string
+	Gateway          string
+	Status           string
+	CPUPercent       float64
+	MemoryPercent    float64
+	GPUCount         int
 	StartTime        time.Time
 	LastHeartbeat    time.Time
 	HeartbeatStatus  string
@@ -247,19 +247,28 @@ func (s *AgentState) GetSnapshot() AgentStateSnapshot {
 	return snapshot
 }
 
-// UpdateInference updates inference server status
+// UpdateInference updates inference server status and leaves the recorded
+// GPU type alone. The control API calls this after /inference/start and
+// /inference/pull; clearing the type there made the next keepalive
+// re-register the node with no GPU, and the router stopped sending it work.
 func (s *AgentState) UpdateInference(status, ip string, port int, models []string) {
-	s.UpdateInferenceWithGPU(status, ip, port, models, "")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateInferenceLocked(status, ip, port, models)
 }
 
 // UpdateInferenceWithGPU updates inference server status including GPU type
 func (s *AgentState) UpdateInferenceWithGPU(status, ip string, port int, models []string, gpuType string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.InferenceGPUType = gpuType
+	s.updateInferenceLocked(status, ip, port, models)
+}
+
+func (s *AgentState) updateInferenceLocked(status, ip string, port int, models []string) {
 	s.InferenceStatus = status
 	s.InferenceIP = ip
 	s.InferencePort = port
-	s.InferenceGPUType = gpuType
 	// Copy slice to prevent data races from caller mutations
 	s.InferenceModels = make([]string, len(models))
 	copy(s.InferenceModels, models)
