@@ -55,10 +55,11 @@ type AgentState struct {
 	TotalJobs   int
 
 	// Inference
-	InferenceStatus string // "stopped", "starting", "running", "error"
-	InferenceIP     string
-	InferencePort   int
-	InferenceModels []string // List of loaded models
+	InferenceStatus  string // "stopped", "starting", "running", "error"
+	InferenceIP      string
+	InferencePort    int
+	InferenceModels  []string // List of loaded models
+	InferenceGPUType string   // e.g. "MPS", "CUDA", ""
 
 	// Logs (ring buffer for TUI display)
 	Logs    []string
@@ -67,25 +68,26 @@ type AgentState struct {
 
 // AgentStateSnapshot is a copy-safe version of AgentState for TUI rendering
 type AgentStateSnapshot struct {
-	MachineID       string
-	PoolName        string
-	Gateway         string
-	Status          string
-	CPUPercent      float64
-	MemoryPercent   float64
-	GPUCount        int
-	StartTime       time.Time
-	LastHeartbeat   time.Time
-	HeartbeatStatus string
-	Jobs            []JobInfo
-	RunningJobs     int
-	TotalJobs       int
-	InferenceStatus string
-	InferenceIP     string
-	InferencePort   int
-	InferenceModels []string
-	Logs            []string
-	MaxLogs         int
+	MachineID        string
+	PoolName         string
+	Gateway          string
+	Status           string
+	CPUPercent       float64
+	MemoryPercent    float64
+	GPUCount         int
+	StartTime        time.Time
+	LastHeartbeat    time.Time
+	HeartbeatStatus  string
+	Jobs             []JobInfo
+	RunningJobs      int
+	TotalJobs        int
+	InferenceStatus  string
+	InferenceIP      string
+	InferencePort    int
+	InferenceModels  []string
+	InferenceGPUType string
+	Logs             []string
+	MaxLogs          int
 }
 
 // Uptime returns the agent uptime
@@ -215,22 +217,23 @@ func (s *AgentState) GetSnapshot() AgentStateSnapshot {
 
 	// Build snapshot field-by-field to avoid copying the mutex
 	snapshot := AgentStateSnapshot{
-		MachineID:       s.MachineID,
-		PoolName:        s.PoolName,
-		Gateway:         s.Gateway,
-		Status:          s.Status,
-		CPUPercent:      s.CPUPercent,
-		MemoryPercent:   s.MemoryPercent,
-		GPUCount:        s.GPUCount,
-		StartTime:       s.StartTime,
-		LastHeartbeat:   s.LastHeartbeat,
-		HeartbeatStatus: s.HeartbeatStatus,
-		RunningJobs:     s.RunningJobs,
-		TotalJobs:       s.TotalJobs,
-		InferenceStatus: s.InferenceStatus,
-		InferenceIP:     s.InferenceIP,
-		InferencePort:   s.InferencePort,
-		MaxLogs:         s.MaxLogs,
+		MachineID:        s.MachineID,
+		PoolName:         s.PoolName,
+		Gateway:          s.Gateway,
+		Status:           s.Status,
+		CPUPercent:       s.CPUPercent,
+		MemoryPercent:    s.MemoryPercent,
+		GPUCount:         s.GPUCount,
+		StartTime:        s.StartTime,
+		LastHeartbeat:    s.LastHeartbeat,
+		HeartbeatStatus:  s.HeartbeatStatus,
+		RunningJobs:      s.RunningJobs,
+		TotalJobs:        s.TotalJobs,
+		InferenceStatus:  s.InferenceStatus,
+		InferenceIP:      s.InferenceIP,
+		InferencePort:    s.InferencePort,
+		InferenceGPUType: s.InferenceGPUType,
+		MaxLogs:          s.MaxLogs,
 	}
 
 	// Deep copy slices
@@ -244,10 +247,25 @@ func (s *AgentState) GetSnapshot() AgentStateSnapshot {
 	return snapshot
 }
 
-// UpdateInference updates inference server status
+// UpdateInference updates inference server status and leaves the recorded
+// GPU type alone. The control API calls this after /inference/start and
+// /inference/pull; clearing the type there made the next keepalive
+// re-register the node with no GPU, and the router stopped sending it work.
 func (s *AgentState) UpdateInference(status, ip string, port int, models []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updateInferenceLocked(status, ip, port, models)
+}
+
+// UpdateInferenceWithGPU updates inference server status including GPU type
+func (s *AgentState) UpdateInferenceWithGPU(status, ip string, port int, models []string, gpuType string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.InferenceGPUType = gpuType
+	s.updateInferenceLocked(status, ip, port, models)
+}
+
+func (s *AgentState) updateInferenceLocked(status, ip string, port int, models []string) {
 	s.InferenceStatus = status
 	s.InferenceIP = ip
 	s.InferencePort = port

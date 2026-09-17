@@ -31,7 +31,13 @@ func NewWorkspaceGroup(g *echo.Group, backendRepo repository.BackendRepository, 
 		defaultStorageClient: defaultStorageClient,
 	}
 
-	g.POST("", group.CreateWorkspace)
+	// CreateWorkspace does `cc, _ := ctx.(*auth.HttpAuthContext)` and
+	// immediately dereferences cc.AuthInfo — unwrapped, an unauthenticated
+	// caller hits fail-open AuthMiddleware, cc is nil, and the handler
+	// nil-derefs (same P1 class as the /v1/machine/* routes).
+	// WithClusterAdminAuth both fixes that and enforces the check the
+	// handler body was already trying (and failing) to do itself.
+	g.POST("", auth.WithClusterAdminAuth(group.CreateWorkspace))
 	g.GET("/current", auth.WithAuth(group.CurrentWorkspace))
 	g.GET("/:workspaceId/export", auth.WithStrictWorkspaceAuth(group.ExportWorkspaceConfig))
 	g.POST("/:workspaceId/set-external-storage", auth.WithStrictWorkspaceAuth(group.SetExternalWorkspaceStorage))

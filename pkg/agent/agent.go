@@ -27,8 +27,8 @@ type Agent struct {
 	useTUI        bool
 	ctx           context.Context
 	cancel        context.CancelFunc
-	ollama        *OllamaManager  // Inference server manager
-	control       *ControlServer  // Control API server
+	ollama        *OllamaManager // Inference server manager
+	control       *ControlServer // Control API server
 }
 
 // New creates a new agent instance (legacy, no TUI)
@@ -357,12 +357,14 @@ func (a *Agent) StartInference() error {
 	}
 
 	if a.ollama.IsRunning() {
+		status := a.ollama.GetStatus()
 		log.Info().
 			Int("port", DefaultOllamaPort).
 			Str("tailscale_ip", a.ollama.TailscaleIP()).
+			Str("gpu_type", status.GPUType).
 			Msg("Inference server ready")
 		a.state.AddLog("Inference: ready on :" + fmt.Sprintf("%d", DefaultOllamaPort))
-		a.state.UpdateInference("running", a.ollama.TailscaleIP(), DefaultOllamaPort, nil)
+		a.state.UpdateInferenceWithGPU("running", a.ollama.TailscaleIP(), DefaultOllamaPort, nil, status.GPUType)
 	}
 
 	return nil

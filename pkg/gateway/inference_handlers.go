@@ -2,14 +2,36 @@ package gateway
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog/log"
 
+	"github.com/beam-cloud/beta9/pkg/auth"
 	"github.com/beam-cloud/beta9/pkg/types"
 )
+
+// tailscaleCGNAT is the CGNAT range Tailscale assigns node addresses from
+// (100.64.0.0/10). A registered node's IP must fall inside it — otherwise a
+// caller can point routed inference/chat traffic at an arbitrary host
+// (loopback, RFC-1918, link-local/cloud-metadata 169.254.169.254, etc.).
+// This is SSRF finding P0 (2026-05-18): independent of the WithClusterAdminAuth
+// fix above, since even a legitimate cluster-admin caller should never be
+// able to register a non-Tailscale address as an inference node.
+var tailscaleCGNAT = func() *net.IPNet {
+	_, n, err := net.ParseCIDR("100.64.0.0/10")
+	if err != nil {
+		panic(err)
+	}
+	return n
+}()
+
+func isTailscaleIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && tailscaleCGNAT.Contains(parsed)
+}
 
 // ============================================================================
 // Inference HTTP Handlers - API endpoints for inference routing
@@ -32,20 +54,32 @@ func NewInferenceService(ctx context.Context, registry *ModelRegistry) *Inferenc
 }
 
 // RegisterRoutes registers inference routes on the Echo router
+//
+// `g` already has auth.AuthMiddleware attached at the group level (see
+// gateway.go), but that middleware fails open when no token is presented —
+// it exists to populate *auth.HttpAuthContext when a token IS given, not to
+// reject anonymous callers itself. Every handler below therefore needs its
+// own auth.WithAuth (or auth.WithClusterAdminAuth) wrapper, or it runs for
+// unauthenticated callers exactly as it did before the middleware ran. This
+// was P0-1 in the beta9 security baseline: node registration, heartbeat,
+// and model load/unload are cluster-admin operations (a caller can redirect
+// live inference traffic by re-registering a node), so they require a
+// TokenTypeClusterAdmin token; chat/embeddings/model+node listing just need
+// any authenticated caller.
 func (s *InferenceService) RegisterRoutes(g *echo.Group) {
 	// OpenAI-compatible endpoints
-	g.POST("/chat/completions", s.handleChat)
-	g.POST("/embeddings", s.handleEmbed)
+	g.POST("/chat/completions", auth.WithAuth(s.handleChat))
+	g.POST("/embeddings", auth.WithAuth(s.handleEmbed))
 
 	// Model management
-	g.GET("/models", s.handleListModels)
-	g.POST("/models/:model/load", s.handleLoadModel)
-	g.POST("/models/:model/unload", s.handleUnloadModel)
+	g.GET("/models", auth.WithAuth(s.handleListModels))
+	g.POST("/models/:model/load", auth.WithClusterAdminAuth(s.handleLoadModel))
+	g.POST("/models/:model/unload", auth.WithClusterAdminAuth(s.handleUnloadModel))
 
 	// Node management
-	g.GET("/nodes", s.handleListNodes)
-	g.POST("/nodes/register", s.handleRegisterNode)
-	g.POST("/nodes/:nodeId/heartbeat", s.handleHeartbeat)
+	g.GET("/nodes", auth.WithAuth(s.handleListNodes))
+	g.POST("/nodes/register", auth.WithClusterAdminAuth(s.handleRegisterNode))
+	g.POST("/nodes/:nodeId/heartbeat", auth.WithClusterAdminAuth(s.handleHeartbeat))
 
 	// Health
 	g.GET("/health", s.handleHealth)
@@ -247,6 +281,12 @@ func (s *InferenceService) handleRegisterNode(c echo.Context) error {
 	if req.NodeID == "" || req.TailscaleIP == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{
 			"error": "node_id and tailscale_ip are required",
+		})
+	}
+
+	if !isTailscaleIP(req.TailscaleIP) {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": "tailscale_ip must be within the Tailscale CGNAT range (100.64.0.0/10)",
 		})
 	}
 

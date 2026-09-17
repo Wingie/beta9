@@ -450,12 +450,22 @@ func (m *OllamaManager) UnloadModel(ctx context.Context, model string) error {
 	return nil
 }
 
+// detectGPUType names the accelerator this node can actually serve on.
+// Apple silicon reports MPS; anything nvidia-smi can enumerate reports CUDA;
+// a node with neither reports "" and the router will not send it GPU work.
+func detectGPUType() string {
+	if runtime.GOOS == "darwin" {
+		return "MPS"
+	}
+	if DetectGPUCount() > 0 {
+		return "CUDA"
+	}
+	return ""
+}
+
 // GetStatus returns inference status for gateway
 func (m *OllamaManager) GetStatus() *NodeInferenceStatus {
-	gpuType := ""
-	if runtime.GOOS == "darwin" {
-		gpuType = "MPS"
-	}
+	gpuType := detectGPUType()
 
 	return &NodeInferenceStatus{
 		TailscaleIP:   m.tailscaleIP,

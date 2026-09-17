@@ -35,9 +35,8 @@ jobs:
           key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/uv.lock') }}
 
       - name: Install dependencies
-        run: |
-          uv sync
-          uv pip install ruff pytest pytest-cov
+        # --locked --group dev, not `uv pip install ruff`: the bare install pulled the newest ruff every run, overriding the lockfile pin, so the ruleset changed under us. pytest and pytest-cov are already in the dev group. Matches upstream.
+        run: uv sync --locked --group dev
         if: steps.cached-dependencies.outputs.cache-hit != 'true'
 
       - name: Code formatting
@@ -52,7 +51,6 @@ jobs:
         run: make tests
 
   lint_and_test_go_pkg:
-    needs: lint_and_test_python_sdk
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -75,7 +73,6 @@ jobs:
           make test-pkg
   
   verify_protobufs:
-    needs: lint_and_test_go_pkg
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3

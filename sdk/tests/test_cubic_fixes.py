@@ -59,6 +59,7 @@ class TestCubicFixes(unittest.TestCase):
         
         inference.configure()
         result = inference.embed("model", "single input")
+        self.assertIsInstance(result, EmbeddingResult)
         self.assertEqual(len(result.embedding), 3) # Vector dimension is 3
         self.assertIsInstance(result.embedding[0], float)
 
@@ -79,6 +80,25 @@ class TestCubicFixes(unittest.TestCase):
         # Check specific values
         self.assertEqual(result.embeddings[0], [0.1, 0.1])
         self.assertEqual(result.embeddings[2], [0.3, 0.3])
+
+    @patch('beta9.inference.httpx.Client')
+    def test_chat_forwards_chatmessage(self, mock_client_cls):
+        """Test that chat() converts ChatMessage objects to dicts in the payload."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"message": {"content": "hi"}, "done_reason": "stop"}
+        mock_response.status_code = 200
+        mock_client.post.return_value = mock_response
+
+        inference.configure()
+        inference.chat("model", [ChatMessage(role="user", content="hello")])
+
+        # ChatMessage objects must be serialized to {"role", "content"} dicts
+        call_args = mock_client.post.call_args
+        self.assertIsNotNone(call_args)
+        payload = call_args[1]['json']
+        self.assertEqual(payload['messages'], [{"role": "user", "content": "hello"}])
 
     @patch('beta9.inference.httpx.Client')
     def test_configure_closes_client(self, mock_client_cls):
