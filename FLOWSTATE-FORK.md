@@ -26,8 +26,10 @@ dropped rather than ported.
 
 | Area | Files | Why it is not upstreamable |
 |---|---|---|
-| Sentry | `cmd/gateway/main.go`, `cmd/worker/main.go` | Reads `SENTRY_DSN` from the environment and no-ops when unset. Our production error reporting. |
-| Registry CI | `.github/workflows/build-agentosaurus.yml` | Builds gateway/worker/runner multi-arch and pushes to `registry.agentosaurus.com`. Deployment-specific. |
+| Sentry | `cmd/internal/fsentry/`, one line each in `cmd/gateway/main.go` and `cmd/worker/main.go` | Reads `SENTRY_DSN` from the environment and no-ops when unset. Reports fatal- and panic-level log events (message only, since a zerolog hook cannot see the attached error) and panics on main's goroutine, which it re-raises. Error-level logs are not sent. Panics on other goroutines are not caught. Our production error reporting. |
+| Registry CI | `.github/workflows/build-agentosaurus.yml` | Builds gateway/worker/runner multi-arch and pushes to `registry.agentosaurus.com`. Deployment-specific. It runs on every push to `main` that touches `docker/`, `cmd/`, `pkg/` or `go.mod`, and overwrites the `:latest` tags there. |
+| arm64 JuiceFS in the gateway image | `docker/Dockerfile.gateway`, `base` stage | Upstream downloads a Beam-pinned JuiceFS that is x86-64 only, so the arm64 gateway image carried a binary it could not run. This uses the same arch switch upstream already has in `Dockerfile.worker`. Upstreamable; drop it once upstream fixes the gateway. |
+| Claude reviewer | `.github/workflows/claude.yml`, `.github/workflows/claude-code-review.yml` | Added on the old fork in #7. Needs the `CLAUDE_CODE_OAUTH_TOKEN` repo secret, which is not set, so both fail until it is. |
 | k3s environment fixes | `manifests/k3d/coredns-custom.yaml`, `manifests/k3d/metrics-server.yaml` | Two self-contained cluster fixes: CoreDNS forwarding, because k3s pods on flannel cannot route to Tailscale MagicDNS at 100.100.100.100; and a `hostNetwork` metrics-server, because the pod network cannot reach the kubelet endpoint on 10250. Neither touches beta9. |
 
 That is the whole delta.
@@ -67,6 +69,10 @@ All of it is reachable from the tag `fork-pre-upstream-sync-pin-95618d01`
 - **Two committed Go binaries**, `b9agent` (11.2 MB) and `bin/agent-go`
   (9.1 MB), still tracked at the old pin despite two commits claiming to remove
   them.
+- **Beads tooling**: `.gitattributes` (a `bd` merge driver) and `AGENTS.md`.
+  The parent repo retired `bd` on 2026-07-25.
+- **`docs/upstream-reconciliation-2026-08.md`**, the 2026-08-18 triage this
+  rebuild carried out. This document replaces it.
 - **The k3d/kustomize manifest edits** for `registry.agentosaurus.com`,
   NodePorts and hostNetwork. Not re-derived: upstream restructured
   `manifests/kustomize/` and the beta9 k3s namespace was torn down the same
