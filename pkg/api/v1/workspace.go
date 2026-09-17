@@ -30,7 +30,9 @@ func NewWorkspaceGroup(g *echo.Group, backendRepo repository.BackendRepository, 
 		defaultStorageClient: defaultStorageClient,
 	}
 
-	g.POST("", group.CreateWorkspace)
+	// FlowState fork: unwrapped, a request with no token reached the handler as a
+	// plain echo.Context and nil-dereferenced cc.AuthInfo. See FLOWSTATE-FORK.md.
+	g.POST("", auth.WithClusterAdminAuth(group.CreateWorkspace))
 	g.GET("/current", auth.WithAuth(group.CurrentWorkspace))
 	g.GET("/:workspaceId/export", auth.WithStrictWorkspaceAuth(group.ExportWorkspaceConfig))
 	g.POST("/:workspaceId/set-external-storage", auth.WithStrictWorkspaceAuth(group.SetExternalWorkspaceStorage))
